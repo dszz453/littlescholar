@@ -33,8 +33,10 @@ type Resource struct {
 
 	// 转存后的信息
 	DiskAccountID *uint64 `gorm:"index" json:"diskAccountId"` // 转存到哪个账号
-	OwnerDirID    string  `gorm:"size:200" json:"ownerDirId"`  // 网盘内所在目录ID
-	FileID        string  `gorm:"size:200" json:"fileId"`      // 网盘内文件ID
+	// OwnerDirID / FileID 对网盘是短 ID，但对 WebDAV 是**相对路径**，
+	// NAS 上的中文片名路径很容易超过 200 字符，故放宽到 500。
+	OwnerDirID string `gorm:"size:500" json:"ownerDirId"` // 网盘内所在目录ID
+	FileID     string `gorm:"size:500" json:"fileId"`     // 网盘内文件ID
 
 	// 元信息
 	MediaType  string  `gorm:"size:20;index" json:"mediaType"`

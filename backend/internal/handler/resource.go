@@ -16,10 +16,21 @@ type ResourceHandler struct {
 	db     *gorm.DB
 	perm   *service.PermissionService
 	pansou *service.PansouClient
+	// encryptor 与 importSvc 仅在「从存储源导入」时需要：
+	// 要列出 WebDAV 目录内容就必须先解密账号凭据。
+	// 其余接口不碰它们。
+	encryptor *util.Encryptor
+	importSvc *service.ImportService
 }
 
-func NewResourceHandler(db *gorm.DB, perm *service.PermissionService, pansou *service.PansouClient) *ResourceHandler {
-	return &ResourceHandler{db: db, perm: perm, pansou: pansou}
+func NewResourceHandler(db *gorm.DB, perm *service.PermissionService, pansou *service.PansouClient, encryptor *util.Encryptor) *ResourceHandler {
+	return &ResourceHandler{
+		db:        db,
+		perm:      perm,
+		pansou:    pansou,
+		encryptor: encryptor,
+		importSvc: service.NewImportService(db),
+	}
 }
 
 // List 资源列表
@@ -424,6 +435,98 @@ func (h *ResourceHandler) Import(c *gin.Context) {
 		}
 	}
 	util.OK(c, gin.H{"created": created, "skipped": skipped})
+}
+
+// ============ 从存储源导入资源 ============
+
+type importFromDiskItem struct {
+	FileID string `json:"fileId" binding:"required"`
+	Title  string `json:"title"`
+	Size   int64  `json:"size"`
+	IsDir  bool   `json:"isDir"`
+}
+
+// ImportFromDisk 把存储源（WebDAV 等）里**已有的文件**登记为系统资源。
+//
+// 与 Import 的关键差异 ——
+//
+//	Import         输入是分享链接：文件还不存在，得先转存，
+//	               所以只写 ShareURL，FileID 留空；
+//	ImportFromDisk 输入是存储源里的实际文件：不需要转存，
+//	               直接写 DiskAccountID + FileID。
+//
+// 播放由 handler.StreamHandler 代理取流，因为 WebDAV 直链离开
+// Authorization 头就是 401，浏览器 <video> 又带不了这个头。
+//
+// 展开与登记的逻辑都在 service.ImportService，与「资源映射」的同步
+// 共用同一份实现 —— 两处各写一遍必然会漂移。
+func (h *ResourceHandler) ImportFromDisk(c *gin.Context) {
+	var req struct {
+		CategoryID uint64               `json:"categoryId" binding:"required"`
+		AccountID  uint64               `json:"accountId" binding:"required"`
+		Items      []importFromDiskItem `json:"items" binding:"required"`
+		Recursive  bool                 `json:"recursive"`
+		MaxFiles   int                  `json:"maxFiles"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		util.BadRequest(c, "参数错误：需要 categoryId、accountId 与 items")
+		return
+	}
+	if len(req.Items) == 0 {
+		util.BadRequest(c, "请至少选择一个文件或目录")
+		return
+	}
+
+	var cat model.Category
+	if err := h.db.First(&cat, req.CategoryID).Error; err != nil {
+		util.BadRequest(c, "目标目录不存在")
+		return
+	}
+	acc, cred, a, err := loadSource(h.db, h.encryptor, req.AccountID)
+	if err != nil {
+		util.BadRequest(c, err.Error())
+		return
+	}
+
+	items := make([]service.CollectItem, 0, len(req.Items))
+	for _, it := range req.Items {
+		items = append(items, service.CollectItem{
+			FileID: it.FileID, Title: it.Title, Size: it.Size, IsDir: it.IsDir,
+		})
+	}
+
+	// 递归可能很久（NAS 大目录一次 PROPFIND 就要几十秒），
+	// 所以这里的超时给到 3 分钟，而不是其它接口常用的 30s。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Minute)
+	defer cancel()
+
+	targets, stats := service.CollectDiskFiles(ctx, a, cred, items, req.Recursive, req.MaxFiles)
+
+	maxFiles := req.MaxFiles
+	if maxFiles <= 0 || maxFiles > service.DefaultMaxImportFiles {
+		maxFiles = service.DefaultMaxImportFiles
+	}
+
+	result := service.ImportResult{
+		SkippedDirs:   stats.SkippedDirs,
+		SkippedNonMed: stats.SkippedNonMed,
+		Truncated:     stats.Truncated,
+		MaxFiles:      maxFiles,
+	}
+	if len(targets) == 0 {
+		result.Message = "没有找到可导入的媒体文件（视频/音频/PDF/图片）"
+		util.OK(c, result)
+		return
+	}
+
+	created, skipped, err := h.importSvc.Register(acc, req.CategoryID, targets)
+	if err != nil {
+		util.ServerError(c, "导入失败: "+err.Error())
+		return
+	}
+	result.Created = created
+	result.Skipped = skipped
+	util.OK(c, result)
 }
 
 // SearchHealth 搜索服务健康检查

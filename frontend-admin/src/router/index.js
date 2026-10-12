@@ -34,7 +34,16 @@ const routes = [
         path: 'resources',
         name: 'Resources',
         component: () => import('@/views/Resources.vue'),
-        meta: { title: '资源管理', icon: 'Files' },
+        meta: { title: '资源列表', icon: 'Files', group: '资源管理', groupIcon: 'Files' },
+      },
+      {
+        // WebDAV 与资源映射同属"资源管理"：它们解决的都是
+        // "把已有文件变成系统里的资源"，和网盘账号那种"凭证管理"
+        // 不是一回事，所以不放在「网盘账号」下。
+        path: 'resources/webdav',
+        name: 'WebdavResources',
+        component: () => import('@/views/WebdavResources.vue'),
+        meta: { title: 'WebDAV 与映射', icon: 'Connection', group: '资源管理', groupIcon: 'Files' },
       },
       {
         path: 'transfer',

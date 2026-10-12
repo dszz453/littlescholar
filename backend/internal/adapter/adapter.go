@@ -14,10 +14,14 @@ const (
 	DiskUC     DiskType = "uc"
 	DiskTianyi DiskType = "tianyi"
 	DiskAliyun DiskType = "aliyun"
+	// DiskWebdav 通用 WebDAV（NAS / Alist / 群晖 / rclone 等）。
+	// 它不是"网盘"，但复用同一套账号/目录/播放抽象后，
+	// 转码链路（service.TranscodeService）无需任何改动即可复用。
+	DiskWebdav DiskType = "webdav"
 )
 
 // AllDiskTypes 全部支持的网盘
-var AllDiskTypes = []DiskType{DiskQuark, DiskBaidu, DiskUC, DiskTianyi, DiskAliyun}
+var AllDiskTypes = []DiskType{DiskQuark, DiskBaidu, DiskUC, DiskTianyi, DiskAliyun, DiskWebdav}
 
 // DiskTypeNames 中文名
 var DiskTypeNames = map[DiskType]string{
@@ -26,6 +30,7 @@ var DiskTypeNames = map[DiskType]string{
 	DiskUC:     "UC网盘",
 	DiskTianyi: "天翼网盘",
 	DiskAliyun: "阿里云盘",
+	DiskWebdav: "WebDAV",
 }
 
 // 常见错误
@@ -161,6 +166,15 @@ type DiskAdapter interface {
 	GetDirectLink(ctx context.Context, cred *Credential, fileID string) (*DirectLink, error)
 	// GetDownloadURL 获取可用于分块下载的地址（通常是直链 + 必要 header）
 	GetDownloadInfo(ctx context.Context, cred *Credential, fileID string) (*DirectLink, error)
+}
+
+// QRCapable 可选接口：适配器可声明自己是否支持扫码登录。
+//
+// 做成可选接口而不是往 DiskAdapter 上加方法，是为了不改动已有的
+// 5 个网盘适配器 —— 它们都支持扫码，不该被迫多写一个恒返回 true 的方法。
+// 未实现该接口的适配器沿用默认值（支持扫码）。
+type QRCapable interface {
+	SupportsQR() bool
 }
 
 // SplitChunks 按块大小切分文件（非会员加速用）

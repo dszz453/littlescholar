@@ -13,14 +13,22 @@
         text-color="#c0c4cc"
         active-text-color="#ffffff"
       >
-        <el-menu-item
-          v-for="item in menus"
-          :key="item.path"
-          :index="item.path"
-        >
-          <el-icon><component :is="item.icon" /></el-icon>
-          <span>{{ item.title }}</span>
-        </el-menu-item>
+        <template v-for="m in menus" :key="m.key">
+          <el-sub-menu v-if="m.children" :index="m.key">
+            <template #title>
+              <el-icon><component :is="m.icon" /></el-icon>
+              <span>{{ m.title }}</span>
+            </template>
+            <el-menu-item v-for="c in m.children" :key="c.path" :index="c.path">
+              <el-icon><component :is="c.icon" /></el-icon>
+              <span>{{ c.title }}</span>
+            </el-menu-item>
+          </el-sub-menu>
+          <el-menu-item v-else :index="m.path">
+            <el-icon><component :is="m.icon" /></el-icon>
+            <span>{{ m.title }}</span>
+          </el-menu-item>
+        </template>
       </el-menu>
     </el-aside>
 
@@ -88,15 +96,40 @@ const userStore = useUserStore()
 
 const status = ref({ pansouOnline: false, dbOnline: false })
 
-const menus = computed(() =>
-  (router.getRoutes().find((r) => r.path === '/')?.children || [])
+// 菜单由路由推导，避免"加了页面忘了加菜单"。
+//
+// meta.group 存在时归入同名分组（渲染成 el-sub-menu），不存在就是顶级项。
+// 分组的图标取其第一个子项的 meta.groupIcon —— 这样每个子页面只声明
+// 自己那两项，不用为了一个分组再单独维护一份菜单表。
+const menus = computed(() => {
+  const children = router.getRoutes().find((r) => r.path === '/')?.children || []
+  const items = children
     .filter((c) => c.meta?.title)
     .map((c) => ({
       path: '/' + c.path,
       title: c.meta.title,
       icon: c.meta.icon,
+      group: c.meta.group || '',
+      groupIcon: c.meta.groupIcon || c.meta.icon,
     }))
-)
+
+  const out = []
+  const groups = new Map()
+  for (const it of items) {
+    if (!it.group) {
+      out.push({ key: it.path, path: it.path, title: it.title, icon: it.icon })
+      continue
+    }
+    let g = groups.get(it.group)
+    if (!g) {
+      g = { key: 'group:' + it.group, title: it.group, icon: it.groupIcon, children: [] }
+      groups.set(it.group, g)
+      out.push(g)
+    }
+    g.children.push({ path: it.path, title: it.title, icon: it.icon })
+  }
+  return out
+})
 
 const activeMenu = computed(() => route.path)
 const currentTitle = computed(() => route.meta?.title || '')

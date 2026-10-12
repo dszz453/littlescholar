@@ -59,6 +59,7 @@ func AllModels() []interface{} {
 		&UserCategoryGrant{},
 		&Category{},
 		&Resource{},
+		&ResourceMapping{},
 		&DiskAccount{},
 		&QRLoginSession{},
 		&TransferTask{},

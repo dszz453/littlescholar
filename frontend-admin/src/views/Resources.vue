@@ -55,6 +55,7 @@
             <el-option label="UC" value="uc" />
             <el-option label="天翼" value="tianyi" />
             <el-option label="阿里" value="aliyun" />
+            <el-option label="WebDAV" value="webdav" />
           </el-select>
         </el-col>
         <el-col :span="4">
@@ -190,7 +191,7 @@ const editDialog = ref(false)
 const editForm = ref({})
 
 function diskName(t) {
-  return { quark: '夸克', baidu: '百度', uc: 'UC', tianyi: '天翼', aliyun: '阿里' }[t] || t || '-'
+  return { quark: '夸克', baidu: '百度', uc: 'UC', tianyi: '天翼', aliyun: '阿里', webdav: 'WebDAV' }[t] || t || '-'
 }
 
 function mediaTypeText(t) {

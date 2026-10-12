@@ -22,10 +22,57 @@ type PlayHandler struct {
 	perm      *service.PermissionService
 	encryptor *util.Encryptor
 	transcode *service.TranscodeService
+	// secret 用于签发播放票据（见 stream.go）。播放 URL 要进 <video src>，
+	// 带不了 Authorization 头，所以不能靠常规 JWT 中间件鉴权。
+	secret string
 }
 
-func NewPlayHandler(db *gorm.DB, perm *service.PermissionService, encryptor *util.Encryptor, transcode *service.TranscodeService) *PlayHandler {
-	return &PlayHandler{db: db, perm: perm, encryptor: encryptor, transcode: transcode}
+func NewPlayHandler(db *gorm.DB, perm *service.PermissionService, encryptor *util.Encryptor, transcode *service.TranscodeService, secret string) *PlayHandler {
+	return &PlayHandler{db: db, perm: perm, encryptor: encryptor, transcode: transcode, secret: secret}
+}
+
+// needsProxy 判断该存储源的直链能否直接交给浏览器。
+//
+// 网盘（夸克/百度等）的直链自带签名，不需要额外请求头，浏览器能直接播；
+// WebDAV 靠 HTTP Basic Auth，而 <video src> 无法携带 Authorization 头，
+// 必须由后端代取流再转发。
+func needsProxy(diskType string) bool {
+	return diskType == string(adapter.DiskWebdav)
+}
+
+// streamURL 生成带票据的代理播放地址。
+func (h *PlayHandler) streamURL(id uint64) string {
+	exp := time.Now().Add(StreamTicketTTL).Unix()
+	return fmt.Sprintf("/api/stream/%d?t=%s", id, SignStreamTicket(h.secret, id, exp))
+}
+
+// directURL 返回"可以直接交给浏览器播放"的地址。
+//
+// WebDAV 一类靠请求头鉴权的存储源给不出这种地址 —— 它的直链离开
+// Authorization 头就是 401 —— 所以统一换成后端代理地址（带票据）。
+// 其余网盘走原有的直链解析。
+//
+// 取不到时返回空串，由调用方决定退路。
+func (h *PlayHandler) directURL(res *model.Resource) string {
+	if needsProxy(res.DiskType) {
+		return h.streamURL(res.ID)
+	}
+	if link, err := h.resolveDirectLink(res); err == nil && link != "" {
+		return link
+	}
+	return ""
+}
+
+// setDirectPlay 决定"不需要转码时"的播放方式。
+func (h *PlayHandler) setDirectPlay(res *model.Resource, playMode, playURL *string) {
+	if needsProxy(res.DiskType) {
+		// 不能走 fallbackDirect —— 那会把 WebDAV 直链塞给 <video>，
+		// 浏览器必然 401。代理层会自己重新取直链并带上鉴权头。
+		*playMode = "proxy"
+		*playURL = h.streamURL(res.ID)
+		return
+	}
+	h.fallbackDirect(res, playMode, playURL)
 }
 
 // Info 获取播放信息
@@ -69,8 +116,9 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	// 优先级：
 	//  1. hls          —— 已转码就绪，直接播放切片（最可靠，支持拖动、跨端兼容）
 	//  2. transcoding  —— 正在转码中，返回进度让前端轮询等待
-	//  3. direct       —— 拿到网盘直链且无需转码，直接播放
-	//  4. external     —— 以上都不可用，回退到网盘原始页面
+	//  3. proxy        —— WebDAV 等需要带鉴权头的源，走后端代理转发
+	//  4. direct       —— 拿到网盘直链且无需转码，直接播放
+	//  5. external     —— 以上都不可用，回退到网盘原始页面
 	playMode := "external"
 	playURL := res.ShareURL
 	var qualities []gin.H
@@ -93,18 +141,19 @@ func (h *PlayHandler) Info(c *gin.Context) {
 			playMode = "transcoding"
 			transcodeTaskID = taskID
 			transcodeProgress = h.transcodeProgress(taskID)
-			// 转码期间先给出直链，前端可降级先播着，转好后再切 HLS
-			if link, lerr := h.resolveDirectLink(&res); lerr == nil && link != "" {
+			// 转码期间先给出可播地址，前端可降级先播着，转好后再切 HLS。
+			// 这里同样要区分需不需要代理 —— WebDAV 直链不能直接给浏览器。
+			if link := h.directURL(&res); link != "" {
 				playURL = link
 			} else {
 				playURL = res.ShareURL
 			}
 		default:
-			// 转码不可用（引擎忙、ffmpeg 缺失等）→ 回退直链
-			h.fallbackDirect(&res, &playMode, &playURL)
+			// 转码不可用（引擎忙、ffmpeg 缺失等）→ 回退可播地址
+			h.setDirectPlay(&res, &playMode, &playURL)
 		}
 	} else {
-		h.fallbackDirect(&res, &playMode, &playURL)
+		h.setDirectPlay(&res, &playMode, &playURL)
 	}
 
 	// 档位信息：HLS 模式下告知前端可选清晰度
@@ -397,27 +446,10 @@ func categoryNameOf(cat *model.Category) string {
 	return cat.Name
 }
 
+// guessMediaType 按标题里的扩展名猜媒体类型。
+//
+// 实现已下沉到 service（导入链路也要用同一套判断），
+// 这里保留薄封装，是为了不改动既有调用处的语义。
 func guessMediaType(title string) string {
-	ext := ""
-	for i := len(title) - 1; i >= 0; i-- {
-		if title[i] == '.' {
-			ext = title[i+1:]
-			break
-		}
-		if title[i] == '/' || title[i] == '\\' {
-			break
-		}
-	}
-	switch ext {
-	case "mp3", "wav", "flac", "aac", "m4a", "ogg", "wma":
-		return model.MediaTypeAudio
-	case "pdf":
-		return model.MediaTypePDF
-	case "jpg", "jpeg", "png", "gif", "webp", "bmp":
-		return model.MediaTypeImage
-	case "mp4", "mkv", "avi", "mov", "wmv", "flv", "rmvb", "ts", "m3u8", "webm":
-		return model.MediaTypeVideo
-	default:
-		return model.MediaTypeVideo
-	}
+	return service.GuessMediaType(title)
 }

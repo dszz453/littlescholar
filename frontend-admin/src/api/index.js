@@ -73,6 +73,8 @@ export const resourceApi = {
   move: (ids, categoryId) => http.put('/admin/resources/move', { ids, categoryId }),
   checkAlive: (ids) => http.post('/admin/resources/check-alive', { ids }),
   import: (data) => http.post('/admin/resources/import', data),
+  // 从存储源（WebDAV 等）导入已有文件：不转存，直接登记账号 + 文件路径
+  importFromDisk: (data) => http.post('/admin/resources/import-disk', data),
 }
 
 export const searchApi = {
@@ -82,7 +84,8 @@ export const searchApi = {
 
 export const diskApi = {
   types: () => http.get('/admin/disk/types'),
-  list: () => http.get('/admin/disk/accounts'),
+  // diskType 可选：WebDAV 资源页只需要存储源账号
+  list: (diskType) => http.get('/admin/disk/accounts', { params: diskType ? { diskType } : {} }),
   getQR: (diskType) => http.post('/admin/disk/accounts/qr', { diskType }),
   pollQR: (sessionId) => http.get(`/admin/disk/accounts/qr/${sessionId}`),
   addManual: (data) => http.post('/admin/disk/accounts/manual', data),
@@ -92,6 +95,16 @@ export const diskApi = {
   remove: (id) => http.delete(`/admin/disk/accounts/${id}`),
   browse: (id, dirId = '') => http.get(`/admin/disk/accounts/${id}/browse`, { params: { dirId } }),
   mkdir: (id, parentId, name) => http.post(`/admin/disk/accounts/${id}/mkdir`, { parentId, name }),
+}
+
+// 资源映射：远端存储目录 → 系统目录，同步即批量登记资源
+export const mappingApi = {
+  list: (accountId) => http.get('/admin/mappings', { params: accountId ? { accountId } : {} }),
+  create: (data) => http.post('/admin/mappings', data),
+  update: (id, data) => http.put(`/admin/mappings/${id}`, data),
+  remove: (id) => http.delete(`/admin/mappings/${id}`),
+  sync: (id) => http.post(`/admin/mappings/${id}/sync`),
+  syncAll: () => http.post('/admin/mappings/sync'),
 }
 
 export const transferApi = {

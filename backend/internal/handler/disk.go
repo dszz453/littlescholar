@@ -13,6 +13,7 @@ import (
 	_ "github.com/littlescholar/core/internal/adapter/quark"
 	_ "github.com/littlescholar/core/internal/adapter/tianyi"
 	_ "github.com/littlescholar/core/internal/adapter/uc"
+	_ "github.com/littlescholar/core/internal/adapter/webdav"
 	"github.com/littlescholar/core/internal/model"
 	"github.com/littlescholar/core/internal/util"
 	"gorm.io/gorm"
@@ -32,10 +33,16 @@ func NewDiskHandler(db *gorm.DB, encryptor *util.Encryptor) *DiskHandler {
 func (h *DiskHandler) Types(c *gin.Context) {
 	var out []gin.H
 	for _, t := range adapter.List() {
+		// 默认支持扫码（5 个网盘都支持）；WebDAV 通过 QRCapable
+		// 声明为 false，前端据此把「扫码添加」置灰。
+		supportQR := true
+		if qc, ok := t.(adapter.QRCapable); ok {
+			supportQR = qc.SupportsQR()
+		}
 		out = append(out, gin.H{
-			"type":         string(t.Type()),
-			"name":         t.Name(),
-			"supportQR":    true,
+			"type":          string(t.Type()),
+			"name":          t.Name(),
+			"supportQR":     supportQR,
 			"supportManual": true,
 		})
 	}
@@ -43,9 +50,17 @@ func (h *DiskHandler) Types(c *gin.Context) {
 }
 
 // List 账号列表
+//
+// 支持 ?diskType=webdav 过滤：管理后台的「WebDAV 资源」页只需要
+// 存储源账号，把网盘账号一并返回会让用户在下拉里选到夸克账号，
+// 然后得到一个"这个账号不是 WebDAV"的报错。
 func (h *DiskHandler) List(c *gin.Context) {
 	var accounts []model.DiskAccount
-	if err := h.db.Order("disk_type asc, id asc").Find(&accounts).Error; err != nil {
+	q := h.db.Order("disk_type asc, id asc")
+	if t := c.Query("diskType"); t != "" {
+		q = q.Where("disk_type = ?", t)
+	}
+	if err := q.Find(&accounts).Error; err != nil {
 		util.ServerError(c, "查询失败")
 		return
 	}
