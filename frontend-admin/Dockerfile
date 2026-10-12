@@ -21,6 +21,11 @@ FROM nginx:alpine
 COPY --from=builder /build/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
+# 构建期就校验 nginx 配置。
+# nginx 只在启动时才解析配置，不校验的话语法错误会一路推到生产才炸
+# （本项目就踩过：add_header 的值含逗号没加引号，容器无限重启）。
+RUN nginx -t
+
 EXPOSE 80
 
 CMD ["nginx", "-g", "daemon off;"]
