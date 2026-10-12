@@ -114,7 +114,10 @@ func (q *Quark) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	return &adapter.QRCode{
 		SessionID: sessionID,
 		Content:   qrContentURL(resp.Data.Members.Token),
-		ExpiresIn: 180,
+		// 夸克二维码有效期是服务端写死的 120 秒（实测 README 与多个开源
+		// 实现均如此）。之前这里写 180，前端会认为 3 分钟内扫码都有效，
+		// 结果用户超过 120 秒再扫，手机端就报「登录请求已过期，请重新扫码」。
+		ExpiresIn: 120,
 	}, nil
 }
 
@@ -126,7 +129,11 @@ func (q *Quark) PollQRCode(ctx context.Context, sessionID string) (*adapter.Logi
 	if !ok {
 		return nil, fmt.Errorf("扫码会话不存在或已过期")
 	}
-	if time.Since(sess.CreatedAt) > 5*time.Minute {
+	// 夸克二维码服务端 120 秒过期。这里不能再用 5 分钟 ——
+	// 超过 120 秒后即使前端还在轮询，token 也已经失效，
+	// 用户扫码只会得到「登录请求已过期」。必须在 120 秒内主动
+	// 判定过期并让前端提示刷新，而不是等用户扫出「过期」才暴露。
+	if time.Since(sess.CreatedAt) > 120*time.Second {
 		delete(q.sessions, sessionID)
 		return &adapter.LoginResult{Status: "expired", Message: "二维码已过期"}, nil
 	}

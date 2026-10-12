@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -228,16 +229,40 @@ func (errDecryptErr) Error() string { return "API 密钥解密失败" }
 
 // ============ 智能体问答 ============
 
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 type chatRequest struct {
-	Message   string `json:"message" binding:"required"`
-	SessionID string `json:"sessionId"`
-	Grade     string `json:"grade"`
+	Message   string        `json:"message"`   // 兼容旧版：单条消息
+	Messages  []chatMessage `json:"messages"`  // 新版：多轮消息数组（前端 Tutor 使用）
+	SessionID string        `json:"sessionId"`
+	Grade     string        `json:"grade"`
 }
 
 // Chat 智能体问答（结合系统资源推荐）
 func (h *AIHandler) Chat(c *gin.Context) {
 	var req chatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		util.BadRequest(c, "请输入问题")
+		return
+	}
+
+	// 兼容两种调用形态：
+	//  - 旧版：{ message: "..." }，单条提问
+	//  - 新版：{ messages: [{role, content}, ...] }，孩子端 Tutor 的多轮上下文
+	// 新版取最后一条 user 消息作为本轮问题；旧版直接用 message。
+	userText := strings.TrimSpace(req.Message)
+	if userText == "" && len(req.Messages) > 0 {
+		for i := len(req.Messages) - 1; i >= 0; i-- {
+			if req.Messages[i].Role == "user" {
+				userText = strings.TrimSpace(req.Messages[i].Content)
+				break
+			}
+		}
+	}
+	if userText == "" {
 		util.BadRequest(c, "请输入问题")
 		return
 	}
@@ -254,7 +279,7 @@ func (h *AIHandler) Chat(c *gin.Context) {
 		sessionID = util.NewSessionID()
 		h.db.Create(&model.AIChatSession{
 			SessionID: sessionID, UserID: userID,
-			Title: truncate(req.Message, 30),
+			Title: truncate(userText, 30),
 		})
 	}
 
@@ -266,15 +291,29 @@ func (h *AIHandler) Chat(c *gin.Context) {
 		catNames = append(catNames, ct.Name)
 	}
 
-	// 取历史对话
-	var history []model.AIChatMessage
-	h.db.Where("session_id = ?", sessionID).Order("id asc").Limit(10).Find(&history)
-
 	messages := ai.BuildTutorPrompt(orDefaultStr(req.Grade, ""), catNames)
-	for _, m := range history {
-		messages = append(messages, ai.Message{Role: m.Role, Content: m.Content})
+
+	// 优先用请求里携带的多轮上下文（前端已把最近若干轮带上），
+	// 避免重复查库历史导致上下文不一致；否则回退到按 session 查库。
+	if len(req.Messages) > 0 {
+		for _, m := range req.Messages {
+			content := strings.TrimSpace(m.Content)
+			if content == "" {
+				continue
+			}
+			role := m.Role
+			if role != "user" && role != "assistant" {
+				role = "user"
+			}
+			messages = append(messages, ai.Message{Role: role, Content: content})
+		}
+	} else {
+		var history []model.AIChatMessage
+		h.db.Where("session_id = ?", sessionID).Order("id asc").Limit(10).Find(&history)
+		for _, m := range history {
+			messages = append(messages, ai.Message{Role: m.Role, Content: m.Content})
+		}
 	}
-	messages = append(messages, ai.Message{Role: "user", Content: req.Message})
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
 	defer cancel()
@@ -288,17 +327,21 @@ func (h *AIHandler) Chat(c *gin.Context) {
 	// 从回复中提取可能的资源推荐
 	recommends := h.matchResources(reply)
 
-	// 保存对话
-	h.db.Create(&model.AIChatMessage{SessionID: sessionID, Role: "user", Content: req.Message})
+	// 保存对话（只记本轮问答，避免与前端上下文重复）
+	h.db.Create(&model.AIChatMessage{SessionID: sessionID, Role: "user", Content: userText})
 	h.db.Create(&model.AIChatMessage{SessionID: sessionID, Role: "assistant", Content: reply})
 
 	// 记录学习行为
 	h.recordStudy(userID, "ai_chat", "", "")
 
 	util.OK(c, gin.H{
-		"reply":               reply,
-		"sessionId":           sessionID,
-		"recommendResources":  recommends,
+		// 前端 Tutor 读取的字段
+		"content":    reply,
+		"resources":  recommends,
+		"sessionId":  sessionID,
+		// 保留旧字段，避免破坏潜在的其他调用方
+		"reply":              reply,
+		"recommendResources": recommends,
 	})
 }
 
