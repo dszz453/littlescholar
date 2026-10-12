@@ -6,13 +6,18 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
 // ============ PanSou 搜索服务 ============
 
 // PansouClient PanSou 网盘搜索 API 客户端
+//
+// baseURL/token 支持运行时热更新（见 Configure）。
+// 用读写锁而不是裸字段：搜索是并发调用的，而管理后台改配置是低频写。
 type PansouClient struct {
+	mu      sync.RWMutex
 	baseURL string
 	token   string
 	http    *HTTPDoer
@@ -24,6 +29,26 @@ func NewPansouClient(baseURL, token string) *PansouClient {
 		token:   token,
 		http:    NewHTTPDoer(60 * time.Second),
 	}
+}
+
+// Configure 运行时更新服务地址与令牌，改完立即生效、无需重启。
+//
+// 起因是一个真实的坑：用户在管理后台把 pansou_url 从默认的
+// http://pansou:8888 改成 http://192.168.31.1:8001 后搜索仍然失败，
+// 因为 baseURL 是启动时固化的。界面显示"配置已保存"，实际根本没被用上 ——
+// 这种"看起来成功了"的失败最难排查。
+func (c *PansouClient) Configure(baseURL, token string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.baseURL = strings.TrimRight(baseURL, "/")
+	c.token = token
+}
+
+// endpoint 取当前基址与令牌的快照，避免请求中途配置被改。
+func (c *PansouClient) endpoint(path string) (string, string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.baseURL + path, c.token
 }
 
 // SearchRequest 搜索请求
@@ -101,13 +126,14 @@ func (c *PansouClient) Search(ctx context.Context, req *SearchRequest) (*SearchR
 		body["filter"] = req.Filter
 	}
 
+	apiURL, token := c.endpoint("/api/search")
 	headers := map[string]string{"Content-Type": "application/json"}
-	if c.token != "" {
-		headers["Authorization"] = "Bearer " + c.token
+	if token != "" {
+		headers["Authorization"] = "Bearer " + token
 	}
 
 	var raw pansouRawResponse
-	if err := c.http.PostJSON(ctx, c.baseURL+"/api/search", body, headers, &raw); err != nil {
+	if err := c.http.PostJSON(ctx, apiURL, body, headers, &raw); err != nil {
 		return nil, fmt.Errorf("PanSou 搜索失败: %w", err)
 	}
 	if raw.Code != 0 {
@@ -163,12 +189,13 @@ func (c *PansouClient) CheckLinks(ctx context.Context, items []CheckLinkItem) ([
 	var resp struct {
 		Results []CheckResult `json:"results"`
 	}
+	apiURL, token := c.endpoint("/api/check/links")
 	headers := map[string]string{"Content-Type": "application/json"}
-	if c.token != "" {
-		headers["Authorization"] = "Bearer " + c.token
+	if token != "" {
+		headers["Authorization"] = "Bearer " + token
 	}
 	body := map[string]interface{}{"items": items}
-	if err := c.http.PostJSON(ctx, c.baseURL+"/api/check/links", body, headers, &resp); err != nil {
+	if err := c.http.PostJSON(ctx, apiURL, body, headers, &resp); err != nil {
 		return nil, fmt.Errorf("存活性检测失败: %w", err)
 	}
 	return resp.Results, nil
@@ -177,7 +204,8 @@ func (c *PansouClient) CheckLinks(ctx context.Context, items []CheckLinkItem) ([
 // Health 健康检查
 func (c *PansouClient) Health(ctx context.Context) (map[string]interface{}, error) {
 	var resp map[string]interface{}
-	if err := c.http.GetJSON(ctx, c.baseURL+"/api/health", nil, &resp); err != nil {
+	apiURL, _ := c.endpoint("/api/health")
+	if err := c.http.GetJSON(ctx, apiURL, nil, &resp); err != nil {
 		return nil, err
 	}
 	return resp, nil
@@ -186,7 +214,10 @@ func (c *PansouClient) Health(ctx context.Context) (map[string]interface{}, erro
 // ============ PanCheck 客户端 ============
 
 // PancheckClient PanCheck 存活检测客户端（补充方案）
+//
+// 与 PansouClient 一样支持运行时热更新，避免"改了配置要重启"的坑。
 type PancheckClient struct {
+	mu       sync.RWMutex
 	baseURL  string
 	password string
 	http     *HTTPDoer
@@ -200,11 +231,26 @@ func NewPancheckClient(baseURL, password string) *PancheckClient {
 	}
 }
 
+// Configure 运行时更新地址与密码（见 PansouClient.Configure 的说明）。
+func (p *PancheckClient) Configure(baseURL, password string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.baseURL = strings.TrimRight(baseURL, "/")
+	p.password = password
+}
+
+func (p *PancheckClient) endpoint(path string) (string, string) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.baseURL + path, p.password
+}
+
 // CheckOne 检测单个链接
 func (p *PancheckClient) CheckOne(ctx context.Context, diskType, link string) (string, error) {
+	apiURL, password := p.endpoint("/api/v1/check")
 	headers := map[string]string{"Content-Type": "application/json"}
-	if p.password != "" {
-		headers["X-Admin-Password"] = p.password
+	if password != "" {
+		headers["X-Admin-Password"] = password
 	}
 	var resp struct {
 		Code int `json:"code"`
@@ -214,7 +260,7 @@ func (p *PancheckClient) CheckOne(ctx context.Context, diskType, link string) (s
 		} `json:"data"`
 	}
 	body := map[string]interface{}{"url": link, "platform": diskType}
-	if err := p.http.PostJSON(ctx, p.baseURL+"/api/v1/check", body, headers, &resp); err != nil {
+	if err := p.http.PostJSON(ctx, apiURL, body, headers, &resp); err != nil {
 		return "uncertain", err
 	}
 	if resp.Data.Valid {
@@ -226,7 +272,8 @@ func (p *PancheckClient) CheckOne(ctx context.Context, diskType, link string) (s
 // Health 健康检查
 func (p *PancheckClient) Health(ctx context.Context) error {
 	var resp map[string]interface{}
-	return p.http.GetJSON(ctx, p.baseURL+"/api/v1/health", nil, &resp)
+	apiURL, _ := p.endpoint("/api/v1/health")
+	return p.http.GetJSON(ctx, apiURL, nil, &resp)
 }
 
 // 确保 json/url 包被使用（供后续扩展）

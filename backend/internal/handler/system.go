@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"log"
 	"runtime"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/littlescholar/core/internal/task"
 	"github.com/littlescholar/core/internal/util"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // SystemHandler 系统配置
@@ -29,8 +31,24 @@ func NewSystemHandler(db *gorm.DB, cfg *config.Config, pansou *service.PansouCli
 
 // GetConfig 获取系统配置
 func (h *SystemHandler) GetConfig(c *gin.Context) {
-	var items []model.SystemConfig
-	h.db.Order("`group` asc, key asc").Find(&items)
+	items := make([]model.SystemConfig, 0, 16)
+
+	// 用 clause.OrderByColumn 而不是手写 "`group` asc, key asc"。
+	//
+	// 原因：group 是 PostgreSQL 的保留字，而反引号是 MySQL 专有语法，
+	// 写死引号必然在其中一边炸。交给 GORM 按 dialector 生成才对。
+	//
+	// 真实教训：原写法让 PG 一直报
+	//   syntax error at or near "group" (SQLSTATE 42601)
+	// 而这里原先没检查 error、接口照样返回 200 + 空 map，
+	// 所以「设置页看不到已保存的值」这个问题被掩盖了好几轮，
+	// 直到翻容器日志才被发现。加日志是这个修复的一半。
+	if err := h.db.
+		Order(clause.OrderByColumn{Column: clause.Column{Name: "group"}}).
+		Order(clause.OrderByColumn{Column: clause.Column{Name: "key"}}).
+		Find(&items).Error; err != nil {
+		log.Printf("[system] 读取系统配置失败（本次仅返回配置文件默认值）: %v", err)
+	}
 
 	m := make(map[string]string, len(items))
 	for _, it := range items {
@@ -62,7 +80,38 @@ func (h *SystemHandler) UpdateConfig(c *gin.Context) {
 			h.db.Model(&existed).Update("value", v)
 		}
 	}
+	h.applyExternalConfig(req)
 	util.OKWithMessage(c, "配置已保存", nil)
+}
+
+// applyExternalConfig 把外部服务地址的变更立刻作用到运行中的客户端。
+//
+// 背景（真实故障）：用户在后台把 pansou_url 从默认的 http://pansou:8888
+// 改成 http://192.168.31.1:8001 后，搜索依旧失败 —— 因为 PansouClient 的
+// baseURL 是启动时固化的，必须重启容器才生效。用户完全无从得知这一点。
+//
+// 这里只处理本次提交中**出现过**的 key：没提交的沿用数据库现有值，
+// 避免把未修改的配置误当空值覆盖掉。
+func (h *SystemHandler) applyExternalConfig(changed map[string]string) {
+	cur := func(key, fallback string) string {
+		if v, ok := changed[key]; ok {
+			return v
+		}
+		var row model.SystemConfig
+		if err := h.db.Where("key = ?", key).First(&row).Error; err == nil {
+			return row.Value
+		}
+		return fallback
+	}
+
+	if _, ok := changed["pansou_url"]; ok {
+		h.pansou.Configure(cur("pansou_url", h.cfg.External.PansouURL),
+			cur("pansou_token", h.cfg.External.PansouToken))
+		log.Printf("[system] PanSou 地址已热更新为 %s", cur("pansou_url", h.cfg.External.PansouURL))
+	} else if _, ok := changed["pansou_token"]; ok {
+		h.pansou.Configure(cur("pansou_url", h.cfg.External.PansouURL),
+			cur("pansou_token", h.cfg.External.PansouToken))
+	}
 }
 
 // Status 系统状态

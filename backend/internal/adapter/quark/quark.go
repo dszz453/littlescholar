@@ -68,14 +68,29 @@ func (q *Quark) headers(cookie string) map[string]string {
 
 // ============ 认证 ============
 
+// qrContentURL 由 token 拼出二维码内容。
+//
+// 这里必须自己拼，不能指望接口给。
+// 夸克早期版本在 getTokenForQrcodeLogin 的响应里带 qrcode_url，
+// 现在**只返回 token**，实测恒为：
+//
+//	{"status":2000000,"message":"ok","data":{"members":{"token":"sta..."}}}
+//
+// 之前代码读 resp.Data.Members.QRCodeURL，于是永远拿到空串 ——
+// 接口返回 200、sessionId 也有值，唯独 qrContent 为空，
+// 前端画不出二维码，表现就是"扫码点了没反应"。
+// 该 URL 格式取自多个公开实现（quarkpan / xiaoya-alist 等），保持一致。
+func qrContentURL(token string) string {
+	return "https://su.quark.cn/4_eMHBJ?token=" + token + "&client_id=532&ssb=weblogin"
+}
+
 // GetQRCode 获取扫码登录二维码
 func (q *Quark) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	var resp struct {
 		Status int    `json:"status"`
 		Data   struct {
 			Members struct {
-				Token    string `json:"token"`
-				QRCodeURL string `json:"qrcode_url"`
+				Token string `json:"token"`
 			} `json:"members"`
 		} `json:"data"`
 	}
@@ -98,7 +113,7 @@ func (q *Quark) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 
 	return &adapter.QRCode{
 		SessionID: sessionID,
-		Content:   resp.Data.Members.QRCodeURL,
+		Content:   qrContentURL(resp.Data.Members.Token),
 		ExpiresIn: 180,
 	}, nil
 }

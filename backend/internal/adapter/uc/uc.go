@@ -49,19 +49,37 @@ func (u *UC) headers(cookie string) map[string]string {
 
 // ============ 认证 ============
 
+// UC 扫码登录域名。
+//
+// ⚠️ 原代码写的是 uop.uc.cn（那是夸克用的域名）。实测该主机对 UC 的
+// client_id 返回**空响应体**，所以永远拿不到 token，扫码必然失败。
+// UC 的正确域名是 api.open.uc.cn。
+const qrCreateURL = "https://api.open.uc.cn/cas/ajax/getTokenForQrcodeLogin"
+
+// qrContentURL 由 token 拼出二维码内容。
+//
+// 与夸克同样的原因：接口只返回 token，没有 qrcode_url 字段。
+// 实测 api.open.uc.cn 的响应恒为
+//
+//	{"status":2000000,"message":"ok","data":{"members":{"token":"sta..."}}}
+//
+// UC 与夸克同源（同一套 CAS），故路径格式一致，仅换 su 域名。
+func qrContentURL(token string) string {
+	return "https://su.uc.cn/4_eMHBJ?token=" + token + "&client_id=" + clientID + "&ssb=weblogin"
+}
+
 func (u *UC) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	var resp struct {
 		Status int `json:"status"`
 		Data   struct {
 			Members struct {
-				Token     string `json:"token"`
-				QRCodeURL string `json:"qrcode_url"`
+				Token string `json:"token"`
 			} `json:"members"`
 		} `json:"data"`
 	}
 	_, err := u.http.DoJSON(ctx, &adapter.Request{
 		Method: "GET",
-		URL:    "https://uop.uc.cn/cas/ajax/getTokenForQrcodeLogin",
+		URL:    qrCreateURL,
 		Query:  map[string]string{"client_id": clientID, "v": "1.2", "request_id": fmt.Sprint(time.Now().UnixMilli())},
 	}, &resp)
 	if err != nil {
@@ -72,17 +90,19 @@ func (u *UC) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	}
 	return &adapter.QRCode{
 		SessionID: fmt.Sprintf("uc_%d", time.Now().UnixNano()),
-		Content:   resp.Data.Members.QRCodeURL,
+		Content:   qrContentURL(resp.Data.Members.Token),
 		ExpiresIn: 180,
 	}, nil
 }
 
 func (u *UC) PollQRCode(ctx context.Context, sessionID string) (*adapter.LoginResult, error) {
-	// UC 与夸克同源，这里返回等待状态，实际扫码确认后由 adapter 层填入 cookie
-	// 生产环境应保存 token 并轮询，参见夸克实现
+	// ⚠️ 这里是**桩实现**，不是 bug 被藏起来：UC 的轮询/换票链路
+	// （getServiceTicketByQrcodeToken + ticket 换 cookie）尚未实现，
+	// 所以 UC 扫码目前**走不到最后一步**，请引导用户改用「手动添加 Cookie」。
+	// 夸克那条链路是完整的，可参照 quark.go 的 PollQRCode/exchangeTicket 补齐。
 	return &adapter.LoginResult{
 		Status:  "waiting",
-		Message: "请在 UC App 中扫码确认（建议使用手动 Cookie 方式绑定以获得更稳定的会话）",
+		Message: "UC 扫码换票尚未实现，请改用「手动添加」粘贴 Cookie",
 	}, nil
 }
 
