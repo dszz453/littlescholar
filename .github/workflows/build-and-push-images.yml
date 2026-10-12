@@ -1,0 +1,84 @@
+name: build-and-push-images
+
+# 说明
+# ----
+# 为什么镜像在 GitHub 上构建，而不是本地/服务器：
+#   1. 开发机（Windows）没装 docker，本地构建不了；
+#   2. 服务器是 iStoreOS 软路由，根分区只剩几百 MB，
+#      拉 golang + node 两套构建镜像再编译，资源吃紧且慢；
+#   3. GitHub runner 有现成的 docker 与 layer cache，构建完直接推 GHCR，
+#      服务器只负责 pull + 起容器，职责清晰。
+#
+# 产物（GHCR）：
+#   ghcr.io/<owner>/<repo>/core-server:latest     ← backend/
+#   ghcr.io/<owner>/<repo>/frontend:latest        ← frontend-admin/
+#   ghcr.io/<owner>/<repo>/frontend-kid:latest    ← frontend-kid/
+#
+# 包默认是 private。若服务器要免登录拉取，需在包设置里改为 public；
+# 否则在服务器上先 `docker login ghcr.io`（用带 read:packages 的 token）。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend-admin/**"
+      - "frontend-kid/**"
+      - ".github/workflows/build-and-push-images.yml"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.image }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      # 三个镜像互相独立，一个失败不影响其余，便于一次看清全部结果
+      fail-fast: false
+      matrix:
+        include:
+          - image: core-server
+            context: ./backend
+            dockerfile: ./backend/Dockerfile
+          - image: frontend
+            context: ./frontend-admin
+            dockerfile: ./frontend-admin/Dockerfile
+          - image: frontend-kid
+            context: ./frontend-kid
+            dockerfile: ./frontend-kid/Dockerfile
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送 ${{ matrix.image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          # latest 用于部署；sha 便于回滚到具体某次提交
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.image }}:latest
+            ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.image }}:${{ github.sha }}
+          build-args: |
+            VITE_API_BASE=/api
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
