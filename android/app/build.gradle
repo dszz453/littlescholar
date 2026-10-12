@@ -1,0 +1,66 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+// ============ 服务器地址 ============
+// 通过 -PsiteUrl=xxx 覆盖；不传则用下面的默认值。
+// 打包示例：
+//   ./gradlew assembleRelease -PsiteUrl=https://kid.example.com
+def siteUrl = project.hasProperty('siteUrl') ? project.siteUrl : 'http://192.168.1.100:8091'
+
+android {
+    namespace 'xyz.littlescholar.kid'
+    compileSdk rootProject.ext.compileSdkVer
+
+    defaultConfig {
+        applicationId 'xyz.littlescholar.kid'
+        minSdk rootProject.ext.minSdkVer
+        targetSdk rootProject.ext.targetSdkVer
+        versionCode 1
+        versionName '1.0.0'
+
+        // 注入到 BuildConfig.SITE_URL，供 MainActivity 使用
+        buildConfigField 'String', 'SITE_URL', "\"${siteUrl}\""
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+            debuggable true
+        }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
+                    'proguard-rules.pro'
+            // 未配置签名时产出未签名 APK，仍需手动签名；
+            // 要自动签名请在下面补 signingConfigs。
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+    buildFeatures {
+        buildConfig true
+        viewBinding false
+    }
+    packagingOptions {
+        resources {
+            excludes += ['META-INF/*.kotlin_module', 'META-INF/DEPENDENCIES']
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.activity:activity-ktx:1.9.0'
+    implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+    implementation 'androidx.webkit:webkit:1.11.0'
+}

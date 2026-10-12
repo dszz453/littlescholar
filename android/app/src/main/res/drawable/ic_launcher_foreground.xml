@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标的前景层：小熊脸，居中且留出安全边距 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 左耳 -->
+    <path
+        android:fillColor="#8B5E3C"
+        android:pathData="M31,38 m-9,0 a9,9 0,1 1,18 0 a9,9 0,1 1,-18 0" />
+    <path
+        android:fillColor="#FFC4D0"
+        android:pathData="M31,38 m-4.5,0 a4.5,4.5 0,1 1,9 0 a4.5,4.5 0,1 1,-9 0" />
+
+    <!-- 右耳 -->
+    <path
+        android:fillColor="#8B5E3C"
+        android:pathData="M77,38 m-9,0 a9,9 0,1 1,18 0 a9,9 0,1 1,-18 0" />
+    <path
+        android:fillColor="#FFC4D0"
+        android:pathData="M77,38 m-4.5,0 a4.5,4.5 0,1 1,9 0 a4.5,4.5 0,1 1,-9 0" />
+
+    <!-- 脸 -->
+    <path
+        android:fillColor="#FFF6E0"
+        android:pathData="M54,58 m-25,0 a25,25 0,1 1,50 0 a25,25 0,1 1,-50 0" />
+
+    <!-- 口鼻区 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.85"
+        android:pathData="M54,66 m-13,0 a13,10 0,1 1,26 0 a13,10 0,1 1,-26 0" />
+
+    <!-- 眼睛 -->
+    <path
+        android:fillColor="#3B2C22"
+        android:pathData="M45,54 m-3,0 a3,3 0,1 1,6 0 a3,3 0,1 1,-6 0" />
+    <path
+        android:fillColor="#3B2C22"
+        android:pathData="M63,54 m-3,0 a3,3 0,1 1,6 0 a3,3 0,1 1,-6 0" />
+
+    <!-- 鼻子 -->
+    <path
+        android:fillColor="#3B2C22"
+        android:pathData="M54,63 m-2.4,0 a2.4,2.4 0,1 1,4.8 0 a2.4,2.4 0,1 1,-4.8 0" />
+
+    <!-- 嘴 -->
+    <path
+        android:strokeColor="#3B2C22"
+        android:strokeWidth="1.6"
+        android:strokeLineCap="round"
+        android:pathData="M54,66 L54,69 M54,69 Q50,73 47,69.5 M54,69 Q58,73 61,69.5" />
+</vector>

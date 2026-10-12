@@ -1,0 +1,31 @@
+# 行尾统一策略
+# -------------
+# 本项目部署目标全是 Linux（Docker 容器 / iStoreOS），
+# 所以默认一律 LF。若放任 Windows 的 autocrlf 把 shell 脚本转成 CRLF，
+# 推上去后容器里会报 `exec format error` 或 `\r: not found` 这类难查的错。
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF，否则 cmd 解析会出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Unix 启动脚本显式锁死 LF（Gradle Wrapper 对行尾敏感）
+gradlew text eol=lf
+
+# 二进制文件不做任何转换
+*.jar binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.zip binary
+*.gz binary
+*.tgz binary
+*.mp3 binary
+*.mp4 binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

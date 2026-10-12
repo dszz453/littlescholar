@@ -1,0 +1,76 @@
+# 服务配置
+server:
+  port: 8080
+  mode: release        # debug / release
+
+# 数据库
+database:
+  driver: postgres     # postgres / sqlite
+  host: postgres
+  port: 5432
+  user: postgres
+  password: postgres
+  name: littlescholar
+  ssl_mode: disable
+  # sqlite 模式下使用
+  file_path: ./data/littlescholar.db
+
+# Redis 缓存（可选加速层）
+# 用途：缓存「用户可访问目录集合」，降低孩子端首页的权限计算开销。
+# 说明：设为 false 或连接失败时系统自动降级为无缓存模式，功能不受影响。
+redis:
+  enabled: true
+  host: redis
+  port: 6379
+  password: ""
+  db: 0
+
+# JWT 认证
+jwt:
+  secret: change-this-to-a-random-secret-in-production
+  access_expire_hours: 2
+  refresh_expire_hours: 168
+  issuer: littlescholar
+
+# 安全
+security:
+  # 用于加密网盘 cookie 与 AI apiKey，请务必修改为随机字符串
+  cookie_encrypt_key: change-this-encrypt-key-in-production
+
+# 外部服务
+external:
+  pansou_url: http://pansou:8888
+  pansou_token: ""
+  pancheck_url: http://pancheck:6080
+  pancheck_password: ""
+
+# 存储
+storage:
+  media_dir: /app/data/media
+  transcode_dir: /app/data/transcode
+
+# 转码
+transcode:
+  enabled: true
+  concurrency: 2       # 同时转码路数，建议 = CPU 核数 / 2
+  ffmpeg_path: ffmpeg
+  # 产物缓存上限（GB）。超过后按「最久未播放」优先淘汰。
+  # 一个 720p 产物约 700MB~2GB。设为 0 表示不限制（会写满磁盘，仅调试用）。
+  cache_max_gb: 20
+  # 产物闲置天数，超过则清理。播放时会刷新访问时间，
+  # 「孩子一直在看的那几部」因此不会被清掉。设为 0 表示不按时间淘汰。
+  cache_ttl_days: 30
+
+# 资源存活巡检
+alive:
+  enabled: true        # 定时巡检开关；关闭后仍可在后台手动触发
+  batch_size: 30       # 单批送检数量。太大会被对面拒，太小则慢
+  interval_seconds: 2  # 每批间隔，避免把检测服务打挂
+  # 连续失败几次才判定资源失效。单次判定的可靠性有限
+  # （网盘限流、对面抖动都会造成假阳性），设 1 会误标孩子在看的资源。
+  dead_threshold: 2
+  stale_hours: 72      # 超过这么久未检查的资源需要重新检查
+
+# 日志
+log:
+  level: info          # debug / info / warn / error

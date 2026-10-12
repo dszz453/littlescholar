@@ -1,0 +1,109 @@
+:root {
+  --ls-primary: #4a90d9;
+  --ls-bg: #f5f7fa;
+  --ls-card: #ffffff;
+  --ls-text: #303133;
+  --ls-text-secondary: #909399;
+  --ls-border: #e4e7ed;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background: var(--ls-bg);
+  color: var(--ls-text);
+  font-size: 14px;
+}
+
+.page-container {
+  padding: 20px;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.page-title {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.card-box {
+  background: var(--ls-card);
+  border-radius: 8px;
+  padding: 20px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+}
+
+.mt-16 {
+  margin-top: 16px;
+}
+.mb-16 {
+  margin-bottom: 16px;
+}
+.mr-8 {
+  margin-right: 8px;
+}
+.flex {
+  display: flex;
+}
+.flex-1 {
+  flex: 1;
+}
+.items-center {
+  align-items: center;
+}
+.justify-between {
+  justify-content: space-between;
+}
+
+.text-secondary {
+  color: var(--ls-text-secondary);
+  font-size: 12px;
+}
+
+/* 网盘类型标签色 */
+.disk-quark {
+  color: #4a90d9;
+}
+.disk-baidu {
+  color: #2932e1;
+}
+.disk-uc {
+  color: #ff6a00;
+}
+.disk-tianyi {
+  color: #d9554a;
+}
+.disk-aliyun {
+  color: #6236ff;
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #c1c5cc;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #a8adb5;
+}

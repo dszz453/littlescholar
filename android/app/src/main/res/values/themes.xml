@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 无 ActionBar 的主题，因为页面导航完全由网页承担 -->
+    <style name="Theme.LittleScholar" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="colorPrimary">@color/brand</item>
+        <item name="colorPrimaryDark">@color/brand_dark</item>
+        <item name="colorAccent">@color/brand</item>
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:statusBarColor">@color/brand</item>
+        <item name="android:navigationBarColor">@color/white</item>
+    </style>
+</resources>

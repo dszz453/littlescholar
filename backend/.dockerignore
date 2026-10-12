@@ -1,0 +1,5 @@
+.git
+*.md
+data
+.env
+.env.local

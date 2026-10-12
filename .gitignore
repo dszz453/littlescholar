@@ -1,0 +1,99 @@
+# ============ 依赖 ============
+# 必须忽略：两个前端目录的 node_modules 合计约 318 MB。
+# 装回来只要一条 npm ci（配合已提交的 package-lock.json）。
+node_modules/
+frontend-admin/node_modules/
+frontend-kid/node_modules/
+
+# ============ 构建产物 ============
+# dist 是可再生的，不进仓库。
+# 例外：frontend-kid/dist 曾用于验证，但它同样可由 npm run build 重建，
+# 所以一并忽略；需要证据时看 README 里的构建记录与截图。
+dist/
+frontend-admin/dist/
+frontend-kid/dist/
+
+# Vite / 缓存
+.vite/
+*.tsbuildinfo
+.eslintcache
+
+# ============ Go ============
+# 注意：go.sum **必须提交**（已生成并通过体检校验），
+# 所以这里千万不要加 go.sum。
+backend/bin/
+backend/tmp/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# ============ Android / Gradle ============
+.gradle/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+*.apk
+*.aab
+*.keystore
+*.jks
+captures/
+
+# 注意：gradle wrapper 必须提交（已于本轮补齐并验证通过），
+# 所以这里千万不要加：
+#   gradlew / gradlew.bat / gradle/wrapper/gradle-wrapper.jar
+#   gradle/wrapper/gradle-wrapper.properties
+# 它们不是构建产物，而是让任何机器都能用同一版本 Gradle 的入口。
+# 特别注意别写 `*.jar` —— 那会把 gradle-wrapper.jar 一起忽略掉。
+
+# ============ 运行时数据 ============
+data/
+backend/data/
+uploads/
+media/
+transcode/
+certs/
+*.db
+*.sqlite
+*.sqlite3
+
+# ============ 密钥 / 本地配置 ============
+# .env.example 要保留，它是配置模板。
+.env
+.env.local
+.env.*.local
+!.env.example
+*.pem
+*.key
+
+# ============ 编辑器 / 系统 ============
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+
+# ============ 本地工作区数据 ============
+# .workbuddy/ 存的是本地的会话记忆与工作日志（含内部记录），
+# 属于"这台机器上的上下文"，不属于项目源码，所以不进仓库。
+.workbuddy/
+
+# ============ 日志 ============
+*.log
+logs/
+npm-debug.log*
+yarn-error.log*
+
+# ============ 临时 ============
+tmp/
+temp/
+*.bak
+*.orig

@@ -1,0 +1,99 @@
+name: lint-and-build
+
+# 说明
+# ----
+# 本仓库的开发机没有 Go 工具链，所以本地只能跑 scripts/lint_offline.py
+# 做文字层面的检查。真正的编译验证放在这里，由 GitHub 的 runner 执行。
+#
+# 两者是互补关系，不是替代关系：
+#   lint_offline.py  → 无工具链环境下的最低保障（路由/handler 对齐、
+#                       跨包符号、括号、未使用 import）
+#   go build / go vet → 唯一能判定"到底能不能编译"的手段
+#
+# 这个 workflow 从建立起就没有跑过（本地无 runner），
+# 第一次 push 后请务必看一遍真实结果，别假设它是绿的。
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "backend/**"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "backend/**"
+  workflow_dispatch:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 注意：preflight.py 在**仓库根**的 scripts/ 下，不在 backend/scripts/。
+      # 本 job 的 defaults 把 cwd 设成了 backend，所以这里必须显式覆盖，
+      # 否则会去找 backend/scripts/preflight.py 而报 No such file。
+      #
+      # 这个 step 在阻断项未修完时**会故意失败**（退出码 1）—— 那是设计意图，
+      # 不是 CI 坏了。它检查的是「仓库该有的文件在不在」（go.sum / gradle wrapper），
+      # 不修的话后面的 go build 也会以更难懂的方式失败。
+      - name: 部署前体检（阻断项：go.sum / gradle wrapper）
+        run: python3 scripts/preflight.py
+        working-directory: .
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: backend/go.sum
+
+      - name: 离线一致性校验（无工具链时的替代方案）
+        run: python3 scripts/lint_offline.py
+        working-directory: backend
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: CGO_ENABLED=0 go build -o /dev/null ./cmd/server
+
+      - name: go test
+        run: go test ./... -count=1
+        continue-on-error: true   # 目前没有测试，先不阻断
+
+  frontend-admin:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend-admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend-admin/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  frontend-kid:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend-kid
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend-kid/package-lock.json
+      - run: npm ci
+      - run: npm run build

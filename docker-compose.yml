@@ -1,0 +1,214 @@
+version: "3.8"
+
+# 小书童 · 孩子学习系统
+# 一键部署：docker compose up -d
+
+services:
+  # ============ 主后端 ============
+  core-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: littlescholar/core-server:latest
+    container_name: ls-core
+    restart: unless-stopped
+    ports:
+      - "${CORE_PORT:-8080}:8080"
+    environment:
+      TZ: Asia/Shanghai
+      SERVER_MODE: ${SERVER_MODE:-release}
+      SERVER_PORT: 8080
+      DATABASE_DRIVER: postgres
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: ${DB_USER:-postgres}
+      DATABASE_PASSWORD: ${DB_PASSWORD:-postgres}
+      DATABASE_NAME: ${DB_NAME:-littlescholar}
+      DATABASE_SSL_MODE: disable
+      REDIS_ENABLED: "true"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: ${JWT_SECRET:-please-change-this-jwt-secret}
+      SECURITY_COOKIE_ENCRYPT_KEY: ${COOKIE_ENCRYPT_KEY:-please-change-this-encrypt-key}
+      EXTERNAL_PANSOU_URL: http://pansou:8888
+      EXTERNAL_PANSOU_TOKEN: ${PANSOU_TOKEN:-}
+      EXTERNAL_PANCHECK_URL: http://pancheck:6080
+      EXTERNAL_PANCHECK_PASSWORD: ${PANCHECK_PASSWORD:-}
+      STORAGE_MEDIA_DIR: /app/data/media
+      STORAGE_TRANSCODE_DIR: /app/data/transcode
+      TRANSCODE_ENABLED: "true"
+      TRANSCODE_CONCURRENCY: ${TRANSCODE_CONCURRENCY:-2}
+      # 产物缓存上限与闲置天数。磁盘写满是静默恶化，建议至少配一项。
+      TRANSCODE_CACHE_MAX_GB: ${TRANSCODE_CACHE_MAX_GB:-20}
+      TRANSCODE_CACHE_TTL_DAYS: ${TRANSCODE_CACHE_TTL_DAYS:-30}
+      # 资源存活巡检
+      ALIVE_ENABLED: ${ALIVE_ENABLED:-true}
+      ALIVE_BATCH_SIZE: ${ALIVE_BATCH_SIZE:-30}
+      ALIVE_INTERVAL_SECONDS: ${ALIVE_INTERVAL_SECONDS:-2}
+      # 连续失败几次才判失效。设 1 会因偶发抖动误标可用资源。
+      ALIVE_DEAD_THRESHOLD: ${ALIVE_DEAD_THRESHOLD:-2}
+      ALIVE_STALE_HOURS: ${ALIVE_STALE_HOURS:-72}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+    volumes:
+      - ./data/media:/app/data/media
+      - ./data/transcode:/app/data/transcode
+      - ./backend/config.yaml:/app/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ls-net
+
+  # ============ 后台管理前端（nginx 托管）============
+  frontend:
+    build:
+      context: ./frontend-admin
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: /api
+    image: littlescholar/frontend:latest
+    container_name: ls-frontend
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8090}:80"
+    depends_on:
+      - core-server
+    networks:
+      - ls-net
+
+  # ============ 孩子端 PWA（nginx 托管）============
+  # 手机浏览器访问 http://<主机>:8091，可"添加到主屏幕"当 App 用
+  frontend-kid:
+    build:
+      context: ./frontend-kid
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: /api
+    image: littlescholar/frontend-kid:latest
+    container_name: ls-kid
+    restart: unless-stopped
+    ports:
+      - "${KID_PORT:-8091}:80"
+    depends_on:
+      - core-server
+    networks:
+      - ls-net
+
+  # ============ PostgreSQL ============
+  postgres:
+    image: postgres:15-alpine
+    container_name: ls-postgres
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-littlescholar}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-littlescholar}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ls-net
+
+  # ============ Redis ============
+  redis:
+    image: redis:7-alpine
+    container_name: ls-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ls-net
+
+  # ============ PanSou 资源搜索 ============
+  pansou:
+    image: ghcr.io/fish2018/pansou:latest
+    container_name: ls-pansou
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      PORT: 8888
+      # 启用认证时取消注释
+      # AUTH_ENABLED: "true"
+      # AUTH_USERS: "admin:${PANSOU_PASSWORD:-pansou123}"
+      # 如需要代理访问 TG
+      # PROXY: "socks5://host:1080"
+      ENABLED_PLUGINS: pansearch,panta,qupansou,hunhepan,jikepan,pan666,panyq,susu,xuexizhinan,hdr4k,labi,shandian,duoduo,muou,wanou,ouge,zhizhen,huban
+    volumes:
+      - ./data/pansou-cache:/app/cache
+    networks:
+      - ls-net
+
+  # ============ PanCheck 存活检测（可选）============
+  # 说明：PanSou 已内置 /api/check/links，PanCheck 用于批量/定时检测。
+  # 如不需要可注释掉整个 pancheck 及其 db/redis 依赖。
+  pancheck:
+    image: lampon/pancheck:latest
+    container_name: ls-pancheck
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      SERVER_PORT: 6080
+      SERVER_MODE: release
+      SERVER_CORS_ORIGINS: "*"
+      DATABASE_TYPE: mysql
+      DATABASE_HOST: pancheck-db
+      DATABASE_PORT: 3306
+      DATABASE_USER: root
+      DATABASE_PASSWORD: ${PANCHECK_DB_PASSWORD:-pancheck123}
+      DATABASE_DATABASE: pancheck
+      DATABASE_CHARSET: utf8mb4
+      REDIS_ENABLED: "true"
+      REDIS_HOST: pancheck-redis
+      REDIS_PORT: 6379
+      REDIS_INVALID_TTL: 168
+      ADMIN_PASSWORD: ${PANCHECK_PASSWORD:-pancheck123}
+    volumes:
+      - ./data/pancheck:/app/data
+    depends_on:
+      - pancheck-db
+      - pancheck-redis
+    networks:
+      - ls-net
+
+  pancheck-db:
+    image: mysql:8.0
+    container_name: ls-pancheck-db
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: ${PANCHECK_DB_PASSWORD:-pancheck123}
+      MYSQL_DATABASE: pancheck
+      MYSQL_CHARACTER_SET_SERVER: utf8mb4
+      MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
+    volumes:
+      - ./data/pancheck-mysql:/var/lib/mysql
+    networks:
+      - ls-net
+
+  pancheck-redis:
+    image: redis:7-alpine
+    container_name: ls-pancheck-redis
+    restart: unless-stopped
+    volumes:
+      - ./data/pancheck-redis:/data
+    networks:
+      - ls-net
+
+networks:
+  ls-net:
+    driver: bridge

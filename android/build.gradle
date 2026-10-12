@@ -1,0 +1,35 @@
+// 顶层构建脚本
+buildscript {
+    ext {
+        kotlin_version = '1.9.24'
+        // 目标 Android 12（API 31）即可覆盖绝大多数家用平板/手机，
+        // 同时避开 Android 13+ 对前台服务更严格的限制
+        compileSdkVer = 34
+        targetSdkVer = 34
+        minSdkVer = 24
+    }
+    repositories {
+        google()
+        mavenCentral()
+        // 国内加速
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.5.2'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}
