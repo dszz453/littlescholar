@@ -53,11 +53,16 @@ captures/
 # 特别注意别写 `*.jar` —— 那会把 gradle-wrapper.jar 一起忽略掉。
 
 # ============ 运行时数据 ============
+# ⚠️ 这里的目录名必须精确到路径，不能写裸目录名。
+# 真实教训：原本写的是裸 `transcode/`，结果把源码包
+# backend/internal/transcode/ 一起忽略了 —— 本地编译完全正常
+# （文件都在磁盘上），推到 CI 才报 "no required module provides package"。
+# 这类错误本地永远发现不了，只有真的在别的机器上构建才暴露。
 data/
 backend/data/
 uploads/
 media/
-transcode/
+/transcode/
 certs/
 *.db
 *.sqlite
