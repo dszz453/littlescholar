@@ -21,15 +21,11 @@ FROM nginx:alpine
 COPY --from=builder /build/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# 构建期就校验 nginx 配置语法。
-# nginx 只在启动时才解析配置，语法错误会一路推到生产才炸
-# （本项目就踩过：add_header 的值含逗号没加引号，容器无限重启）。
-#
-# 注意：配置里 proxy_pass 指向 compose 网络的服务名 core-server，
-# 构建环境没有这条 DNS 记录，nginx -t 会以 "host not found in upstream" 中断。
-# 所以先往 /etc/hosts 塞个占位，让它只做语法与结构校验。
-# 运行时 Docker 会用自己的 /etc/hosts 覆盖，不影响真实解析。
-RUN echo "127.0.0.1 core-server" >> /etc/hosts && nginx -t
+# nginx 配置的语法校验不放在这里，而是在 CI 的独立 job（nginx-check）里做。
+# 原因：配置里 proxy_pass 指向 compose 服务名 core-server，
+# 构建环境没有这条 DNS，nginx -t 会以 "host not found in upstream" 中断；
+# 而想在构建期补 hosts 又不行 —— build 阶段的 /etc/hosts 是只读挂载。
+# 放到 CI 用 docker run 校验（那里 /etc/hosts 可写、也能 sed 替换主机名）更合适。
 
 EXPOSE 80
 
