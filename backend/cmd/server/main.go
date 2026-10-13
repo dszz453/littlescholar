@@ -193,6 +193,12 @@ func main() {
 			CacheTTLDays: cfg.Transcode.CacheTTLDays,
 		})
 
+		// 上个进程如果被强杀（容器重启 / OOM），正在跑的转码会在
+		// transcode_tasks 里留下一条永远不动的 pending/running 记录，
+		// 让对应资源此后一直显示"转码中"。趁着本进程刚起来、引擎还是空的，
+		// 把它清干净（详见 RecoverStaleTasks 的注释）。
+		transcodeSvc.RecoverStaleTasks()
+
 		// 产物缓存上限 / TTL 的启动期自检
 		if cfg.Transcode.CacheMaxGB <= 0 && cfg.Transcode.CacheTTLDays <= 0 {
 			logger.Warn("转码产物缓存未设上限（cache_max_gb 与 cache_ttl_days 均为 0），" +

@@ -193,6 +193,44 @@ func (s *TranscodeService) EnsureHLS(ctx context.Context, res *model.Resource) (
 	return "", false, t.ID, nil
 }
 
+// RecoverStaleTasks 回收"上一个进程遗留"的转码任务，应在启动时调用一次。
+//
+// 进程退出（容器重启 / OOM / 崩溃）时正在跑的 ffmpeg 会被一并带走，
+// 但 transcode_tasks 里的 pending/running 记录不会有人来收尾。后果是
+// 这些资源在 EnsureHLS 眼里永远是"正在转码"：前端进度条停在原地、
+// 后台任务列表挂着一批永远不会动的"排队中"，只能人工改库恢复。
+//
+// 为什么放在启动时做全量回收，而不是全靠 EnsureHLS 的按需判定：
+// 按需判定只在"有人来播这个资源"的时候才触发，没被播到的记录会一直
+// 挂在那里。而这个进程刚起来，engine 与 inflight 必然是空的，所以
+// 此刻数据库里所有 pending/running **确定**是遗留 —— 这是唯一一个
+// 可以放心全量清的时刻。
+//
+// ⚠️ 前提：单实例部署（本项目的 docker compose 就是单实例）。
+// 如果将来横向扩多实例，这个全量回收会误杀别的实例正在跑的任务，
+// 那时必须改成"按实例标识过滤"。
+func (s *TranscodeService) RecoverStaleTasks() {
+	if s == nil || s.db == nil {
+		return
+	}
+	now := time.Now()
+	res := s.db.Model(&model.TranscodeTask{}).
+		Where("status IN ?", []string{model.TaskStatusPending, model.TaskStatusRunning}).
+		Updates(map[string]interface{}{
+			"status":      model.TaskStatusFailed,
+			"message":     "服务重启导致转码中断，重新播放时会自动重新排队",
+			"finished_at": &now,
+		})
+	if res.Error != nil {
+		s.logger.Warn("回收遗留转码任务失败", zap.Error(res.Error))
+		return
+	}
+	if res.RowsAffected > 0 {
+		s.logger.Warn("已回收上个进程遗留的转码任务，重新播放时会自动重新排队",
+			zap.Int64("count", res.RowsAffected))
+	}
+}
+
 // Create 创建并异步执行转码任务
 func (s *TranscodeService) Create(ctx context.Context, res *model.Resource) (*model.TranscodeTask, error) {
 	if !s.Enabled() {
