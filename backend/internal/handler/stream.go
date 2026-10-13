@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -99,6 +100,98 @@ func verifyStreamTicket(secret string, resourceID uint64, ticket string) bool {
 	expect := hex.EncodeToString(mac.Sum(nil))
 	// 定长比较，避免时序侧信道
 	return hmac.Equal([]byte(sig), []byte(expect))
+}
+
+// ============ 容器格式自愈 ============
+//
+// 背景（一条真实的踩坑记录）：
+//
+// 网盘资源的 FileID 是一串短 hash（既不是路径、也不含后缀），而 Title 在
+// 入库时被刻意剥掉了扩展名。对"上线之前就已经入库"的老资源来说，我们手里
+// **一点格式信息都没有** —— 于是 NeedsTranscode 判不出 rmvb，直链被塞进
+// <video>，前端只报「播放地址可能已过期」，运维方向完全跑偏。
+//
+// 但上游 CDN 其实把答案明明白白写在响应头里：
+// 夸克那批动画返回的是 `application/vnd.rn-realmedia-vbr`（RMVB）。
+//
+// 所以这里做一件事：**第一次取流时顺手把 Content-Type 记回资源**。
+// 之后的播放判定就都正确了。代价只有"某个资源第一次播时多失败一次"，
+// 且仅对老数据发生 —— 新导入的资源在 ImportService / instant 里
+// 已经直接把扩展名写进 Ext 了。
+
+// contentTypeExt 把上游的 Content-Type 归一成扩展名（不含点），认不出返回空。
+func contentTypeExt(ct string) string {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	switch strings.ToLower(strings.TrimSpace(ct)) {
+	case "video/mp4":
+		return "mp4"
+	case "video/x-matroska":
+		return "mkv"
+	case "video/x-msvideo", "video/avi", "video/msvideo":
+		return "avi"
+	case "video/x-ms-wmv", "video/x-ms-asf":
+		return "wmv"
+	case "video/quicktime":
+		return "mov"
+	case "video/x-flv", "video/flv":
+		return "flv"
+	case "video/mp2t", "video/vnd.dlna.mpeg-tts":
+		return "ts"
+	case "video/mpeg":
+		return "mpeg"
+	case "video/3gpp":
+		return "3gp"
+	case "video/webm":
+		return "webm"
+	case "video/x-ms-vob":
+		return "vob"
+	case "video/x-m4v":
+		return "m4v"
+	// RealMedia 家族：夸克/百度上大量国内老动画都是这个格式，
+	// 也正是这次"播不了"的主角。
+	case "application/vnd.rn-realmedia", "application/vnd.rn-realmedia-vbr":
+		return "rmvb"
+	case "application/vnd.rn-realmedia-real", "application/x-pn-realmedia":
+		return "rm"
+	case "audio/mpeg":
+		return "mp3"
+	case "audio/mp4", "audio/x-m4a":
+		return "m4a"
+	case "audio/flac", "audio/x-flac":
+		return "flac"
+	case "audio/wav", "audio/x-wav":
+		return "wav"
+	case "application/pdf":
+		return "pdf"
+	}
+	return ""
+}
+
+// learnContainerType 把上游声明的容器格式记回资源。
+//
+// 三条护栏：
+//   - 只认得出扩展名时才写，认不出就什么都不做；
+//   - 只在**原本没有任何格式信息**时写 —— WebDAV 的 FileID 带后缀，
+//     比 CDN 的 MIME 更权威，不能被覆盖掉；
+//   - 写失败只记日志，绝不因为"记格式"这种副业影响正在进行的播放。
+func (h *StreamHandler) learnContainerType(res *model.Resource, contentType string) {
+	if res == nil || res.Ext != "" || contentType == "" {
+		return
+	}
+	ext := contentTypeExt(contentType)
+	if ext == "" {
+		return
+	}
+	err := h.db.Model(&model.Resource{}).
+		Where("id = ? AND (ext IS NULL OR ext = '')", res.ID).
+		UpdateColumn("ext", ext).Error
+	if err != nil {
+		log.Printf("[stream] 记录容器格式失败 resource=%d: %v", res.ID, err)
+		return
+	}
+	res.Ext = ext
 }
 
 // ============ 代理 ============
@@ -198,7 +291,7 @@ func (h *StreamHandler) Serve(c *gin.Context) {
 		link.URL = applyAccel(accel, link.URL)
 	} else if n := h.multiConn(); n > 1 && link.AcceptRanges && link.Size > 0 &&
 		isWholeFileRequest(c.GetHeader("Range")) {
-		if h.serveMultiConn(c, link, n) {
+		if h.serveMultiConn(c, &res, link, n) {
 			return
 		}
 		// 返回 false 表示一个字节都没写出去，可以安全回退到下面的单流。
@@ -234,6 +327,10 @@ func (h *StreamHandler) Serve(c *gin.Context) {
 		util.ServerError(c, fmt.Sprintf("源站返回 %d", resp.StatusCode))
 		return
 	}
+
+	// 上游告诉了我们真实容器格式就记下来（只对老数据补一次，
+	// 详见 learnContainerType 的注释）。
+	h.learnContainerType(&res, resp.Header.Get("Content-Type"))
 
 	for _, name := range serveHeaders {
 		if v := resp.Header.Get(name); v != "" {
@@ -394,7 +491,7 @@ func (h *StreamHandler) fetchRange(ctx context.Context, link *adapter.DirectLink
 //
 // 返回 true 表示已经接管响应（可能已写出数据）；返回 false 表示
 // 一个字节都还没写，调用方可以安全回退到单流。
-func (h *StreamHandler) serveMultiConn(c *gin.Context, link *adapter.DirectLink, n int) bool {
+func (h *StreamHandler) serveMultiConn(c *gin.Context, res *model.Resource, link *adapter.DirectLink, n int) bool {
 	chunks := planChunks(link.Size)
 	if len(chunks) == 0 {
 		return false
@@ -411,6 +508,9 @@ func (h *StreamHandler) serveMultiConn(c *gin.Context, link *adapter.DirectLink,
 	if int64(len(first)) != want {
 		return false
 	}
+
+	// 分块路径同样能拿到 Content-Type，顺手补一次格式信息
+	h.learnContainerType(res, contentType)
 
 	if contentType == "" {
 		contentType = "application/octet-stream"
