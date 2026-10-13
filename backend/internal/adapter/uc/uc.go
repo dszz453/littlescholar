@@ -26,6 +26,10 @@ type UC struct {
 	// token 只对签发它的那个进程有效，所以必须自己存着 —— 轮询时要用。
 	mu       sync.RWMutex
 	sessions map[string]*qrSession
+
+	// probeBase 仅用于登录校验那一次请求，留作测试接缝
+	// （单测里指向 httptest，其余业务请求仍走 apiBase）。
+	probeBase string
 }
 
 type qrSession struct {
@@ -57,6 +61,11 @@ const (
 	// 取值对齐参考实现（xiaoya-alist 的 uc_cookie.py）。
 	clientID = "381"
 	ucUA     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) uc-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
+
+	// statusNotLogin UC 明确表示"未登录"的业务状态码。
+	//
+	// 只有它（而不是任何错误码）才用来判定 cookie 失效。见 checkLoginSession。
+	statusNotLogin = 31001
 )
 
 func (u *UC) headers(cookie string) map[string]string {
@@ -315,6 +324,10 @@ func (u *UC) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*ada
 	if !resp.Success {
 		return nil, adapter.ErrCookieInvalid
 	}
+	// 账号资料接口过了还不够 —— 见 checkLoginSession 的注释。
+	if err := u.checkLoginSession(ctx, cred); err != nil {
+		return nil, err
+	}
 	return &adapter.AccountInfo{
 		Nickname:      resp.Data.Nickname,
 		Avatar:        resp.Data.Avatar,
@@ -322,6 +335,48 @@ func (u *UC) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*ada
 		CapacityUsed:  resp.Data.Capacity.Used,
 		CapacityTotal: resp.Data.Capacity.Total,
 	}, nil
+}
+
+// checkLoginSession 用一次轻量的真实业务请求确认会话"真的能干活"。
+//
+// 为什么不能只靠 ValidateCookie 里那个 account/info：
+// 那是**网页引导接口，游客会话同样返回 success**。线上因此出现过
+// 账号状态显示"有效"、但列目录/转存/播放全部失败的情况 ——
+// 上游真实回应是 HTTP 401 + {"code":31001,"message":"require login [guest]"}。
+// 用户看到"有效"却什么都做不了，比直接标红更难排查。
+//
+// 判据刻意收得很紧：**只有上游明确说"未登录"才判失效**。
+// 限流、超时、网络抖动一律不改判定 —— 用户反馈过反方向的问题
+// （提示 cookie 失效、实际能正常打开），宁可漏报也不能误杀好账号。
+func (u *UC) checkLoginSession(ctx context.Context, cred *adapter.Credential) error {
+	base := apiBase
+	if u.probeBase != "" {
+		base = u.probeBase
+	}
+	var resp struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	// 只取 1 条，尽量轻。
+	//
+	// 这里刻意吞掉 err：DoJSON 对非 2xx 也会解析 body，所以 401 的
+	// code/message 照样拿得到；而网络层失败并不是"未登录"，按上面的
+	// 原则不该改判定。
+	_, _ = u.http.DoJSON(ctx, &adapter.Request{
+		Method:  "GET",
+		URL:     base + "/file/sort",
+		Headers: u.headers(cred.Cookie),
+		Query: map[string]string{
+			"pr": "UCBrowser", "fr": "pc", "pdir_fid": "0",
+			"_page": "1", "_size": "1", "_sort": "file_type:asc,updated_at:desc",
+		},
+	}, &resp)
+
+	if resp.Code == statusNotLogin ||
+		strings.Contains(strings.ToLower(resp.Message), "require login") {
+		return adapter.ErrCookieInvalid
+	}
+	return nil
 }
 
 // ============ 文件操作 ============
