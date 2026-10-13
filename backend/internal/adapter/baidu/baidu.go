@@ -3,12 +3,14 @@ package baidu
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/littlescholar/core/internal/adapter"
@@ -22,6 +24,15 @@ import (
 // 转存的细节参数建议结合实际账号在阶段二联调时校准。
 type Baidu struct {
 	http *adapter.HTTPClient
+
+	// bdstoken 缓存：写操作全都要它，但每个请求都去换一遍太浪费。
+	tokenMu sync.Mutex
+	tokens  map[string]tokenEntry
+}
+
+type tokenEntry struct {
+	token string
+	at    time.Time
 }
 
 func init() {
@@ -29,7 +40,10 @@ func init() {
 }
 
 func New() *Baidu {
-	return &Baidu{http: adapter.NewHTTPClient(30 * time.Second)}
+	return &Baidu{
+		http:   adapter.NewHTTPClient(30 * time.Second),
+		tokens: make(map[string]tokenEntry),
+	}
 }
 
 func (b *Baidu) Type() adapter.DiskType { return adapter.DiskBaidu }
@@ -319,8 +333,18 @@ func (b *Baidu) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 	}
 	items := make([]adapter.FileItem, 0, len(resp.List))
 	for _, f := range resp.List {
+		// 目录的 ID 用**路径**而不是 fs_id。
+		//
+		// 百度 /api/list 的 dir 参数、转存/新建/删除的 path 参数，
+		// 要的都是绝对路径；只有取直链（filemetas）要 fs_id。
+		// 之前目录也返回 fs_id，导致"点进子目录"必定报错、
+		// 转存也拿不到合法的目标路径。文件保持 fs_id 不变。
+		id := fmt.Sprint(f.FsID)
+		if f.IsDir == 1 && f.Path != "" {
+			id = f.Path
+		}
 		items = append(items, adapter.FileItem{
-			ID:        fmt.Sprint(f.FsID),
+			ID:        id,
 			Name:      f.ServerName,
 			IsDir:     f.IsDir == 1,
 			Size:      f.Size,
@@ -333,15 +357,19 @@ func (b *Baidu) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 
 func (b *Baidu) MakeDir(ctx context.Context, cred *adapter.Credential, parentID, name string) (string, error) {
 	path := strings.TrimRight(parentID, "/") + "/" + name
+	token, err := b.bdstoken(ctx, cred)
+	if err != nil {
+		return "", err
+	}
 	var resp struct {
 		Errno int   `json:"errno"`
 		FsID  int64 `json:"fs_id"`
 	}
-	_, err := b.http.DoJSON(ctx, &adapter.Request{
+	_, err = b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
 		URL:     basePanAPI + "/create",
 		Headers: b.headers(cred),
-		Query:   map[string]string{"a": "commit", "bdstoken": "", "web": "1", "app_id": "250528", "clienttype": "0"},
+		Query:   map[string]string{"a": "commit", "bdstoken": token, "web": "1", "app_id": "250528", "clienttype": "0"},
 		Body:    map[string]interface{}{"path": path, "isdir": 1, "block_list": []string{}},
 	}, &resp)
 	if err != nil {
@@ -354,6 +382,11 @@ func (b *Baidu) MakeDir(ctx context.Context, cred *adapter.Credential, parentID,
 }
 
 func (b *Baidu) DeleteFile(ctx context.Context, cred *adapter.Credential, fileIDs []string) error {
+	token, err := b.bdstoken(ctx, cred)
+	if err != nil {
+		return err
+	}
+	// 百度 filemanager 的 filelist 收的是"路径"数组的 JSON 串。
 	var filelist []string
 	for _, id := range fileIDs {
 		filelist = append(filelist, `"`+id+`"`)
@@ -362,11 +395,11 @@ func (b *Baidu) DeleteFile(ctx context.Context, cred *adapter.Credential, fileID
 	var resp struct {
 		Errno int `json:"errno"`
 	}
-	_, err := b.http.DoJSON(ctx, &adapter.Request{
+	_, err = b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
 		URL:     basePanAPI + "/filemanager",
 		Headers: b.headers(cred),
-		Query:   map[string]string{"opera": "delete", "bdstoken": "", "web": "1", "app_id": "250528", "clienttype": "0"},
+		Query:   map[string]string{"opera": "delete", "bdstoken": token, "web": "1", "app_id": "250528", "clienttype": "0"},
 		RawBody: mustRead(body),
 	}, &resp)
 	if err != nil {
@@ -379,14 +412,18 @@ func (b *Baidu) DeleteFile(ctx context.Context, cred *adapter.Credential, fileID
 }
 
 func (b *Baidu) Rename(ctx context.Context, cred *adapter.Credential, fileID, newName string) error {
+	token, err := b.bdstoken(ctx, cred)
+	if err != nil {
+		return err
+	}
 	var resp struct {
 		Errno int `json:"errno"`
 	}
-	_, err := b.http.DoJSON(ctx, &adapter.Request{
+	_, err = b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
 		URL:     basePanAPI + "/filemanager",
 		Headers: b.headers(cred),
-		Query:   map[string]string{"opera": "rename", "bdstoken": "", "web": "1", "app_id": "250528", "clienttype": "0"},
+		Query:   map[string]string{"opera": "rename", "bdstoken": token, "web": "1", "app_id": "250528", "clienttype": "0"},
 		Body:    map[string]interface{}{"filelist": []map[string]string{{"path": fileID, "newname": newName}}},
 	}, &resp)
 	if err != nil {
@@ -464,7 +501,12 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 		ShareURL: shareURL,
 		Passcode: passcode,
 		RootID:   fmt.Sprintf("%d", verifyResp.ShareID),
-		Title:    fmt.Sprintf("百度分享_%s", shareID),
+		// from 参数要的是**分享者的 uk**，不是自己的 uid。
+		// 旧代码把它丢掉了，转存只能传 from=""，服务端直接判参数错误。
+		OwnerID: fmt.Sprintf("%d", verifyResp.UK),
+		// randsk 转存时要作为 sekey 原样回传。
+		SeKey: verifyResp.RandSkey,
+		Title: fmt.Sprintf("百度分享_%s", shareID),
 	}
 	for _, f := range listResp.List {
 		info.Files = append(info.Files, adapter.FileItem{
@@ -472,6 +514,7 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 			Name:  f.ServerName,
 			IsDir: f.IsDir == 1,
 			Size:  f.Size,
+			Ext:   extOf(f.ServerName),
 		})
 		info.TotalSize += f.Size
 	}
@@ -481,37 +524,151 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 	return info, nil
 }
 
+// bdstoken 取百度网盘的操作令牌。
+//
+// 百度的写操作（转存/新建/删除/重命名）全部要在 query 里带 bdstoken，
+// 并且它**不在 cookie 里**，得单独问服务端要。旧代码一律传空串，
+// 于是所有写操作都失败 —— 这正是"转存到百度也是失败的"的根因之一。
+//
+// 令牌会随会话变化，所以缓存 30 分钟即可，不必每次请求都换。
+func (b *Baidu) bdstoken(ctx context.Context, cred *adapter.Credential) (string, error) {
+	key := hashCookie(cred)
+	b.tokenMu.Lock()
+	if t, ok := b.tokens[key]; ok && time.Since(t.at) < 30*time.Minute {
+		token := t.token
+		b.tokenMu.Unlock()
+		return token, nil
+	}
+	b.tokenMu.Unlock()
+
+	var resp struct {
+		Errno  int `json:"errno"`
+		Result struct {
+			Bdstoken string `json:"bdstoken"`
+		} `json:"result"`
+	}
+	_, err := b.http.DoJSON(ctx, &adapter.Request{
+		Method:  "GET",
+		URL:     basePanAPI + "/gettemplatevariable",
+		Headers: b.headers(cred),
+		Query: map[string]string{
+			"fields": `["bdstoken"]`, "clienttype": "0", "app_id": "250528", "web": "1",
+		},
+	}, &resp)
+	if err != nil {
+		return "", err
+	}
+	if resp.Errno != 0 || resp.Result.Bdstoken == "" {
+		return "", fmt.Errorf("获取 bdstoken 失败: errno=%d（Cookie 可能已失效）", resp.Errno)
+	}
+
+	b.tokenMu.Lock()
+	b.tokens[key] = tokenEntry{token: resp.Result.Bdstoken, at: time.Now()}
+	b.tokenMu.Unlock()
+	return resp.Result.Bdstoken, nil
+}
+
+// hashCookie 用 cookie 做缓存键（不落盘，仅进程内）。
+func hashCookie(cred *adapter.Credential) string {
+	h := sha1.Sum([]byte(cred.Cookie))
+	return hex.EncodeToString(h[:])
+}
+
+// SaveToDir 把分享转存到自己的网盘目录。
+//
+// 百度的转存接口对参数极其挑剔，旧实现几乎每一项都是错的：
+//
+//	✗ from=""            必须填**分享者 uk**（ShareInfo.OwnerID）
+//	✗ bdstoken=""        必须填真实令牌
+//	✗ 缺 sekey           必须回传 verify 得到的 randsk
+//	✗ body 走 JSON       必须 form 编码（fsidlist=[..]&path=/x）
+//	✗ path 用目录 ID     必须是自己网盘里的**绝对路径**
+//
+// 另外注意 path 的默认值：空路径对百度没有"根目录"的含义，
+// 必须落到 / 或具体目录，否则 errno=2（参数错误）。
 func (b *Baidu) SaveToDir(ctx context.Context, cred *adapter.Credential, share *adapter.ShareInfo, targetDirID string) (*adapter.SaveResult, error) {
-	// 百度转存：share/transfer
 	var fsidList []string
 	for _, f := range share.Files {
 		fsidList = append(fsidList, f.ID)
 	}
-	var resp struct {
-		Errno  int    `json:"errno"`
-		TaskID int64  `json:"task_id"`
-		ErrMsg string `json:"err_msg"`
+	if len(fsidList) == 0 {
+		return nil, fmt.Errorf("分享里没有可转存的文件")
 	}
-	_, err := b.http.DoJSON(ctx, &adapter.Request{
+
+	token, err := b.bdstoken(ctx, cred)
+	if err != nil {
+		return nil, err
+	}
+
+	// targetDirID 在本适配器里就是"目标路径"。空 / "0" 一律归到根目录。
+	targetPath := strings.TrimSpace(targetDirID)
+	if targetPath == "" || targetPath == "0" {
+		targetPath = "/"
+	}
+	if !strings.HasPrefix(targetPath, "/") {
+		targetPath = "/" + targetPath
+	}
+
+	fsidJSON, _ := json.Marshal(fsidList)
+	form := url.Values{}
+	form.Set("fsidlist", string(fsidJSON))
+	form.Set("path", targetPath)
+
+	q := url.Values{}
+	q.Set("shareid", share.RootID)
+	q.Set("from", share.OwnerID)
+	q.Set("bdstoken", token)
+	q.Set("sekey", share.SeKey)
+	q.Set("channel", "chunlei")
+	q.Set("web", "1")
+	q.Set("app_id", "250528")
+	q.Set("clienttype", "0")
+
+	var resp struct {
+		Errno int `json:"errno"`
+		Info  []struct {
+			Errno int    `json:"errno"`
+			Path  string `json:"path"`
+		} `json:"info"`
+		ShowMsg string `json:"show_msg"`
+		ErrMsg  string `json:"err_msg"`
+	}
+	_, err = b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     panURL + "/share/transfer",
+		URL:     panURL + "/share/transfer?" + q.Encode(),
 		Headers: b.headers(cred),
-		Query:   map[string]string{"shareid": share.RootID, "from": "", "bdstoken": "", "channel": "chunlei", "web": "1", "app_id": "250528", "clienttype": "0"},
-		Body: map[string]interface{}{
-			"fsidlist": fsidList,
-			"path":     targetDirID,
-		},
+		RawBody: []byte(form.Encode()),
 	}, &resp)
 	if err != nil {
 		return nil, err
 	}
-	if resp.Errno != 0 {
-		return nil, fmt.Errorf("百度转存失败: errno=%d msg=%s", resp.Errno, resp.ErrMsg)
+
+	// errno 语义（实测 + 公开实现）：
+	//   0          成功
+	//   12         同名文件已存在 —— 视作成功，用户要的就是"有这份文件"
+	//   -6         cookie 失效
+	//   2 / 其它   参数错误、分享被取消等
+	switch resp.Errno {
+	case 0, 12:
+	default:
+		if resp.Errno == -6 {
+			return nil, adapter.ErrCookieInvalid
+		}
+		msg := orDefault(resp.ShowMsg, resp.ErrMsg, fmt.Sprintf("errno=%d", resp.Errno))
+		return nil, fmt.Errorf("百度转存失败: %s", msg)
 	}
+
+	// 逐项错误码里只要有一个非 0/12 就说明这份文件没进去。
+	for _, it := range resp.Info {
+		if it.Errno != 0 && it.Errno != 12 {
+			return nil, fmt.Errorf("百度转存失败(%s): errno=%d", it.Path, it.Errno)
+		}
+	}
+
 	return &adapter.SaveResult{
 		FileIDs: fsidList,
 		Count:   len(fsidList),
-		Message: fmt.Sprintf("成功转存 %d 个文件", len(fsidList)),
+		Message: fmt.Sprintf("成功转存 %d 个文件到 %s", len(fsidList), targetPath),
 	}, nil
 }
 

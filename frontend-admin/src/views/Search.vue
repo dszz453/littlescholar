@@ -38,7 +38,7 @@
 
         <el-divider direction="vertical" />
 
-        <el-checkbox v-model="checkAlive" size="small">搜索时检测存活</el-checkbox>
+        <el-checkbox v-model="checkAlive" size="small">搜索时检测存活（PanCheck 实时检测）</el-checkbox>
 
         <el-divider direction="vertical" />
 
@@ -264,7 +264,7 @@ const page = ref(1)
 const pageSize = ref(20)
 const searched = ref(false)
 const loading = ref(false)
-const checkAlive = ref(false)
+const checkAlive = ref(true)
 const health = ref({})
 
 const diskOptions = [
@@ -302,7 +302,7 @@ function diskName(t) {
 }
 
 function aliveText(s) {
-  return { ok: '有效', bad: '失效', locked: '需密码', unsupported: '不支持', uncertain: '不确定' }[s] || s
+  return { ok: '有效', bad: '失效', locked: '需密码', unsupported: '不支持', uncertain: '未检出' }[s] || s
 }
 
 function aliveTagType(s) {

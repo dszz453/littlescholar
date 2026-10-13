@@ -60,6 +60,8 @@ export const categoryApi = {
 export const resourceApi = {
   list: (params) => http.get('/app/resources', { params }),
   detail: (id) => http.get(`/app/resources/${id}`),
+  // 资源分布：孩子端「搜系统」按网盘筛选用
+  facets: (params) => http.get('/app/resources/facets', { params }),
 }
 
 export const searchApi = {

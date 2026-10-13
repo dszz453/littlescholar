@@ -259,6 +259,7 @@ func main() {
 		Encryptor: encryptor,
 		Perm:      permService,
 		Pansou:    pansouClient,
+		Pancheck:  pancheckClient,
 		Alive:     aliveSvc,
 		Pool:      pool,
 		Transcode: transcodeSvc,

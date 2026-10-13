@@ -301,7 +301,9 @@ function diskName(t) {
 }
 
 function statusText(s) {
-  return { valid: '正常', invalid: '失效', expired: '过期' }[s] || s
+  // 空状态显示"待检测"而不是原始空串：老数据没有 status 字段，
+  // 之前渲染成空白，看起来像坏了，其实只是还没校验过。
+  return { valid: '正常', invalid: '失效', expired: '过期' }[s] || '待检测'
 }
 function statusTagType(s) {
   return { valid: 'success', invalid: 'danger', expired: 'warning' }[s] || 'info'

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
 	"strconv"
@@ -34,9 +35,26 @@ import (
 const (
 	CfgInstantEnabled    = "instant_enabled"     // 是否开启「搜全网」即时播放
 	CfgInstantDiskType   = "instant_disk_type"   // 默认转存网盘类型
-	CfgInstantAccountID  = "instant_account_id"  // 默认转存账号 ID
+	CfgInstantAccountID  = "instant_account_id"  // 默认转存账号 ID（单值，保留兼容）
 	CfgInstantRemoteDir  = "instant_remote_dir"  // 转存到网盘里的哪个目录（目录 ID，空=根目录）
 	CfgInstantCategoryID = "instant_category_id" // 收录到系统里的哪个目录（空=自动用「搜全网」）
+	// CfgInstantAccountMap 按网盘类型分别指定转存账号，JSON：
+	//
+	//	{"quark":"3","baidu":"5"}
+	//
+	// 为什么要它：全网搜索的结果是**混杂多种网盘**的，只配一个默认账号
+	// 时，碰到别的网盘的结果就只能失败。按下图各挑一个账号，
+	// "点谁转谁"才真正成立。
+	CfgInstantAccountMap = "instant_account_map"
+
+	// CfgInstantRemoteDirMap 按网盘类型分别指定转存目录，JSON：
+	//
+	//	{"quark":"<文件夹fid>","baidu":"/我的资源/搜全网"}
+	//
+	// 必须分类型的原因：夸克/UC 用**目录 ID**，百度用**绝对路径**，
+	// 同一份配置救不了两家。旧版本只有一个 instant_remote_dir，
+	// 配成夸克的 fid 后百度那边必然参数错误。
+	CfgInstantRemoteDirMap = "instant_remote_dir_map"
 )
 
 // instantCategoryName 自动创建的收录目录名
@@ -103,6 +121,27 @@ func (h *ResourceHandler) SearchGlobal(c *gin.Context) {
 	if end > len(resp.List) {
 		end = len(resp.List)
 	}
+	pageItems := resp.List[start:end]
+
+	// 实时有效性检测：只查当前这一页（20 条以内），
+	// 全量查既慢又会把检测服务打满。检测失败不影响搜索本身。
+	if len(pageItems) > 0 {
+		checkItems := make([]service.CheckLinkItem, 0, len(pageItems))
+		for _, it := range pageItems {
+			checkItems = append(checkItems, service.CheckLinkItem{
+				DiskType: it.DiskType, URL: it.URL, Password: it.Password,
+			})
+		}
+		checkCtx, checkCancel := context.WithTimeout(c.Request.Context(), 50*time.Second)
+		states := h.checkLinks(checkCtx, checkItems)
+		for i := range pageItems {
+			if r, ok := states[service.NormalizeShareURL(pageItems[i].URL)]; ok {
+				pageItems[i].Alive = r.State
+				pageItems[i].AliveSummary = r.Summary
+			}
+		}
+		checkCancel()
+	}
 
 	// 告诉前端"当前配置下能不能一键播放"，避免用户点了才发现
 	// 后台根本没配默认转存网盘。
@@ -117,10 +156,12 @@ func (h *ResourceHandler) SearchGlobal(c *gin.Context) {
 		"costMs":             resp.CostMs,
 		"page":               page,
 		"pageSize":           pageSize,
-		"list":               resp.List[start:end],
+		"list":               pageItems,
 		"instantReady":       h.instantReady(),
 		"instantTarget":      h.instantTargetLabel(),
+		"instantTargets":     h.instantTargets(),
 		"availableDiskTypes": h.availableDiskTypes(),
+		"checkEnabled":       h.aliveCheckEnabled(),
 	})
 }
 
@@ -152,7 +193,13 @@ func (h *ResourceHandler) instantReady() bool {
 	if !h.instantEnabled() {
 		return false
 	}
-	_, err := h.pickAccount("", 0)
+	// 配了类型映射：只要其中任意一个账号可用就算就绪
+	for diskType := range h.accountMap() {
+		if _, err := h.pickAccount(diskType, 0); err == nil {
+			return true
+		}
+	}
+	_, err := h.pickAccount("", h.cfgUint(CfgInstantAccountID))
 	return err == nil
 }
 
@@ -218,7 +265,7 @@ func (h *ResourceHandler) InstantPlay(c *gin.Context) {
 		return
 	}
 
-	targetDirID := strings.TrimSpace(h.cfgValue(CfgInstantRemoteDir))
+	targetDirID := h.resolveRemoteDir(acc.DiskType)
 
 	// 4) 转存到目标目录
 	if _, err := a.SaveToDir(ctx, cred, share, targetDirID); err != nil {
@@ -312,10 +359,30 @@ func (h *ResourceHandler) instantPayload(res *model.Resource, files []gin.H, msg
 
 // pickAccount 挑选转存账号。
 //
-// 优先级：显式指定（且类型匹配）> 该类型的默认账号 > 该类型任意有效账号。
+// 优先级：
+//  1. instant_account_map 里该网盘类型指定的账号（最准，也是多网盘并存的关键）
+//  2. 显式指定的账号 ID（且类型匹配）
+//  3. 该网盘类型的默认账号 → 该类型任意有效账号
+//  4. diskType 为空时，退到全局默认（单账号配置的老用法）
+//
 // 显式指定的账号类型不匹配时**静默降级**而不是报错 —— 用户在设置里
 // 配的可能是很久以前删掉的账号，这时按类型兜底比直接失败更有用。
 func (h *ResourceHandler) pickAccount(diskType string, preferID uint64) (*model.DiskAccount, error) {
+	// 1) 按类型的映射配置
+	if diskType != "" {
+		if id := h.accountMap()[diskType]; id > 0 {
+			var acc model.DiskAccount
+			if err := h.db.First(&acc, id).Error; err == nil && acc.DiskType == diskType &&
+				adapter.IsSupported(adapter.DiskType(acc.DiskType)) {
+				if acc.Status == model.DiskAccountValid {
+					return &acc, nil
+				}
+			}
+			// 配的账号被删/失效 → 不报错，继续往下兜底
+		}
+	}
+
+	// 2) 显式指定的账号
 	if preferID > 0 {
 		var acc model.DiskAccount
 		if err := h.db.First(&acc, preferID).Error; err == nil {
@@ -327,6 +394,7 @@ func (h *ResourceHandler) pickAccount(diskType string, preferID uint64) (*model.
 		}
 	}
 
+	// 3) / 4) 按类型或全局的默认账号
 	q := h.db.Model(&model.DiskAccount{}).
 		Where("status = ?", model.DiskAccountValid).
 		// 存储源（WebDAV/本地硬盘）不能用来转存分享，排除掉
@@ -342,6 +410,113 @@ func (h *ResourceHandler) pickAccount(diskType string, preferID uint64) (*model.
 		return nil, fmt.Errorf("没有可用的网盘账号，请先在「资源接入」里绑定")
 	}
 	return &acc, nil
+}
+
+// accountMap 解析 instant_account_map 配置：网盘类型 → 账号 ID。
+//
+// 解析失败一律当空处理：这条配置是"锦上添花"，写坏了不该让
+// 整个即时播放功能不可用。
+func (h *ResourceHandler) accountMap() map[string]uint64 {
+	out := map[string]uint64{}
+	raw := strings.TrimSpace(h.cfgValue(CfgInstantAccountMap))
+	if raw == "" {
+		return out
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return out
+	}
+	for k, v := range m {
+		switch n := v.(type) {
+		case float64:
+			if n > 0 {
+				out[k] = uint64(n)
+			}
+		case string:
+			if id, err := strconv.ParseUint(strings.TrimSpace(n), 10, 64); err == nil && id > 0 {
+				out[k] = id
+			}
+		}
+	}
+	return out
+}
+
+// resolveRemoteDir 取某个网盘类型的转存目标目录。
+//
+// 解析顺序：
+//  1. instant_remote_dir_map 里该类型单独配的
+//  2. 全局 instant_remote_dir —— 但只在"它就是配给这个类型"时才用
+//  3. 都没有 → 空串（各适配器自行落到根目录）
+//
+// 第 2 步的判定看的是**默认账号属于哪个网盘**，而不是 instant_disk_type：
+// 夸克/UC 的目录是 ID、百度的是路径，把夸克的 fid 当百度的路径用
+// 必然参数错误。旧版本只有一个全局目录，正好踩了这个坑。
+func (h *ResourceHandler) resolveRemoteDir(diskType string) string {
+	if diskType == "" {
+		return strings.TrimSpace(h.cfgValue(CfgInstantRemoteDir))
+	}
+	if v, ok := h.stringMap(CfgInstantRemoteDirMap)[diskType]; ok {
+		return v
+	}
+
+	globalDir := strings.TrimSpace(h.cfgValue(CfgInstantRemoteDir))
+	if globalDir == "" {
+		return ""
+	}
+	// 全局目录是跟着"默认转存账号"配的，所以只有当前类型
+	// 与默认账号的类型一致时才可以沿用。
+	if acc, err := h.pickAccount("", h.cfgUint(CfgInstantAccountID)); err == nil && acc.DiskType == diskType {
+		return globalDir
+	}
+	return ""
+}
+
+// stringMap 解析一份「字符串 → 字符串」的 JSON 配置，坏数据当空处理。
+func (h *ResourceHandler) stringMap(key string) map[string]string {
+	out := map[string]string{}
+	raw := strings.TrimSpace(h.cfgValue(key))
+	if raw == "" {
+		return out
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return out
+	}
+	for k, v := range m {
+		switch s := v.(type) {
+		case string:
+			if strings.TrimSpace(s) != "" {
+				out[k] = strings.TrimSpace(s)
+			}
+		case float64:
+			out[k] = strconv.FormatInt(int64(s), 10)
+		}
+	}
+	return out
+}
+
+// instantTargets 每种网盘会转存到哪个账号，供前端展示。
+//
+// 例如 {"quark":"夸克网盘 · 我的夸克","baidu":"百度网盘 · 老账号"}。
+func (h *ResourceHandler) instantTargets() map[string]string {
+	out := map[string]string{}
+	for diskType := range h.accountMap() {
+		if acc, err := h.pickAccount(diskType, 0); err == nil {
+			out[diskType] = adapter.DiskTypeNames[adapter.DiskType(acc.DiskType)] + " · " + acc.Nickname
+		}
+	}
+	// 没配映射时，保留单账号的语义，让前端仍能显示"会转存到哪里"
+	if len(out) == 0 {
+		if acc, err := h.pickAccount("", h.cfgUint(CfgInstantAccountID)); err == nil {
+			out[acc.DiskType] = adapter.DiskTypeNames[adapter.DiskType(acc.DiskType)] + " · " + acc.Nickname
+		}
+	}
+	return out
+}
+
+// aliveCheckEnabled 是否配置了存活性检测引擎（前端据此决定要不要显示有效性标）。
+func (h *ResourceHandler) aliveCheckEnabled() bool {
+	return h.pancheck.Configured() || h.pansou != nil
 }
 
 // instantCategory 取（或创建）收录目录。

@@ -105,6 +105,44 @@
                 网盘目录，并立即开始播放（边下边播）。
               </div>
             </el-form-item>
+            <el-form-item label="各网盘转存账号">
+              <div class="type-map">
+                <div v-for="row in diskTypeRows" :key="row.type" class="type-row">
+                  <span class="type-name">{{ diskName(row.type) }}</span>
+                  <el-select
+                    v-model="accountMap[row.type]"
+                    clearable
+                    size="small"
+                    placeholder="用默认账号"
+                    style="width: 190px"
+                  >
+                    <el-option
+                      v-for="a in row.accounts"
+                      :key="a.id"
+                      :label="a.nickname"
+                      :value="String(a.id)"
+                    />
+                  </el-select>
+                  <el-input
+                    v-model="dirMap[row.type]"
+                    size="small"
+                    readonly
+                    :placeholder="row.type === 'baidu' ? '根目录（百度用绝对路径）' : '根目录'"
+                    style="width: 230px"
+                  />
+                  <el-button size="small" :disabled="!row.accounts.length" @click="openBrowseFor(row)">
+                    浏览
+                  </el-button>
+                </div>
+                <div v-if="!diskTypeRows.length" class="text-secondary">
+                  还没有可用的网盘账号，请先到「资源接入」里添加。
+                </div>
+              </div>
+              <div class="text-secondary">
+                全网搜到的结果来自<b>多种网盘</b>，这里给每种网盘各指定一个转存账号，
+                点开任意网盘的结果都能「即转即放」。没指定的网盘会退回下面的默认账号。
+              </div>
+            </el-form-item>
             <el-form-item label="默认转存账号">
               <el-select v-model="config.instant_account_id" clearable placeholder="留空则用该网盘的默认账号" style="width: 100%">
                 <el-option
@@ -114,15 +152,16 @@
                   :value="String(a.id)"
                 />
               </el-select>
+              <div class="text-secondary">兜底账号：上面没单独指定的网盘会用它。</div>
             </el-form-item>
-            <el-form-item label="转存到目录">
+            <el-form-item label="兜底转存目录">
               <el-input v-model="config.instant_remote_dir" readonly placeholder="根目录">
                 <template #append>
                   <el-button :disabled="!browseAccountId" @click="openBrowse">浏览</el-button>
                 </template>
               </el-input>
               <div class="text-secondary">
-                转存到该账号里的哪个目录（留空 = 根目录）。选「默认转存账号」后才可浏览。
+                只对「默认转存账号」生效（各网盘的目录请在上面分别设置）。
               </div>
             </el-form-item>
             <el-form-item label="收录到目录">
@@ -224,7 +263,16 @@ const config = ref({
   instant_account_id: '',
   instant_remote_dir: '',
   instant_category_id: '',
+  // 下面两项是 JSON 字符串（后端按 JSON 解析）。
+  // 用字符串而不是对象，是为了复用 save() 里"全部转成字符串"的逻辑。
+  instant_account_map: '',
+  instant_remote_dir_map: '',
 })
+
+// 按网盘类型分别配置转存账号 / 目录。
+// UI 上用 {类型: 值} 的对象，保存前序列化成 JSON 字符串。
+const accountMap = ref({})
+const dirMap = ref({})
 const status = ref({})
 const saving = ref(false)
 
@@ -232,6 +280,17 @@ const saving = ref(false)
 const accounts = ref([])
 const categoryTree = ref([])
 const transferAccounts = computed(() => accounts.value.filter((a) => !a.isStorage))
+
+// diskTypeRows 每种网盘一行：类型 + 该类型下可选的账号。
+// 只列出**已绑定账号**的网盘 —— 没账号的网盘配了也用不了。
+const diskTypeRows = computed(() => {
+  const byType = new Map()
+  for (const a of transferAccounts.value) {
+    if (!byType.has(a.diskType)) byType.set(a.diskType, [])
+    byType.get(a.diskType).push(a)
+  }
+  return [...byType.entries()].map(([type, list]) => ({ type, accounts: list }))
+})
 const browseAccountId = computed(() => {
   if (config.value.instant_account_id) return Number(config.value.instant_account_id)
   return transferAccounts.value.length ? transferAccounts.value[0].id : null
@@ -269,10 +328,44 @@ async function load() {
         config.value[k] = numeric.includes(k) ? Number(res[k]) : res[k]
       }
     })
+    // 视图内的对象形态与保存用的 JSON 字符串互相转换
+    accountMap.value = safeParseMap(res.instant_account_map)
+    dirMap.value = safeParseMap(res.instant_remote_dir_map)
   } catch (e) {
     /* 忽略 */
   }
 }
+
+// safeParseMap 解析 {类型: 值} 的 JSON，坏数据一律当空。
+function safeParseMap(raw) {
+  if (!raw) return {}
+  try {
+    const m = JSON.parse(raw)
+    return m && typeof m === 'object' ? m : {}
+  } catch (e) {
+    return {}
+  }
+}
+
+// 把两份映射同步回配置字符串（保存时直接用）。
+watch(
+  [accountMap, dirMap],
+  () => {
+    const clean = (o) => {
+      const out = {}
+      Object.keys(o).forEach((k) => {
+        const v = o[k]
+        if (v !== undefined && v !== null && String(v).trim() !== '') out[k] = String(v)
+      })
+      return out
+    }
+    const am = clean(accountMap.value)
+    const dm = clean(dirMap.value)
+    config.value.instant_account_map = Object.keys(am).length ? JSON.stringify(am) : ''
+    config.value.instant_remote_dir_map = Object.keys(dm).length ? JSON.stringify(dm) : ''
+  },
+  { deep: true }
+)
 
 async function loadAccounts() {
   try {
@@ -291,13 +384,32 @@ async function loadCategories() {
 }
 
 // ===== 转存目录浏览 =====
+// browseCtx.type 为空表示"兜底目录"，否则表示给某个网盘类型单独选。
+const browseCtx = ref({ accountId: null, type: '' })
+
 async function openBrowse() {
   if (!browseAccountId.value) {
     ElMessage.warning('请先在「资源接入」里添加一个网盘账号')
     return
   }
+  browseCtx.value = { accountId: browseAccountId.value, type: '' }
   stack.value = []
   // 已配置的远端目录作为起点无法反查路径，这里固定从根目录开始选
+  dirs.value = []
+  browseDialog.value = true
+  await loadBrowse('')
+}
+
+// openBrowseFor 给某个网盘类型选目录。
+// 该网盘还没单独指定账号时，用它的第一个账号去浏览 —— 否则没法列目录。
+async function openBrowseFor(row) {
+  const accountId = Number(accountMap.value[row.type] || 0) || row.accounts[0]?.id
+  if (!accountId) {
+    ElMessage.warning(`请先为${diskName(row.type)}添加一个账号`)
+    return
+  }
+  browseCtx.value = { accountId, type: row.type }
+  stack.value = []
   dirs.value = []
   browseDialog.value = true
   await loadBrowse('')
@@ -306,7 +418,7 @@ async function openBrowse() {
 async function loadBrowse(dirId) {
   browsing.value = true
   try {
-    const res = await diskApi.browse(browseAccountId.value, dirId)
+    const res = await diskApi.browse(browseCtx.value.accountId, dirId)
     dirs.value = (res.items || []).filter((i) => i.isDir)
   } catch (e) {
     dirs.value = []
@@ -327,7 +439,13 @@ async function goUp() {
 
 function confirmBrowse() {
   const cur = stack.value.length ? stack.value[stack.value.length - 1] : null
-  config.value.instant_remote_dir = cur ? cur.id : ''
+  const id = cur ? cur.id : ''
+  if (browseCtx.value.type) {
+    // 选中的是"某网盘的目录"，写进映射表
+    dirMap.value = { ...dirMap.value, [browseCtx.value.type]: id }
+  } else {
+    config.value.instant_remote_dir = id
+  }
   browseDialog.value = false
 }
 
@@ -396,5 +514,23 @@ onMounted(() => {
 }
 .dir-item:hover {
   background: var(--ls-bg);
+}
+
+/* 按网盘分别配置：一行一件事，窄屏自动换行 */
+.type-map {
+  width: 100%;
+}
+.type-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.type-name {
+  width: 74px;
+  flex: 0 0 auto;
+  font-size: 13px;
+  color: var(--ls-text-sub);
 }
 </style>

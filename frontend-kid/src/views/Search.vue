@@ -25,6 +25,28 @@
           搜全网
         </button>
       </div>
+
+      <!-- 网盘筛选：只在「搜系统」出现。
+           只列出结果里真实存在的网盘，点了就按它过滤 —— 与后台
+           「资源搜索」的按网盘筛选是同一套语义。 -->
+      <div v-if="scope === 'system' && diskFacets.length > 1" class="disk-filter">
+        <span
+          class="df-chip pressable"
+          :class="{ on: activeDisk === '' }"
+          @click="pickDisk('')"
+        >
+          全部
+        </span>
+        <span
+          v-for="f in diskFacets"
+          :key="f.diskType"
+          class="df-chip pressable"
+          :class="{ on: activeDisk === f.diskType }"
+          @click="pickDisk(f.diskType)"
+        >
+          {{ f.name }} {{ f.total }}
+        </span>
+      </div>
     </header>
 
     <div class="page-pad">
@@ -60,7 +82,9 @@
         <div v-else class="empty">
           <span class="emoji">🔍</span>
           <p>没有找到「{{ keyword }}」</p>
-          <p class="text-sub">换个词试试看吧</p>
+          <p class="text-sub">
+            {{ activeDisk ? '换个网盘或点「全部」试试看吧' : '换个词试试看吧' }}
+          </p>
         </div>
       </template>
 
@@ -105,6 +129,9 @@
               <div class="g-meta">
                 <span class="g-chip" :style="{ color: tintOf(r.diskType), background: tintBg(r.diskType) }">
                   {{ diskName(r.diskType) }}
+                </span>
+                <span v-if="r.alive" class="g-chip" :class="aliveClass(r.alive)">
+                  {{ aliveText(r.alive) }}
                 </span>
                 <span v-if="r.source" class="g-chip plain">{{ r.source }}</span>
                 <span v-if="r.datetime" class="g-chip plain">{{ shortDate(r.datetime) }}</span>
@@ -155,6 +182,9 @@ const loading = ref(false)
 const results = ref([])
 const total = ref(0)
 const allResources = ref([])
+// 网盘筛选：activeDisk 为空 = 全部；diskFacets 是"当前结果里真实存在的网盘"
+const activeDisk = ref('')
+const diskFacets = ref([])
 
 // —— 搜全网 ——
 const globalSearched = ref(false)
@@ -202,6 +232,14 @@ function titleOf(r) {
   if (t) return t.replace(/<[^>]+>/g, '').slice(0, 60)
   return `${diskName(r.diskType)}分享`
 }
+
+// 有效性状态（由后端实时调用 PanCheck 得到）
+function aliveText(s) {
+  return { ok: '有效', bad: '已失效', locked: '需密码', unsupported: '不支持', uncertain: '未检出' }[s] || s
+}
+function aliveClass(s) {
+  return { ok: 'alive-ok', bad: 'alive-bad', locked: 'alive-warn', uncertain: 'alive-unk' }[s] || 'alive-unk'
+}
 function shortDate(s) {
   if (!s) return ''
   const d = new Date(s)
@@ -214,7 +252,6 @@ function switchScope(s) {
   scope.value = s
   if (keyword.value.trim()) doSearch(keyword.value)
 }
-
 // isSupported 该结果对应的网盘类型是否已绑定账号。
 // availableTypes 为空（老后端 / 未返回）时一律视为可点，避免误伤。
 function isSupported(r) {
@@ -233,21 +270,48 @@ async function doSystemSearch(q) {
   if (!q) {
     searched.value = false
     results.value = []
+    diskFacets.value = []
     return
   }
   searched.value = true
   loading.value = true
   try {
-    const data = await resourceApi.list({ keyword: q, page: 1, pageSize: 30 })
+    const params = { keyword: q, page: 1, pageSize: 30 }
+    if (activeDisk.value) params.diskType = activeDisk.value
+    const data = await resourceApi.list(params)
     const list = data?.list || []
     results.value = list
     total.value = data?.total ?? list.length
+    // 筛选标签跟搜索结果同步刷新：没有结果的网盘不该继续占位置
+    refreshFacets(q)
   } catch {
     results.value = []
     total.value = 0
   } finally {
     loading.value = false
   }
+}
+
+// refreshFacets 拉一次"结果里有哪些网盘"。
+// 不传 diskType —— 标签要反映全部可选网盘，否则一旦筛了某一种，
+// 其他网盘的入口就消失了，孩子再也切不回去。
+async function refreshFacets(q) {
+  try {
+    const data = await resourceApi.facets({ keyword: q })
+    diskFacets.value = data?.diskTypes || []
+    // 当前筛选的网盘在新结果里不存在了 → 自动回到"全部"
+    if (activeDisk.value && !diskFacets.value.some((f) => f.diskType === activeDisk.value)) {
+      activeDisk.value = ''
+    }
+  } catch {
+    diskFacets.value = []
+  }
+}
+
+function pickDisk(t) {
+  if (activeDisk.value === t) return
+  activeDisk.value = t
+  if (keyword.value.trim()) doSystemSearch(keyword.value)
 }
 
 async function doGlobalSearch(q) {
@@ -361,6 +425,54 @@ onMounted(async () => {
   background: linear-gradient(135deg, #5b8ff9, #4a7ef0);
   color: #fff;
   box-shadow: 0 4px 14px rgba(91, 143, 249, 0.35);
+}
+
+/* 网盘筛选：横向可滚动，避免网盘多时挤成两行把搜索栏推走 */
+.disk-filter {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  padding-bottom: 2px;
+}
+.disk-filter::-webkit-scrollbar {
+  display: none;
+}
+.df-chip {
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: #fff;
+  color: var(--c-text-sub, #6b7c8f);
+  font-size: 13px;
+  border: 1px solid rgba(15, 40, 80, 0.08);
+  white-space: nowrap;
+}
+.df-chip.on {
+  background: rgba(91, 143, 249, 0.12);
+  color: #4a7ef0;
+  border-color: rgba(91, 143, 249, 0.4);
+  font-weight: 600;
+}
+
+/* 全网结果的有效性标（实时由 PanCheck 检出） */
+.alive-ok {
+  color: #12a15b;
+  background: rgba(18, 161, 91, 0.12);
+}
+.alive-bad {
+  color: #e04b4b;
+  background: rgba(224, 75, 75, 0.12);
+}
+.alive-warn {
+  color: #d68a1a;
+  background: rgba(214, 138, 26, 0.14);
+}
+.alive-unk {
+  color: #7f8c9a;
+  background: rgba(127, 140, 154, 0.12);
 }
 
 .hot {

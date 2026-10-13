@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/littlescholar/core/internal/adapter"
 	"github.com/littlescholar/core/internal/model"
 	"github.com/littlescholar/core/internal/service"
 	"github.com/littlescholar/core/internal/util"
@@ -16,6 +17,9 @@ type ResourceHandler struct {
 	db     *gorm.DB
 	perm   *service.PermissionService
 	pansou *service.PansouClient
+	// pancheck 存活性检测（PanCheck）。配置了它就用它 —— 它对平台的
+	// 识别比 PanSou 的通用探测准，也是用户在「系统设置」里指定的那一个。
+	pancheck *service.PancheckClient
 	// encryptor 与 importSvc 仅在「从存储源导入」时需要：
 	// 要列出 WebDAV 目录内容就必须先解密账号凭据。
 	// 其余接口不碰它们。
@@ -23,14 +27,66 @@ type ResourceHandler struct {
 	importSvc *service.ImportService
 }
 
-func NewResourceHandler(db *gorm.DB, perm *service.PermissionService, pansou *service.PansouClient, encryptor *util.Encryptor) *ResourceHandler {
+func NewResourceHandler(db *gorm.DB, perm *service.PermissionService, pansou *service.PansouClient,
+	pancheck *service.PancheckClient, encryptor *util.Encryptor) *ResourceHandler {
 	return &ResourceHandler{
 		db:        db,
 		perm:      perm,
 		pansou:    pansou,
+		pancheck:  pancheck,
 		encryptor: encryptor,
 		importSvc: service.NewImportService(db),
 	}
+}
+
+// checkLinks 统一的链接存活性检测入口。
+//
+// 优先 PanCheck，未配置或调用失败时回退 PanSou 的检测接口。
+// 返回 map[归一化URL]CheckResult —— 按 URL 建索引是刻意的：
+// 两个引擎返回的都是链接字符串，而搜索结果里的链接常带参数，
+// 直接用原串匹配会大面积对不上。
+//
+// 失败时返回空 map 而不是 error：有效性只是"锦上添花"的标注，
+// 不该因为检测引擎挂了就让整个搜索失败。
+func (h *ResourceHandler) checkLinks(ctx context.Context, items []service.CheckLinkItem) map[string]service.CheckResult {
+	out := make(map[string]service.CheckResult, len(items))
+	if len(items) == 0 {
+		return out
+	}
+
+	if h.pancheck != nil && h.pancheck.Configured() {
+		links := make([]string, 0, len(items))
+		for _, it := range items {
+			links = append(links, it.URL)
+		}
+		if states, err := h.pancheck.Check(ctx, links); err == nil {
+			for _, it := range items {
+				key := service.NormalizeShareURL(it.URL)
+				state := states[key]
+				if state == "" {
+					state = service.AliveUncertain
+				}
+				out[key] = service.CheckResult{
+					URL: it.URL, NormalizedURL: key,
+					State: state, Summary: service.AliveSummary(state),
+				}
+			}
+			return out
+		}
+	}
+
+	if h.pansou != nil {
+		if results, err := h.pansou.CheckLinks(ctx, items); err == nil {
+			for _, r := range results {
+				key := service.NormalizeShareURL(r.URL)
+				out[key] = service.CheckResult{
+					URL: r.URL, NormalizedURL: key,
+					State: r.State, Summary: r.Summary,
+				}
+			}
+		}
+	}
+	return out
 }
 
 // List 资源列表
@@ -76,6 +132,52 @@ func (h *ResourceHandler) List(c *gin.Context) {
 		return
 	}
 	util.Page(c, total, page, pageSize, list)
+}
+
+// Facets 资源分布统计。
+//
+// GET /app/resources/facets?keyword=&categoryId=
+//
+// 给「搜系统」做网盘筛选用的：只列出**当前结果里真正存在**的网盘类型
+// 及其数量。如果不管有没有内容都把 7 种网盘全列出来，孩子点进去
+// 只会看到空白页，反而更困惑。
+func (h *ResourceHandler) Facets(c *gin.Context) {
+	keyword := c.Query("keyword")
+	categoryID := util.GetUintQuery(c, "categoryId", 0)
+
+	q := h.db.Model(&model.Resource{})
+	if keyword != "" {
+		q = q.Where("title LIKE ?", "%"+keyword+"%")
+	}
+	if categoryID > 0 {
+		q = q.Where("category_id = ?", categoryID)
+	}
+
+	var rows []struct {
+		DiskType string `json:"diskType"`
+		Total    int64  `json:"total"`
+	}
+	if err := q.Select("disk_type, count(*) as total").Group("disk_type").Scan(&rows).Error; err != nil {
+		util.ServerError(c, "统计失败")
+		return
+	}
+
+	list := make([]gin.H, 0, len(rows)+1)
+	var total int64
+	for _, r := range rows {
+		total += r.Total
+		if r.DiskType == "" {
+			// 手工创建、没有绑定网盘的资源归到"系统资源"
+			list = append(list, gin.H{"diskType": "", "name": "系统资源", "total": r.Total})
+			continue
+		}
+		name := adapter.DiskTypeNames[adapter.DiskType(r.DiskType)]
+		if name == "" {
+			name = r.DiskType
+		}
+		list = append(list, gin.H{"diskType": r.DiskType, "name": name, "total": r.Total})
+	}
+	util.OK(c, gin.H{"total": total, "diskTypes": list})
 }
 
 // Detail 资源详情
@@ -346,17 +448,12 @@ func (h *ResourceHandler) Search(c *gin.Context) {
 				DiskType: it.DiskType, URL: it.URL, Password: it.Password,
 			})
 		}
-		checkCtx, checkCancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-		if results, err := h.pansou.CheckLinks(checkCtx, checkItems); err == nil {
-			stateMap := make(map[string]service.CheckResult, len(results))
-			for _, r := range results {
-				stateMap[normalizeURL(r.URL)] = r
-			}
-			for i := range pageItems {
-				if r, ok := stateMap[normalizeURL(pageItems[i].URL)]; ok {
-					pageItems[i].Alive = r.State
-					pageItems[i].AliveSummary = r.Summary
-				}
+		checkCtx, checkCancel := context.WithTimeout(c.Request.Context(), 50*time.Second)
+		stateMap := h.checkLinks(checkCtx, checkItems)
+		for i := range pageItems {
+			if r, ok := stateMap[normalizeURL(pageItems[i].URL)]; ok {
+				pageItems[i].Alive = r.State
+				pageItems[i].AliveSummary = r.Summary
 			}
 		}
 		checkCancel()

@@ -18,15 +18,17 @@ import (
 
 // SystemHandler 系统配置
 type SystemHandler struct {
-	db     *gorm.DB
-	cfg    *config.Config
-	pansou *service.PansouClient
-	pool   *task.WorkerPool
-	start  time.Time
+	db       *gorm.DB
+	cfg      *config.Config
+	pansou   *service.PansouClient
+	pancheck *service.PancheckClient
+	pool     *task.WorkerPool
+	start    time.Time
 }
 
-func NewSystemHandler(db *gorm.DB, cfg *config.Config, pansou *service.PansouClient, pool *task.WorkerPool, start time.Time) *SystemHandler {
-	return &SystemHandler{db: db, cfg: cfg, pansou: pansou, pool: pool, start: start}
+func NewSystemHandler(db *gorm.DB, cfg *config.Config, pansou *service.PansouClient,
+	pancheck *service.PancheckClient, pool *task.WorkerPool, start time.Time) *SystemHandler {
+	return &SystemHandler{db: db, cfg: cfg, pansou: pansou, pancheck: pancheck, pool: pool, start: start}
 }
 
 // GetConfig 获取系统配置
@@ -112,6 +114,19 @@ func (h *SystemHandler) applyExternalConfig(changed map[string]string) {
 		h.pansou.Configure(cur("pansou_url", h.cfg.External.PansouURL),
 			cur("pansou_token", h.cfg.External.PansouToken))
 	}
+
+	// PanCheck 同样要能热更新 —— 否则"改了地址但检测还用老的"，
+	// 排查起来比配置没改还费劲。
+	if h.pancheck != nil {
+		if _, ok := changed["pancheck_url"]; ok {
+			h.pancheck.Configure(cur("pancheck_url", h.cfg.External.PancheckURL),
+				cur("pancheck_password", h.cfg.External.PancheckPass))
+			log.Printf("[system] PanCheck 地址已热更新为 %s", cur("pancheck_url", h.cfg.External.PancheckURL))
+		} else if _, ok := changed["pancheck_password"]; ok {
+			h.pancheck.Configure(cur("pancheck_url", h.cfg.External.PancheckURL),
+				cur("pancheck_password", h.cfg.External.PancheckPass))
+		}
+	}
 }
 
 // Status 系统状态
@@ -132,6 +147,14 @@ func (h *SystemHandler) Status(c *gin.Context) {
 		pansouOnline = true
 	}
 
+	// pancheck（存活性检测）
+	pancheckOnline := false
+	if h.pancheck != nil && h.pancheck.Configured() {
+		if err := h.pancheck.Health(ctx); err == nil {
+			pancheckOnline = true
+		}
+	}
+
 	// 统计
 	var userCount, resourceCount, categoryCount, taskCount int64
 	h.db.Model(&model.User{}).Count(&userCount)
@@ -149,6 +172,7 @@ func (h *SystemHandler) Status(c *gin.Context) {
 		"uptime":         int(time.Since(h.start).Seconds()),
 		"dbOnline":       dbOnline,
 		"pansouOnline":   pansouOnline,
+		"pancheckOnline": pancheckOnline,
 		"goroutines":     runtime.NumGoroutine(),
 		"memoryMB":       m.Alloc / 1024 / 1024,
 		"transferQueue":  h.pool.QueueLen(),

@@ -123,6 +123,10 @@ func SeedDefaultData(db *gorm.DB, adminUser, adminPassHash string) error {
 		"instant_account_id":  "",
 		"instant_remote_dir":  "",
 		"instant_category_id": "",
+		// 多网盘并存：按网盘类型各指定一个转存账号 / 目录。
+		// 搜全网的结果是混杂多种网盘的，只配一个账号时别的网盘必然失败。
+		"instant_account_map":    "",
+		"instant_remote_dir_map": "",
 	}
 	for k, v := range defaults {
 		var existed int64

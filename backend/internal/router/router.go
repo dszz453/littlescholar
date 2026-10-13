@@ -26,6 +26,7 @@ type Deps struct {
 	Encryptor *util.Encryptor
 	Perm      *service.PermissionService
 	Pansou    *service.PansouClient
+	Pancheck  *service.PancheckClient
 	Alive     *service.ResourceAliveService
 	Pool      *task.WorkerPool
 	Transcode *service.TranscodeService
@@ -51,7 +52,7 @@ func Setup(deps *Deps) *gin.Engine {
 	// 初始化各 handler
 	authH := handler.NewAuthHandler(deps.DB, deps.JWT)
 	categoryH := handler.NewCategoryHandler(deps.DB, deps.Perm)
-	resourceH := handler.NewResourceHandler(deps.DB, deps.Perm, deps.Pansou, deps.Encryptor)
+	resourceH := handler.NewResourceHandler(deps.DB, deps.Perm, deps.Pansou, deps.Pancheck, deps.Encryptor)
 	userH := handler.NewUserHandler(deps.DB, deps.Perm)
 	diskH := handler.NewDiskHandler(deps.DB, deps.Encryptor)
 	transferH := handler.NewTransferHandler(deps.DB, deps.Encryptor, deps.Pool)
@@ -59,7 +60,7 @@ func Setup(deps *Deps) *gin.Engine {
 	studyH := handler.NewStudyHandler(deps.DB, aiH)
 	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret)
 	streamH := handler.NewStreamHandler(deps.DB, deps.Encryptor, deps.Cfg.JWT.Secret)
-	systemH := handler.NewSystemHandler(deps.DB, deps.Cfg, deps.Pansou, deps.Pool, deps.StartedAt)
+	systemH := handler.NewSystemHandler(deps.DB, deps.Cfg, deps.Pansou, deps.Pancheck, deps.Pool, deps.StartedAt)
 	transcodeH := handler.NewTranscodeHandler(deps.DB, deps.Transcode)
 	aliveH := handler.NewAliveHandler(deps.DB, deps.Alive)
 	mappingH := handler.NewMappingHandler(deps.DB, deps.Encryptor)
@@ -211,6 +212,8 @@ func Setup(deps *Deps) *gin.Engine {
 		app.GET("/categories/tree", categoryH.AppTree)
 
 		app.GET("/resources", resourceH.List) // 复用，权限在 AppTree 层面已过滤
+		// facets 必须注册在 /:id 之前，否则会被当成资源 ID
+		app.GET("/resources/facets", resourceH.Facets)
 		app.GET("/resources/:id", resourceH.Detail)
 
 		// 搜一搜 · 搜全网 + 即时转存播放

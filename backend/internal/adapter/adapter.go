@@ -89,12 +89,20 @@ type LoginResult struct {
 
 // FileItem 网盘文件项
 type FileItem struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	IsDir    bool   `json:"isDir"`
-	Size     int64  `json:"size"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	IsDir     bool   `json:"isDir"`
+	Size      int64  `json:"size"`
 	UpdatedAt string `json:"updatedAt"`
-	Ext      string `json:"ext"`
+	Ext       string `json:"ext"`
+
+	// Token 分享内的一次性访问令牌（夸克/UC 的 share_fid_token）。
+	//
+	// 转存时必须成对提交 (fid, share_fid_token)，两者是一一对应的：
+	// fid 只说明"哪个文件"，token 才说明"凭什么叫你转存"。
+	// 之前把 fid 原样当成 token 传，服务端一律拒绝 —— 这就是
+	// 「夸克/UC 转存失败」的直接原因。
+	Token string `json:"-"`
 }
 
 // ShareInfo 分享链接解析结果
@@ -103,11 +111,27 @@ type ShareInfo struct {
 	Title    string     `json:"title"`
 	Passcode string     `json:"passcode"`
 	Files    []FileItem `json:"files"`
-	// 分享根目录的 ID（转存时需要）
+	// 分享根目录的 ID（转存时需要）。
+	//
+	// 语义各家不同，别混用：
+	//   夸克/UC —— sharepage/token 返回的 stoken
+	//   百度    —— share/verify 返回的 shareid（数字）
 	RootID string `json:"rootId"`
-	// 分享者
+
+	// OwnerID 分享者 ID。
+	//
+	// 百度转存的 from 参数必须填**分享者的 uk**（不是自己的），
+	// 填错或不填会直接 errno=2（参数错误）。
+	OwnerID string `json:"ownerId"`
+
+	// SeKey 分享的附加密钥。
+	//
+	// 百度 share/verify 返回 randsk，转存时要作为 sekey 原样回传。
+	SeKey string `json:"seKey,omitempty"`
+
+	// 分享者昵称
 	OwnerName string `json:"ownerName"`
-	TotalSize int64    `json:"totalSize"`
+	TotalSize int64  `json:"totalSize"`
 }
 
 // SaveResult 转存结果

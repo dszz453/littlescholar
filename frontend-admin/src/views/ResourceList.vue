@@ -32,7 +32,29 @@
                   </el-tag>
                 </div>
               </div>
-              <el-tag v-if="a.status !== 'valid'" size="small" type="danger">失效</el-tag>
+              <!-- 状态标：
+                   只有「确定失效」才标红。未检测过的账号不该被当成坏的 ——
+                   最早的版本只要 status !== valid 就显示"失效"，
+                   于是老数据（状态字段为空）全都挂着红标，
+                   实际却能正常浏览。 -->
+              <el-tag
+                v-if="a.status === 'invalid'"
+                size="small"
+                type="danger"
+                class="src-state"
+                @click.stop="recheck(a)"
+              >
+                失效 · 重检
+              </el-tag>
+              <el-tag
+                v-else-if="a.status !== 'valid'"
+                size="small"
+                type="info"
+                class="src-state"
+                @click.stop="recheck(a)"
+              >
+                待检测
+              </el-tag>
             </div>
             <el-empty
               v-if="!accounts.length"
@@ -266,7 +288,6 @@ import {
   Files,
 } from '@element-plus/icons-vue'
 import { diskApi, mappingApi, categoryApi, resourceApi } from '@/api'
-
 const accounts = ref([])
 const accountId = ref(null)
 const items = ref([])
@@ -369,6 +390,24 @@ async function loadAccounts() {
     }
   } catch (e) {
     /* 忽略 */
+  }
+}
+
+// recheck 重新检测某个接入源。
+//
+// 后端在账号信息接口失败时会退回"能否列根目录"实测，
+// 所以这里的结果比单纯看状态字段更可信。
+async function recheck(a) {
+  try {
+    const res = await diskApi.validate(a.id)
+    if (res?.valid) {
+      ElMessage.success(`${a.nickname} 正常`)
+    } else {
+      ElMessage.warning(res?.message || `${a.nickname} 校验未通过`)
+    }
+    await loadAccounts()
+  } catch (e) {
+    /* 拦截器已提示 */
   }
 }
 
@@ -631,6 +670,11 @@ async function removeLib(row) {
 }
 .src-type {
   margin-top: 2px;
+}
+/* 状态标可点：点一下就地重新校验，省得再去「资源接入」找 */
+.src-state {
+  cursor: pointer;
+  flex: 0 0 auto;
 }
 .src-ico {
   color: #f7ba2a;

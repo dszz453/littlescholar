@@ -303,8 +303,14 @@ func (h *DiskHandler) AddManual(c *gin.Context) {
 	}
 	info, err := a.ValidateCookie(ctx, cred)
 	if err != nil {
-		util.BadRequest(c, "校验失败: "+err.Error())
-		return
+		// 与 Validate 同样的兜底：账号信息接口不通不代表 cookie 不能用。
+		// 能列出根目录就收下，避免"填了明明能用的 cookie 却被拒"。
+		if _, listErr := a.ListDir(ctx, cred, ""); listErr == nil {
+			info = &adapter.AccountInfo{}
+		} else {
+			util.BadRequest(c, "校验失败: "+err.Error())
+			return
+		}
 	}
 
 	encrypted, err := h.encryptor.Encrypt(req.Cookie)
@@ -389,6 +395,18 @@ func (h *DiskHandler) Validate(c *gin.Context) {
 	info, err := a.ValidateCookie(ctx, cred)
 	now := time.Now()
 	if err != nil {
+		// 兜底：账号信息接口换个域名就可能 404/改版，而"能不能列目录"
+		// 才是用户真正在意的能力（也是他判断"实际能点开"的依据）。
+		//
+		// 所以这里再用一次实际使用路径复核：列根目录能成功就判有效，
+		// 只把昵称留空。宁可少标一个"失效"，也不要冤枉一个能用的账号。
+		if _, listErr := a.ListDir(ctx, cred, ""); listErr == nil {
+			h.db.Model(acc).Updates(map[string]interface{}{
+				"status": model.DiskAccountValid, "last_check_at": now,
+			})
+			util.OK(c, gin.H{"valid": true, "message": "账号信息接口不可用，但目录可正常访问"})
+			return
+		}
 		h.db.Model(acc).Updates(map[string]interface{}{
 			"status": model.DiskAccountInvalid, "last_check_at": now,
 		})

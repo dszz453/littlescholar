@@ -246,11 +246,28 @@ func (q *Quark) exchangeTicket(ctx context.Context, ticket string) (string, erro
 	return adapter.MergeCookie(cookie, puus), nil
 }
 
-// ValidateCookie 校验 cookie
+// ValidateCookie 校验 cookie 并取回账号信息。
+//
+// ⚠️ 端点必须用 pan.quark.cn/account/info，**不是** drive-pc 那套。
+// 之前写成 baseURL + "/account/info"（即 drive-pc.quark.cn/1/clouddrive/account/info），
+// 实测该路径恒返回：
+//
+//	{"timestamp":…,"status":404,"error":"Not Found","path":"/1/clouddrive/account/info"}
+//
+// 于是 status=404 ≠ 200，判定恒为"cookie 已失效"——哪怕 cookie 完全正常。
+// 而列目录走的是 drive-pc 的 /file/sort（存在），所以出现
+// 「提示失效、实际能点开」这种自相矛盾的现象。
+//
+// 正确端点的响应体也不是 {status,code} 那套：
+//
+//	{"success":true,"code":"OK","data":{"nickname":…,"avatar_url":…,"vip":…,"capacity":{…}}}
+//
+// code 是**字符串** "OK"，不是数字。旧结构体用 int 接，还会额外触发
+// 反序列化错误。
 func (q *Quark) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*adapter.AccountInfo, error) {
 	var resp struct {
-		Status  int    `json:"status"`
-		Code    int    `json:"code"`
+		Success bool   `json:"success"`
+		Code    string `json:"code"`
 		Message string `json:"message"`
 		Data    struct {
 			Nickname string `json:"nickname"`
@@ -264,14 +281,14 @@ func (q *Quark) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*
 	}
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     baseURL + "/account/info",
-		Query:   map[string]string{"pr": "ucpro", "fr": "pc", "uc_param_str": ""},
+		URL:     accountURL + "/account/info",
+		Query:   map[string]string{"fr": "pc", "platform": "pc"},
 		Headers: q.headers(cred.Cookie),
 	}, &resp)
 	if err != nil {
 		return nil, err
 	}
-	if resp.Status != 200 || resp.Code != 0 {
+	if !resp.Success {
 		return nil, adapter.ErrCookieInvalid
 	}
 	return &adapter.AccountInfo{
@@ -426,6 +443,10 @@ func (q *Quark) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 				FileName string `json:"file_name"`
 				Dir      bool   `json:"dir"`
 				Size     int64  `json:"size"`
+				// share_fid_token 是转存的"准入令牌"，必须逐项带回。
+				// 之前漏读这个字段，SaveToDir 只能拿 fid 冒充 token，
+				// 转存必然失败。
+				ShareFidToken string `json:"share_fid_token"`
 			} `json:"list"`
 			Share struct {
 				Title    string `json:"title"`
@@ -469,6 +490,9 @@ func (q *Quark) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 			IsDir: f.Dir,
 			Size:  f.Size,
 			Ext:   extOf(f.FileName),
+			// 逐项保存转存令牌 —— 注意这是"每个文件一个"，
+			// 不能整份分享共用一个 stoken。
+			Token: f.ShareFidToken,
 		})
 		info.TotalSize += f.Size
 	}
@@ -515,6 +539,17 @@ func (q *Quark) getShareToken(ctx context.Context, cred *adapter.Credential, pwd
 }
 
 // SaveToDir 转存到指定目录
+//
+// 关键点（错一个就整单失败）：
+//
+//	fid_list       —— 文件 ID，来自分享详情
+//	fid_token_list —— 逐项对应的 share_fid_token，**不是 fid 本身**
+//	to_pdir_fid    —— 目标目录 fid（"0" 表示根目录）
+//	pwd_id/stoken  —— 分享 ID 与分享 stoken，缺一会报"分享已失效"
+//	pdir_fid       —— 分享内要转存的父目录，顶层固定 "0"
+//
+// 之前 fid_token_list 直接复制了 fid_list，服务端一律拒绝，
+// 表现就是"夸克转存失败"（百度同理，见 baidu.go）。
 func (q *Quark) SaveToDir(ctx context.Context, cred *adapter.Credential, share *adapter.ShareInfo, targetDirID string) (*adapter.SaveResult, error) {
 	if targetDirID == "" {
 		targetDirID = "0"
@@ -522,7 +557,17 @@ func (q *Quark) SaveToDir(ctx context.Context, cred *adapter.Credential, share *
 	var fids, tokenFids []string
 	for _, f := range share.Files {
 		fids = append(fids, f.ID)
-		tokenFids = append(tokenFids, f.ID)
+		tokenFids = append(tokenFids, f.Token)
+	}
+	if len(fids) == 0 {
+		return nil, fmt.Errorf("分享里没有可转存的文件")
+	}
+	// 令牌缺失就不必发了 —— 直接说清楚原因，比让服务端回一个
+	// 语焉不详的 code 更容易定位。
+	for i, t := range tokenFids {
+		if t == "" {
+			return nil, fmt.Errorf("分享条目 %q 缺少转存令牌，请重新解析分享", share.Files[i].Name)
+		}
 	}
 
 	var resp struct {
@@ -551,8 +596,8 @@ func (q *Quark) SaveToDir(ctx context.Context, cred *adapter.Credential, share *
 	if err != nil {
 		return nil, err
 	}
-	if resp.Code != 0 {
-		return nil, fmt.Errorf("转存失败: code=%d msg=%s", resp.Code, resp.Message)
+	if resp.Status != 200 || resp.Code != 0 {
+		return nil, fmt.Errorf("转存失败: status=%d code=%d msg=%s", resp.Status, resp.Code, resp.Message)
 	}
 
 	// 转存是异步任务，需要轮询任务状态

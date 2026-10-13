@@ -277,11 +277,23 @@ func (u *UC) exchangeTicket(ctx context.Context, ticket string) (string, error) 
 	return adapter.MergeCookie(cookie, puus), nil
 }
 
+// ValidateCookie 校验 cookie 并取回账号信息。
+//
+// ⚠️ 端点必须用 drive.uc.cn/account/info，不能用 pc-api 那套：
+// pc-api.uc.cn/1/clouddrive/account/info 实测恒返回 404，
+// 于是 status=404 ≠ 200，判定恒为"cookie 已失效"（与夸克同款 bug）。
+//
+// 正确端点响应体为：
+//
+//	{"success":true,"code":"OK","data":{"nickname":…,"vip":…,"capacity":{…}}}
+//
+// 注意 code 是字符串 "OK" 而非数字。
 func (u *UC) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*adapter.AccountInfo, error) {
 	var resp struct {
-		Status int `json:"status"`
-		Code   int `json:"code"`
-		Data   struct {
+		Success bool   `json:"success"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
 			Nickname string `json:"nickname"`
 			Avatar   string `json:"avatar_url"`
 			Vip      bool   `json:"vip"`
@@ -293,14 +305,14 @@ func (u *UC) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*ada
 	}
 	_, err := u.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     apiBase + "/account/info",
+		URL:     ucPan + "/account/info",
 		Headers: u.headers(cred.Cookie),
 		Query:   map[string]string{"pr": "UCBrowser", "fr": "pc"},
 	}, &resp)
 	if err != nil {
 		return nil, err
 	}
-	if resp.Status != 200 || resp.Code != 0 {
+	if !resp.Success {
 		return nil, adapter.ErrCookieInvalid
 	}
 	return &adapter.AccountInfo{
@@ -455,6 +467,8 @@ func (u *UC) ParseShare(ctx context.Context, cred *adapter.Credential, shareURL,
 				FileName string `json:"file_name"`
 				Dir      bool   `json:"dir"`
 				Size     int64  `json:"size"`
+				// 与夸克同协议：转存必须逐项回传 share_fid_token。
+				ShareFidToken string `json:"share_fid_token"`
 			} `json:"list"`
 			ShareToken string `json:"share_token"`
 		} `json:"data"`
@@ -485,6 +499,7 @@ func (u *UC) ParseShare(ctx context.Context, cred *adapter.Credential, shareURL,
 	for _, f := range listResp.Data.List {
 		info.Files = append(info.Files, adapter.FileItem{
 			ID: f.FID, Name: f.FileName, IsDir: f.Dir, Size: f.Size, Ext: extOf(f.FileName),
+			Token: f.ShareFidToken,
 		})
 		info.TotalSize += f.Size
 	}
@@ -498,13 +513,23 @@ func (u *UC) SaveToDir(ctx context.Context, cred *adapter.Credential, share *ada
 	if targetDirID == "" {
 		targetDirID = "0"
 	}
-	var fids []string
+	var fids, tokenFids []string
 	for _, f := range share.Files {
 		fids = append(fids, f.ID)
+		tokenFids = append(tokenFids, f.Token)
+	}
+	if len(fids) == 0 {
+		return nil, fmt.Errorf("分享里没有可转存的文件")
+	}
+	for i, t := range tokenFids {
+		if t == "" {
+			return nil, fmt.Errorf("分享条目 %q 缺少转存令牌，请重新解析分享", share.Files[i].Name)
+		}
 	}
 	var resp struct {
-		Code int `json:"code"`
-		Data struct {
+		Status int `json:"status"`
+		Code   int `json:"code"`
+		Data   struct {
 			TaskID string `json:"task_id"`
 		} `json:"data"`
 	}
@@ -514,7 +539,7 @@ func (u *UC) SaveToDir(ctx context.Context, cred *adapter.Credential, share *ada
 		Headers: u.headers(cred.Cookie),
 		Query:   map[string]string{"pr": "UCBrowser", "fr": "pc"},
 		Body: map[string]interface{}{
-			"fid_list": fids, "fid_token_list": fids,
+			"fid_list": fids, "fid_token_list": tokenFids,
 			"to_pdir_fid": targetDirID,
 			"pwd_id":      extractPwdID(share.ShareURL),
 			"stoken":      share.RootID,
@@ -527,10 +552,60 @@ func (u *UC) SaveToDir(ctx context.Context, cred *adapter.Credential, share *ada
 	if resp.Code != 0 {
 		return nil, fmt.Errorf("UC 转存失败: code=%d", resp.Code)
 	}
+	if resp.Data.TaskID != "" {
+		if err := u.waitTask(ctx, cred, resp.Data.TaskID); err != nil {
+			return nil, err
+		}
+	}
 	return &adapter.SaveResult{
 		FileIDs: fids, Count: len(fids),
 		Message: fmt.Sprintf("成功转存 %d 个文件", len(fids)),
 	}, nil
+}
+
+// waitTask 轮询转存任务。
+//
+// UC 与夸克同协议：data.status 2=成功、3=失败、其余表示仍在跑。
+// 不轮询就等于"发完请求就说成功"——转存实际失败也看不出来。
+func (u *UC) waitTask(ctx context.Context, cred *adapter.Credential, taskID string) error {
+	deadline := time.Now().Add(60 * time.Second)
+	var lastMsg string
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1200 * time.Millisecond):
+		}
+		var resp struct {
+			Status int `json:"status"`
+			Code   int `json:"code"`
+			Data   struct {
+				Status  int    `json:"status"`
+				Message string `json:"message"`
+			} `json:"data"`
+		}
+		_, err := u.http.DoJSON(ctx, &adapter.Request{
+			Method:  "GET",
+			URL:     apiBase + "/task/" + taskID,
+			Headers: u.headers(cred.Cookie),
+			Query:   map[string]string{"pr": "UCBrowser", "fr": "pc", "retry_index": "1"},
+		}, &resp)
+		if err != nil {
+			continue
+		}
+		switch resp.Data.Status {
+		case 2:
+			return nil
+		case 3:
+			return fmt.Errorf("UC 转存任务失败: %s", resp.Data.Message)
+		default:
+			lastMsg = resp.Data.Message
+		}
+	}
+	if lastMsg == "" {
+		lastMsg = "任务超时"
+	}
+	return fmt.Errorf("UC 转存任务未在预期时间内完成: %s", lastMsg)
 }
 
 func (u *UC) Transfer(ctx context.Context, cred *adapter.Credential, shareURL, passcode, targetDirID string) (*adapter.SaveResult, error) {
