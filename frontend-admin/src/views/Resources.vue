@@ -7,7 +7,16 @@
           <el-radio-button value="list">列表</el-radio-button>
           <el-radio-button value="tree">目录</el-radio-button>
         </el-radio-group>
+        <el-button :icon="FolderAdd" @click="openCreateDir">新建目录</el-button>
         <el-button :icon="Refresh" @click="loadList">刷新</el-button>
+        <el-button
+          v-if="viewMode === 'list'"
+          :icon="FolderOpened"
+          :disabled="!selected.length"
+          @click="openMoveDialog"
+        >
+          移动到目录
+        </el-button>
         <el-button
           v-if="viewMode === 'list'"
           :icon="VideoPlay"
@@ -193,6 +202,51 @@
       </el-tree>
     </div>
 
+    <!-- 新建目录对话框 -->
+    <el-dialog v-model="dirDialog" title="新建目录" width="480px">
+      <el-form :model="dirForm" label-width="80px">
+        <el-form-item label="目录名称">
+          <el-input v-model="dirForm.name" placeholder="例如：新概念英语" />
+        </el-form-item>
+        <el-form-item label="上级目录">
+          <el-tree-select
+            v-model="dirForm.parentId"
+            :data="categoryTree"
+            :props="{ label: 'name', value: 'id', children: 'children' }"
+            check-strictly
+            clearable
+            node-key="id"
+            placeholder="不选则为顶级目录"
+            style="width: 100%"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dirDialog = false">取消</el-button>
+        <el-button type="primary" @click="saveCreateDir">创建</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 移动资源到目录对话框 -->
+    <el-dialog v-model="moveDialog" title="移动到目录" width="480px">
+      <div class="mb-12 text-secondary">
+        已选 {{ selected.length }} 个资源，移动到：
+      </div>
+      <el-tree-select
+        v-model="moveCategoryId"
+        :data="categoryTree"
+        :props="{ label: 'name', value: 'id', children: 'children' }"
+        check-strictly
+        node-key="id"
+        placeholder="选择目标目录"
+        style="width: 100%"
+      />
+      <template #footer>
+        <el-button @click="moveDialog = false">取消</el-button>
+        <el-button type="primary" @click="saveMove">移动</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 编辑对话框 -->
     <el-dialog v-model="editDialog" title="编辑资源" width="520px">
       <el-form :model="editForm" label-width="80px">
@@ -225,7 +279,7 @@
 import { onMounted, reactive, ref, computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Search, Delete, VideoPlay, Folder, Document } from '@element-plus/icons-vue'
+import { Refresh, Search, Delete, VideoPlay, Folder, Document, FolderAdd, FolderOpened } from '@element-plus/icons-vue'
 import { resourceApi, categoryApi } from '@/api'
 
 const route = useRoute()
@@ -250,6 +304,55 @@ const query = reactive({
 
 const editDialog = ref(false)
 const editForm = ref({})
+
+const dirDialog = ref(false)
+const dirForm = reactive({ name: '', parentId: null })
+const moveDialog = ref(false)
+const moveCategoryId = ref(null)
+
+function openCreateDir() {
+  dirForm.name = ''
+  dirForm.parentId = null
+  dirDialog.value = true
+}
+
+async function saveCreateDir() {
+  if (!dirForm.name.trim()) {
+    ElMessage.warning('请输入目录名称')
+    return
+  }
+  try {
+    await categoryApi.create({
+      name: dirForm.name.trim(),
+      parentId: dirForm.parentId || null,
+    })
+    ElMessage.success('目录已创建')
+    dirDialog.value = false
+    await loadCategories()
+  } catch (e) {
+    /* 忽略 */
+  }
+}
+
+function openMoveDialog() {
+  moveCategoryId.value = null
+  moveDialog.value = true
+}
+
+async function saveMove() {
+  if (!moveCategoryId.value) {
+    ElMessage.warning('请选择目标目录')
+    return
+  }
+  try {
+    await resourceApi.move(selected.value.map((r) => r.id), moveCategoryId.value)
+    ElMessage.success('已移动')
+    moveDialog.value = false
+    loadList()
+  } catch (e) {
+    /* 忽略 */
+  }
+}
 
 function diskName(t) {
   return { quark: '夸克', baidu: '百度', uc: 'UC', tianyi: '天翼', aliyun: '阿里', webdav: 'WebDAV' }[t] || t || '-'

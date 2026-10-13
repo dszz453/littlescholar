@@ -163,12 +163,14 @@ func (q *Quark) PollQRCode(ctx context.Context, sessionID string) (*adapter.Logi
 		return &adapter.LoginResult{Status: "waiting", Message: "轮询中"}, nil
 	}
 
+	// 夸克 CAS 的 status 语义（对照多个公开实现与实测）：
+	//   2000000 —— 登录成功，data.members.service_ticket 已就绪，可直接换 cookie
+	//   50004001 —— 尚未扫码 / 查询无结果（"Query result is empty"），继续等
+	// 没有独立的「已扫码待确认」中间态（2000001 并不存在）。
+	// 之前这里写 case 2000000 当「待确认」、case 2000001 当「确认成功」，
+	// 结果真正的成功码 2000000 被当成"还要再等"，用户手机确认了也换不到 cookie。
 	switch resp.Status {
 	case 2000000:
-		// 已扫码，待确认
-		return &adapter.LoginResult{Status: "scanned", Message: "已扫码，请在手机上确认"}, nil
-	case 2000001:
-		// 确认成功，用 service_ticket 换 cookie
 		ticket := resp.Data.Members.ServiceTicket
 		if ticket == "" {
 			return &adapter.LoginResult{Status: "failed", Message: "未获取到 service ticket"}, nil
@@ -189,20 +191,33 @@ func (q *Quark) PollQRCode(ctx context.Context, sessionID string) (*adapter.Logi
 	}
 }
 
-// exchangeTicket 用 service ticket 换取 cookie
+// exchangeTicket 用 service ticket 换取 cookie。
+//
+// 正确的换票接口是 pan.quark.cn/account/info，参数名是 st（不是 ticket），
+// 且要带 lw=scan。之前写的是 /uc/api/account/login?ticket=...，那是错误的
+// 地址——扫码确认后访问一个不存在的回调，拿不到 __puus / __uid 等关键
+// cookie，登录最终失败。这就是「夸克扫码还是不行」的最后一环根因。
+// 参考多个公开实现（52pojie Java 版、xiaoya-alist 的 quark_cookie.py）。
 func (q *Quark) exchangeTicket(ctx context.Context, ticket string) (string, error) {
 	// 夸克登录后 cookie 中关键字段为 __puus / __uid 等
-	// 实际通过访问带 ticket 的登录回调地址，从 set-cookie 获取
-	loginURL := fmt.Sprintf("%s/uc/api/account/login?ticket=%s", accountURL, url.QueryEscape(ticket))
+	loginURL := fmt.Sprintf("%s/account/info?st=%s&lw=scan", accountURL, url.QueryEscape(ticket))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", loginURL, nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Referer", "https://pan.quark.cn/")
 
 	hc := &httpClientWrapper{}
-	return hc.getCookies(req)
+	cookie, err := hc.getCookies(req)
+	if err != nil {
+		return "", err
+	}
+	if cookie == "" {
+		return "", fmt.Errorf("扫码确认后未拿到有效 cookie（可能已过期，请重新扫码）")
+	}
+	return cookie, nil
 }
 
 // ValidateCookie 校验 cookie
