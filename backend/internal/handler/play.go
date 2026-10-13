@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -590,6 +591,13 @@ func (h *PlayHandler) History(c *gin.Context) {
 	util.Page(c, total, page, pageSize, list)
 }
 
+// playlistLimit 单目录播放列表最多返回多少条。
+//
+// 从 50 提到 500：一个目录 52 集是常态（牛津树），卡在 50 会让
+// "顺序播放"莫名其妙断在倒数第三集，而孩子根本不知道为什么。
+// 500 条只是几个字段的轻量查询，不构成负担。
+const playlistLimit = 500
+
 // Playlist 某目录下的播放列表
 //
 // 兼容两种取参方式：
@@ -609,21 +617,49 @@ func (h *PlayHandler) Playlist(c *gin.Context) {
 		util.NotFound(c, "资源不存在")
 		return
 	}
-	// 同目录下的其他资源作为播放列表
-	var siblings []model.Resource
-	h.db.Where("category_id = ? AND id != ?", res.CategoryID, res.ID).
-		Order("sort_order asc, id asc").Limit(50).Find(&siblings)
+	// 同目录下的资源整体构成播放列表，按标题「数字自然序」升序。
+	//
+	// 两处和旧实现不同，都是为了让「顺序播放」真的能顺着往下播：
+	//
+	//  1. **不再把当前资源强制排到第一位**。原来第二条就是列表头，
+	//     于是"当前在哪一集"和"下一集是哪一集"永远差一位，顺序播放
+	//     播到第二集就开始绕圈。现在它待在自己该在的位置上。
+	//  2. **不再按 sort_order / id 排**，改按标题自然序 —— 与孩子在
+	//     列表里看到的顺序、以及"这一集后面该是哪一集"的直觉一致。
+	//     纯字典序会把 1-10 排到 1-2 前面（见 util.NaturalCompare）。
+	var items []model.Resource
+	// 带上 id asc：截断发生在哪一条必须可复现。不带排序时"取哪 500 条"
+	// 由数据库自己决定，同一个目录两次请求可能给出不同的列表。
+	h.db.Where("category_id = ?", res.CategoryID).
+		Order("id asc").Limit(playlistLimit).Find(&items)
 
-	list := []gin.H{{
-		"id": res.ID, "title": res.Title,
-		"playUrl": fmt.Sprintf("/api/play/%d", res.ID),
-		"duration": res.Duration,
-	}}
-	for _, s := range siblings {
+	// 当前资源可能因 limit 被截断，但它必须在列表里：前端要据此标出
+	// "正在播放"，顺序播放也要先找得到它才能决定下一集。
+	inList := false
+	for i := range items {
+		if items[i].ID == res.ID {
+			inList = true
+			break
+		}
+	}
+	if !inList {
+		items = append(items, res)
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		if cmp := util.NaturalCompare(items[i].Title, items[j].Title); cmp != 0 {
+			return cmp < 0
+		}
+		// 标题完全相同时按 ID 兜底，保证每次请求的顺序都可复现
+		return items[i].ID < items[j].ID
+	})
+
+	list := make([]gin.H, 0, len(items))
+	for _, it := range items {
 		list = append(list, gin.H{
-			"id": s.ID, "title": s.Title,
-			"playUrl": fmt.Sprintf("/api/play/%d", s.ID),
-			"duration": s.Duration,
+			"id": it.ID, "title": it.Title,
+			"playUrl": fmt.Sprintf("/api/play/%d", it.ID),
+			"duration": it.Duration,
 		})
 	}
 	util.OK(c, list)

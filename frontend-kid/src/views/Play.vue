@@ -157,6 +157,26 @@
         <p v-if="smoothUnavailable" class="qb-warn">转码服务暂时不可用，「流畅」用不了</p>
       </section>
 
+      <!-- ===== 播放模式（顺序 / 随机 / 单曲） =====
+           列表已按标题升序，"顺序"就是列表里从上往下的那个顺序，
+           播完最后一集停下 —— 不回头循环，睡前不会一直播下去。
+           样式复用画质那套分段控件（.qb-*），两处手感保持一致。 -->
+      <section v-if="(isVideo || isAudio) && !error" class="quality-bar play-mode-bar">
+        <span class="qb-label">播放</span>
+        <div class="qb-group">
+          <button
+            v-for="m in PLAY_MODES"
+            :key="m.key"
+            class="qb pressable"
+            :class="{ on: playMode === m.key }"
+            @click="setPlayMode(m.key)"
+          >
+            {{ m.label }}
+          </button>
+        </div>
+        <span class="qb-hint">{{ modeHint }}</span>
+      </section>
+
       <!-- ===== 播放控制条（音频 / 图片 / PDF 用，视频用原生控件） ===== -->
       <section v-if="isAudio && !error" class="controls">
         <button class="skip pressable" @click="seekBy(-15)" aria-label="后退15秒">↺15</button>
@@ -183,7 +203,9 @@
         <span class="t">{{ fmtClock(duration) }}</span>
       </section>
 
-      <!-- ===== 倍速 / 循环（音频） ===== -->
+      <!-- ===== 倍速（音频） =====
+           单曲循环原来也在这里，现在归到上面的「播放模式」——
+           视频也需要单曲循环，放在只对音频可见的地方是摆错了位置。 -->
       <section v-if="isAudio" class="extras">
         <div class="rate-group">
           <button
@@ -196,9 +218,6 @@
             {{ r }}x
           </button>
         </div>
-        <button class="loop pressable" :class="{ on: loop }" @click="toggleLoop">
-          🔁 单曲循环
-        </button>
       </section>
 
       <!-- ===== 详情 ===== -->
@@ -243,15 +262,20 @@
       <div v-if="showPlaylist" class="sheet-mask" @click.self="showPlaylist = false">
         <div class="sheet">
           <div class="sheet-bar"></div>
-          <h3 class="sheet-title">播放列表</h3>
+          <h3 class="sheet-title">
+            播放列表<span v-if="playlist.length" class="sheet-count">
+              共 {{ playlist.length }} 集 · {{ modeLabel }}</span
+            >
+          </h3>
           <div class="sheet-list">
             <div
               class="sheet-item pressable"
               :class="{ on: it.id === resourceId }"
-              v-for="it in playlist"
+              v-for="(it, i) in playlist"
               :key="it.id"
               @click="switchTo(it.id)"
             >
+              <span class="si-idx">{{ i + 1 }}</span>
               <span class="si-emoji">{{ it.id === resourceId ? '🔊' : '🎵' }}</span>
               <span class="si-name ellipsis">{{ it.title }}</span>
               <span class="si-time">{{ fmtClock(it.duration) }}</span>
@@ -291,7 +315,6 @@ const isPlaying = ref(false)
 const current = ref(0)
 const duration = ref(0)
 const rate = ref(1)
-const loop = ref(false)
 const zoomed = ref(false)
 
 const siblings = ref([])
@@ -369,6 +392,59 @@ async function setQuality(q) {
   if (q === quality.value) return
   quality.value = q
   await load(pos)
+}
+
+/* ---------- 播放模式（顺序 / 随机 / 单曲） ---------- */
+//
+// 播放列表由后端按标题升序给出，所以三种模式就是：
+//   顺序——顺着列表从上往下，播完最后一集**停下**（不回头循环，
+//        睡前不会一直播下去）；
+//   随机——每集放完随机挑一集，尽量不连着放同一集；
+//   单曲——同一集反复放，适合精听跟读。
+//
+// 一个有意的取舍：单曲循环**不用** <audio loop> 原生属性实现。
+// 原生 loop 会让 ended 事件永远不触发，三种模式就得走两条路；
+// 统一在 onEnded 里处理，换源、切模式都不会因为媒体元素被重建而丢状态。
+const MODE_KEY = 'kid_play_mode'
+const MODE_ORDER = 'order'
+const MODE_SHUFFLE = 'shuffle'
+const MODE_SINGLE = 'single'
+const PLAY_MODES = [
+  { key: MODE_ORDER, label: '顺序' },
+  { key: MODE_SHUFFLE, label: '随机' },
+  { key: MODE_SINGLE, label: '单曲' },
+]
+
+function readPlayMode() {
+  try {
+    const v = localStorage.getItem(MODE_KEY)
+    if (v === MODE_SHUFFLE || v === MODE_SINGLE) return v
+  } catch {
+    // 隐私模式 / 禁用存储：读不到就用默认，不影响播放
+  }
+  return MODE_ORDER
+}
+
+const playMode = ref(readPlayMode())
+
+const modeLabel = computed(
+  () => PLAY_MODES.find((m) => m.key === playMode.value)?.label || '顺序'
+)
+
+const modeHint = computed(() => {
+  if (playMode.value === MODE_SHUFFLE) return '随机挑着播'
+  if (playMode.value === MODE_SINGLE) return '这一集反复播'
+  return '按列表顺序播'
+})
+
+function setPlayMode(m) {
+  if (!PLAY_MODES.some((it) => it.key === m)) return
+  playMode.value = m
+  try {
+    localStorage.setItem(MODE_KEY, m)
+  } catch {
+    /* 存不下不影响本次切换 */
+  }
 }
 
 let reportTimer = null
@@ -589,20 +665,25 @@ function onTimeUpdate() {
 
 function onEnded() {
   isPlaying.value = false
-  if (loop.value) {
+  flushProgress(true)
+
+  // 单曲循环：原地重播。不用 <audio loop>（见上面播放模式那段注释）
+  if (playMode.value === MODE_SINGLE) {
     const el = mediaEl()
     if (el) {
-      el.currentTime = 0
+      try {
+        el.currentTime = 0
+      } catch {
+        /* 某些格式 seek 会抛错，接着 play 依然会从头开始 */
+      }
       el.play().catch(() => {})
     }
     return
   }
-  flushProgress(true)
-  // 自动播放同目录下一首
-  const idx = playlist.value.findIndex((p) => p.id === resourceId.value)
-  if (idx >= 0 && idx < playlist.value.length - 1) {
-    router.replace(`/play/${playlist.value[idx + 1].id}`)
-  }
+
+  const next = nextTrackId()
+  // nextTrackId 返回 0 表示没有下一集（顺序播放的最后一集）→ 停在这里
+  if (next) goTo(next)
 }
 
 function onMediaError() {
@@ -754,12 +835,6 @@ function setRate(r) {
   if (el) el.playbackRate = r
 }
 
-function toggleLoop() {
-  loop.value = !loop.value
-  const el = mediaEl()
-  if (el) el.loop = loop.value
-}
-
 function toggleZoom() {
   zoomed.value = !zoomed.value
 }
@@ -829,12 +904,12 @@ function setupMediaSession() {
       }
     })
     navigator.mediaSession.setActionHandler('previoustrack', () => {
-      const idx = playlist.value.findIndex((p) => p.id === resourceId.value)
-      if (idx > 0) switchTo(playlist.value[idx - 1].id)
+      const id = prevTrackId()
+      if (id) goTo(id)
     })
     navigator.mediaSession.setActionHandler('nexttrack', () => {
-      const idx = playlist.value.findIndex((p) => p.id === resourceId.value)
-      if (idx >= 0 && idx < playlist.value.length - 1) switchTo(playlist.value[idx + 1].id)
+      const id = nextTrackId()
+      if (id) goTo(id)
     })
   } catch {
     /* 某些浏览器不支持全部 action，忽略 */
@@ -858,12 +933,57 @@ function loadPlaylist() {
   // playlist 已在 loadSiblings 中一并获取
 }
 
+/* ---------- 列表内的前后导航 ---------- */
+// 列表按标题升序，索引往后走就是"下一集"。
+function currentIndex() {
+  return playlist.value.findIndex((p) => p.id === resourceId.value)
+}
+
+// randomOtherId 随机挑一集，尽量避开当前这集 ——
+// 否则"随机播放"会时不时原地重播，看起来像卡住了。
+function randomOtherId() {
+  const list = playlist.value
+  if (!list.length) return 0
+  if (list.length === 1) return list[0].id
+  for (let i = 0; i < 30; i++) {
+    const pick = list[Math.floor(Math.random() * list.length)]
+    if (pick.id !== resourceId.value) return pick.id
+  }
+  const fallback = list.find((p) => p.id !== resourceId.value)
+  return fallback ? fallback.id : 0
+}
+
+// nextTrackId 自动续播和"下一集"按钮共用。返回 0 表示没有下一集。
+function nextTrackId() {
+  if (!playlist.value.length) return 0
+  if (playMode.value === MODE_SHUFFLE) return randomOtherId()
+  const idx = currentIndex()
+  if (idx < 0) return 0
+  return idx < playlist.value.length - 1 ? playlist.value[idx + 1].id : 0
+}
+
+// prevTrackId 供锁屏 / 耳机上的"上一集"。随机模式下退化为再随机一首。
+function prevTrackId() {
+  if (!playlist.value.length) return 0
+  if (playMode.value === MODE_SHUFFLE) return randomOtherId()
+  const idx = currentIndex()
+  return idx > 0 ? playlist.value[idx - 1].id : 0
+}
+
 /* ---------- 切换资源 ---------- */
+// switchTo 点击列表项：已经在播的那集只收弹层，不重新加载
 function switchTo(id) {
   if (id === resourceId.value) {
     showPlaylist.value = false
     return
   }
+  goTo(id)
+}
+
+// goTo 是通用实现 —— 自动续播、锁屏"下一集"都走它，
+// 保证"离开前先落一次进度"这条规则不会被漏掉。
+function goTo(id) {
+  if (!id || id === resourceId.value) return
   flushProgress(false)
   showPlaylist.value = false
   router.replace(`/play/${id}`)
@@ -935,6 +1055,17 @@ onBeforeUnmount(() => {
 // 同一路由参数变化（切换资源）时重新加载
 watch(resourceId, () => {
   load()
+})
+
+// 打开播放列表时把"正在播的这集"滚进视野。
+// 一个目录几十集，不滚的话每次都要自己翻半天。
+watch(showPlaylist, async (v) => {
+  if (!v) return
+  await nextTick()
+  const on = document.querySelector('.sheet-item.on')
+  if (on && typeof on.scrollIntoView === 'function') {
+    on.scrollIntoView({ block: 'center' })
+  }
 })
 
 // 播放状态变化时同步 MediaSession playState（部分浏览器需要）
@@ -1347,11 +1478,12 @@ watch(isPlaying, (v) => {
   border: 3px solid var(--c-primary);
 }
 
-/* ===== 倍速 / 循环 ===== */
+/* ===== 倍速 =====
+   单曲循环已归到「播放模式」那一条（视频也要用），这里只剩倍速，
+   所以改成左对齐而不是两端撑开。 */
 .extras {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 10px;
   padding: 16px 16px 4px;
   flex-wrap: wrap;
@@ -1374,20 +1506,6 @@ watch(isPlaying, (v) => {
   background: var(--c-primary);
   color: #fff;
   box-shadow: 0 3px 12px rgba(91, 143, 249, 0.35);
-}
-.loop {
-  border: none;
-  padding: 7px 14px;
-  border-radius: 999px;
-  background: #fff;
-  color: var(--c-text-sub);
-  font-size: 13px;
-  font-weight: 600;
-  box-shadow: var(--shadow-sm);
-}
-.loop.on {
-  background: var(--c-primary-light);
-  color: var(--c-primary);
 }
 
 /* ===== 详情 ===== */
@@ -1500,6 +1618,14 @@ watch(isPlaying, (v) => {
   font-weight: 700;
   color: var(--c-text);
 }
+/* 标题右边挂一行小字：一共几集 + 当前播放模式。
+   模式放在这里，是因为"列表怎么往下播"正是在看列表时要想的事。 */
+.sheet-count {
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--c-text-sub);
+}
 .sheet-list {
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
@@ -1514,6 +1640,17 @@ watch(isPlaying, (v) => {
 }
 .sheet-item.on {
   background: var(--c-primary-light);
+}
+.si-idx {
+  flex: 0 0 auto;
+  min-width: 16px;
+  font-size: 11.5px;
+  color: #b6c2cf;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.sheet-item.on .si-idx {
+  color: var(--c-primary);
 }
 .si-emoji {
   font-size: 16px;
