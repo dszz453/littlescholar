@@ -538,10 +538,37 @@ function onMediaError() {
 //
 // 和 load() 的区别：load() 会把整页打回 loading 态、清掉续播位置，
 // 对"直链过期"这种小故障来说太重了。
+//
+// ⚠️ 这里最重要的一条：**"后端说要转码" 不等于 "出错"**。
+//
+// 存量网盘资源入库时格式未知（Ext 为空），只有真正取一次流、让后端从
+// 上游 Content-Type 认出是 rmvb/avi 之后，下一次 play/:id 才会返回
+// playMode=transcoding 且 url 为空。
+// 而这个"下一次"恰好就是本次重取 —— 所以 url 为空是**预期结果**，
+// 必须切到"转码中"的等待界面继续轮询，而不是报错。
+// 以前这里写的是 `if (!data?.url) throw`，直接把这种情况打成了
+// "播放地址可能已过期"，误导用户反复刷新（问题根本不在地址上）。
 async function reloadInfo() {
+  let data
   try {
-    const data = await playApi.info(resourceId.value)
-    if (!data?.url) throw new Error('no url')
+    data = await playApi.info(resourceId.value)
+  } catch {
+    error.value = '网络好像不太稳定，点下面再试一次'
+    return
+  }
+
+  // 只要是转码中，等待提示就该立起来 —— 但**别急着丢掉地址**：
+  // 后端对"容器本身能播"的资源会在转码期间照给一条直链先播着
+  // （见 PlayHandler.Info 里 playURL 那段），一看到 transcoding
+  // 就去显示空等待界面反而是倒退。
+  if (data?.playMode === 'transcoding') {
+    transcoding.value = true
+    transcodeProgress.value = Number(data?.transcodeProgress) || 0
+    startTranscodePolling(data?.transcodeTaskId)
+  }
+
+  // —— 拿到了可播地址：换源重播 ——
+  if (data?.url) {
     // 地址没变说明重取也没用，直接给提示，别让孩子对着黑屏等
     if (data.url === info.value.url) {
       error.value = '这个视频暂时播不了，可能是地址过期或格式不支持，点下面重试一下'
@@ -556,9 +583,29 @@ async function reloadInfo() {
       pendingSeek = pos
     }
     el?.load()
-  } catch {
-    error.value = '播放地址可能已过期，请返回重新进入'
+    return
   }
+
+  // —— 没有地址且正在转码：这是**预期**结果，不是错误 ——
+  //
+  // 这一步正是本次故障的修复点。存量网盘资源 Ext 为空，第一次播放被
+  // 当成"浏览器能播"代理了出去，浏览器一取流就 MediaError(4)；而这次取流
+  // 让后端认出了真实容器（rmvb），于是本次重取拿到的就是
+  // playMode=transcoding + url=""。
+  // 也就是说 **url 为空恰恰说明修复生效了**。以前这里写的是
+  // `if (!data?.url) throw`，把它打成了"播放地址可能已过期"，
+  // 害得用户反复刷新重试（问题根本不在地址上）。
+  if (data?.playMode === 'transcoding') {
+    info.value = { ...info.value, ...data }
+    error.value = ''
+    return
+  }
+
+  // —— 既没地址也没排上转码：说清楚到底是什么问题 ——
+  // containerUnsupported 语义就是"这个容器浏览器放不出来，且当前没有转码任务"，
+  // 这种情况下转圈是永远转不完的，必须明确告知。
+  const ext = String(data?.ext || info.value.ext || '').toUpperCase()
+  error.value = `${ext ? '「' + ext + '」格式' : '这个格式'}手机浏览器直接放不出来，需要转码。请让家长在后台开启转码，转好后再来看`
 }
 
 /* ---------- 播放控制 ---------- */

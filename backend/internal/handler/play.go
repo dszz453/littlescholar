@@ -3,6 +3,8 @@ package handler
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -132,6 +134,14 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	var qualities []gin.H
 	var transcodeTaskID uint64
 	var transcodeProgress int
+
+	// 先补容器格式，再决定播放方式。
+	//
+	// 顺序很重要：NeedsTranscode 依赖 ResourceExt，而存量网盘资源这一项是空的。
+	// 不先探一次，rmvb/mkv 会被当成"浏览器能播"直接代理出去，第一次必然失败。
+	if mediaType == model.MediaTypeVideo && service.ResourceExt(&res) == "" {
+		h.probeContainer(c.Request.Context(), &res)
+	}
 
 	// DirectPlay（搜全网的即时转存）默认跳过转码，保证"点了就播"。
 	//
@@ -268,16 +278,28 @@ func (h *PlayHandler) qualitiesOf(taskID uint64) []gin.H {
 
 // resolveDirectLink 解析资源的直链
 func (h *PlayHandler) resolveDirectLink(res *model.Resource) (string, error) {
+	link, err := h.resolveDirectLinkObj(res)
+	if err != nil {
+		return "", err
+	}
+	return link.URL, nil
+}
+
+// resolveDirectLinkObj 与 resolveDirectLink 相同，但保留 Headers。
+//
+// 需要 headers 的场景（如 probeContainer 要向上游发一个 Range 试探请求）
+// 不能只用 URL —— 夸克/UC 的 CDN 缺了 Cookie 会直接 412。
+func (h *PlayHandler) resolveDirectLinkObj(res *model.Resource) (*adapter.DirectLink, error) {
 	if res.DiskAccountID == nil || res.FileID == "" {
-		return "", fmt.Errorf("缺少转存信息")
+		return nil, fmt.Errorf("缺少转存信息")
 	}
 	var acc model.DiskAccount
 	if err := h.db.First(&acc, *res.DiskAccountID).Error; err != nil {
-		return "", fmt.Errorf("账号不存在")
+		return nil, fmt.Errorf("账号不存在")
 	}
 	cookie, err := h.encryptor.Decrypt(acc.CookieEncrypted)
 	if err != nil {
-		return "", fmt.Errorf("凭据解密失败")
+		return nil, fmt.Errorf("凭据解密失败")
 	}
 	extra := map[string]string{}
 	for k, v := range acc.Extra {
@@ -287,7 +309,7 @@ func (h *PlayHandler) resolveDirectLink(res *model.Resource) (string, error) {
 	}
 	a, err := adapter.Get(adapter.DiskType(res.DiskType))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -298,9 +320,91 @@ func (h *PlayHandler) resolveDirectLink(res *model.Resource) (string, error) {
 		Extra:    extra,
 	}, res.FileID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return link.URL, nil
+	return link, nil
+}
+
+// probeTimeout / probeClient 供 probeExtFromLink 向上游做一次极小试探。
+//
+// 超时给得短是刻意的：这是播放链路上的**前置**调用，它慢一秒，
+// 用户点开播放页就多等一秒。宁可探不出来（退回原有行为），也不能拖住播放。
+const probeTimeout = 6 * time.Second
+
+var probeClient = &http.Client{Timeout: probeTimeout}
+
+// probeExtFromLink 向上游要 64 字节，从 Content-Type 推断容器格式。
+//
+// 认不出来、上游报错、网络超时，一律返回空串 —— 调用方据此"什么都不做"。
+func probeExtFromLink(ctx context.Context, link *adapter.DirectLink) string {
+	if link == nil || link.URL == "" {
+		return ""
+	}
+	if strings.HasPrefix(link.URL, "file://") {
+		return "" // 本地硬盘的文件名本身就是路径，不需要探
+	}
+	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet, link.URL, nil)
+	if err != nil {
+		return ""
+	}
+	// 必须带上适配器给的请求头：夸克/UC 的 CDN 缺了 Cookie 直接 412，
+	// 那样探到的就是一个错误页的 Content-Type。
+	for k, v := range link.Headers {
+		req.Header.Set(k, v)
+	}
+	// 只要头部 64 字节：够 CDN 声明 Content-Type，也不会真把整个文件拉下来
+	req.Header.Set("Range", "bytes=0-63")
+
+	resp, err := probeClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return ""
+	}
+	return contentTypeExt(resp.Header.Get("Content-Type"))
+}
+
+// probeContainer 补全资源的容器格式（只在 Ext 为空时生效）。
+//
+// 解决的是一个很具体的坑：**存量网盘资源的 Ext 是空的**。
+//   - 入库时标题被剥掉了扩展名（diskimport.Register / instant.go 都这么做）；
+//   - 网盘的 FileID 是短 hash（332041b0494f466bab164b06a27261dd），没有后缀。
+// 于是 service.NeedsTranscode 判不出 rmvb/mkv，直接按"浏览器能播"代理出去，
+// 浏览器一取流就 MediaError(4)，用户看到的是**"播放地址可能已过期"** ——
+// 一个和真实原因毫无关系的提示。
+//
+// 上游 CDN 的 Content-Type 其实会明说（application/vnd.rn-realmedia-vbr 即 RMVB）。
+// 原先只靠 StreamHandler 在取流时"顺手学"，代价是**第一次播放必然失败一次**
+// （黑屏 → 前端自动重试 → 才开始转码）。这里把学习提前到"决定播放方式之前"，
+// 于是第一次就能判对、直接进转码等待。
+//
+// 成本：每个资源只探一次（认出后 Ext 落库，service.ResourceExt 就不再为空）。
+// 全程 best-effort —— 任何一步失败都只是"仍然不知道格式"，退回原有行为。
+func (h *PlayHandler) probeContainer(ctx context.Context, res *model.Resource) {
+	if res == nil || !canProxy(res) {
+		return
+	}
+	link, err := h.resolveDirectLinkObj(res)
+	if err != nil || link == nil {
+		return
+	}
+	ext := probeExtFromLink(ctx, link)
+	if ext == "" {
+		return
+	}
+	// 条件更新：只在仍然没有格式信息时写，避免覆盖更权威的值
+	// （WebDAV 的 FileID 带后缀，比 CDN 的 MIME 更准）。
+	if err := h.db.Model(&model.Resource{}).
+		Where("id = ? AND (ext IS NULL OR ext = '')", res.ID).
+		UpdateColumn("ext", ext).Error; err != nil {
+		return
+	}
+	res.Ext = ext
 }
 
 // ReportProgress 上报播放进度
