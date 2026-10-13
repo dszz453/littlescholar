@@ -150,8 +150,8 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { h, onMounted, ref } from 'vue'
+import { ElCheckbox, ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Refresh, RefreshRight, ArrowLeft, Folder } from '@element-plus/icons-vue'
 import { diskApi, mappingApi, categoryApi } from '@/api'
 
@@ -272,14 +272,37 @@ async function toggleEnabled(row, v) {
 }
 
 async function remove(row) {
+  // 删除映射默认**不动**已导入的资源：删资源不可逆，不该被"取消配置"顺带触发。
+  //
+  // 但只删映射会留下一批用户已经不想要的孤儿资源 —— 线上真实发生过：
+  // 用户删掉夸克那条映射后，孩子端依然列着那 26 集，看起来就像"删除没生效"。
+  // 所以这里把选择摆到明面上，并且默认勾选（用户的直觉就是要一起清掉）。
+  const withResources = ref(true)
   try {
-    await ElMessageBox.confirm(
-      `确定删除映射「${row.name}」吗？已导入的资源会保留。`,
-      '删除确认',
-      { type: 'warning' }
-    )
-    await mappingApi.remove(row.id)
-    ElMessage.success('已删除')
+    await ElMessageBox({
+      title: '删除映射',
+      type: 'warning',
+      showCancelButton: true,
+      confirmButtonText: '确定删除',
+      cancelButtonText: '取消',
+      message: h('div', [
+        h('p', { style: 'margin:0 0 12px' }, `确定删除映射「${row.name}」吗？`),
+        h(ElCheckbox, {
+          modelValue: withResources.value,
+          'onUpdate:modelValue': (v) => {
+            withResources.value = v
+          },
+        }, () => '同时删除已导入的资源'),
+        h(
+          'p',
+          { style: 'margin:8px 0 0;color:#909399;font-size:12px;line-height:1.6' },
+          '勾选后，这条映射同步进来的资源会从资源列表和孩子端一并移除（不可撤销）；不勾选则只删配置、资源保留。'
+        ),
+      ]),
+    })
+    const res = await mappingApi.remove(row.id, withResources.value)
+    const n = Number(res?.removedResources) || 0
+    ElMessage.success(n > 0 ? `已删除映射，并清理 ${n} 条资源` : '已删除映射')
     loadAll()
   } catch (e) {
     /* 取消 */

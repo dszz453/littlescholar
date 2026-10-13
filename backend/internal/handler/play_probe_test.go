@@ -123,21 +123,25 @@ func TestLearnContainerTypeGuards(t *testing.T) {
 
 	// 1) 空的应该被补上
 	h.learnContainerType(blank, "application/vnd.rn-realmedia-vbr")
-	var after model.Resource
-	if err := db.First(&after, blank.ID).Error; err != nil {
+	var afterBlank model.Resource
+	if err := db.First(&afterBlank, blank.ID).Error; err != nil {
 		t.Fatalf("回读失败: %v", err)
 	}
-	if after.Ext != "rmvb" {
-		t.Errorf("空 Ext 应被补成 rmvb，实际 %q", after.Ext)
+	if afterBlank.Ext != "rmvb" {
+		t.Errorf("空 Ext 应被补成 rmvb，实际 %q", afterBlank.Ext)
 	}
 
 	// 2) 已有值不能被覆盖
+	//
+	// 回读必须用**新的**变量：gorm 的 First(&dst, pk) 会把 dst 里非零的主键
+	// 也拼进 WHERE，复用上一次的 after 会得到 "id = 2 AND id = 1" 而查不到。
 	h.learnContainerType(hasExt, "application/vnd.rn-realmedia-vbr")
-	if err := db.First(&after, hasExt.ID).Error; err != nil {
+	var afterHasExt model.Resource
+	if err := db.First(&afterHasExt, hasExt.ID).Error; err != nil {
 		t.Fatalf("回读失败: %v", err)
 	}
-	if after.Ext != "avi" {
-		t.Errorf("已有 Ext 不应被覆盖，实际 %q", after.Ext)
+	if afterHasExt.Ext != "avi" {
+		t.Errorf("已有 Ext 不应被覆盖，实际 %q", afterHasExt.Ext)
 	}
 
 	// 3) 认不出的 Content-Type 什么都不写（比如 HTML 错误页）
@@ -146,10 +150,11 @@ func TestLearnContainerTypeGuards(t *testing.T) {
 		t.Fatalf("插入失败: %v", err)
 	}
 	h.learnContainerType(other, "text/html; charset=utf-8")
-	if err := db.First(&after, other.ID).Error; err != nil {
+	var afterOther model.Resource
+	if err := db.First(&afterOther, other.ID).Error; err != nil {
 		t.Fatalf("回读失败: %v", err)
 	}
-	if after.Ext != "" {
-		t.Errorf("认不出时不应写入，实际 %q", after.Ext)
+	if afterOther.Ext != "" {
+		t.Errorf("认不出时不应写入，实际 %q", afterOther.Ext)
 	}
 }

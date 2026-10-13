@@ -38,6 +38,17 @@ type Resource struct {
 	OwnerDirID string `gorm:"size:500" json:"ownerDirId"` // 网盘内所在目录ID
 	FileID     string `gorm:"size:500" json:"fileId"`     // 网盘内文件ID
 
+	// MappingID 这条资源是由哪个「资源映射」同步进来的（0 = 手动导入/搜索收录）。
+	//
+	// 为什么必须落一列而不是靠 (账号 + 目录) 现推：
+	// 删除映射时用户**期望**资源跟着消失，但同一个远端目录完全可能被
+	// 先后映射两次（线上就发生过：夸克映射一次、WebDAV 又映射一次，
+	// 孩子端于是出现 26 集重复列表）。只按账号+目录去推，第二次映射
+	// 会把第一次的记录一并算进去，删多了没法收拾。
+	//
+	// 有了它，"删映射时连带清理资源"才能精确到只动这一条映射导入的那些。
+	MappingID uint64 `gorm:"index" json:"mappingId"`
+
 	// 元信息
 	MediaType string `gorm:"size:20;index" json:"mediaType"`
 	// Ext 文件扩展名（小写、不含点，如 "rmvb" / "mp4"）。

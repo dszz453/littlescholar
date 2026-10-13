@@ -78,7 +78,11 @@ export const instantApi = {
 
 export const playApi = {
   // 获取播放信息（含播放地址、断点位置）
-  info: (id) => http.get(`/app/play/${id}`),
+  //
+  // quality：'original'（默认，不转码、秒开）/ 'smooth'（转码成 HLS，弱网更稳）。
+  // 不传即由后端按默认的 original 处理，但播放页始终显式带上，
+  // 免得"默认值"改动时前后端理解不一致。
+  info: (id, quality) => http.get(`/app/play/${id}`, { params: quality ? { quality } : {} }),
   // 上报进度
   progress: (id, data) => http.post(`/app/play/${id}/progress`, data),
   // 播放列表（同目录下的其他资源）

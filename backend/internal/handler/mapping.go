@@ -136,20 +136,65 @@ func (h *MappingHandler) Update(c *gin.Context) {
 	util.OKWithMessage(c, "已保存", nil)
 }
 
-// Delete 删除映射（不动已导入的资源）
+// Delete 删除映射。
+//
+// 默认只删映射本身，已导入的资源保留 —— 删资源不可逆，不该被
+// 一个"取消配置"的动作顺带触发。
+//
+// 但只删映射会留下一批用户**已经不想要**的孤儿资源：线上真实发生过，
+// 用户删掉映射后孩子端依然列着那 26 集，看着像"删除没生效"。
+// 所以这里提供一个显式开关 ?withResources=1，让调用方选择连带清理。
+//
+// 用 Unscoped 查映射是刻意的：对一条**之前只删了映射**的记录，这样还能再补一次
+// 「连带清理资源」，不必回滚重建映射。
+//
+// 注意两条分支对映射都用软删除（与仓库里其他 Delete 一致）：带 withResources
+// 时若改成物理删除，会出现"删不删资源"决定了"映射是软删还是硬删"这种
+// 与语义无关的差异，日后排查问题时很难解释。
 func (h *MappingHandler) Delete(c *gin.Context) {
 	id, ok := util.GetUintParam(c, "id")
 	if !ok {
 		util.BadRequest(c, "无效的映射 ID")
 		return
 	}
-	// 只删映射本身，不删已导入的资源 —— 删资源是不可逆的，
-	// 不该由一个"取消配置"的动作顺带触发。
-	if err := h.db.Delete(&model.ResourceMapping{}, id).Error; err != nil {
+
+	withResources := c.Query("withResources") == "1" || c.Query("withResources") == "true"
+
+	if !withResources {
+		if err := h.db.Delete(&model.ResourceMapping{}, id).Error; err != nil {
+			util.ServerError(c, "删除失败")
+			return
+		}
+		util.OKWithMessage(c, "已删除映射（已导入的资源保留）", nil)
+		return
+	}
+
+	// 连带清理：先确认映射存在（含已软删除的），避免对着不存在的 ID 空删一场
+	// 却回报"清理成功"。
+	var m model.ResourceMapping
+	if err := h.db.Unscoped().First(&m, id).Error; err != nil {
+		util.NotFound(c, "映射不存在")
+		return
+	}
+
+	var removed int64
+	err := h.db.Transaction(func(tx *gorm.DB) error {
+		// 资源走软删除（与「资源列表 → 批量删除」一致），
+		// 万一删错了还能从库里捞回来。
+		res := tx.Where("mapping_id = ?", m.ID).Delete(&model.Resource{})
+		if res.Error != nil {
+			return res.Error
+		}
+		removed = res.RowsAffected
+		return tx.Delete(&model.ResourceMapping{}, m.ID).Error
+	})
+	if err != nil {
 		util.ServerError(c, "删除失败")
 		return
 	}
-	util.OKWithMessage(c, "已删除映射（已导入的资源保留）", nil)
+	util.OKWithMessage(c,
+		fmt.Sprintf("已删除映射，并清理 %d 条已导入的资源", removed),
+		gin.H{"removedResources": removed})
 }
 
 // Sync 立即同步一个映射
@@ -225,7 +270,7 @@ func (h *MappingHandler) syncOne(ctx context.Context, m *model.ResourceMapping) 
 		res.Truncated = stats.Truncated
 		if len(targets) == 0 {
 			res.Error = "该目录下没有找到可导入的媒体文件"
-		} else if created, skipped, rerr := h.importSvc.Register(acc, m.CategoryID, targets); rerr != nil {
+		} else if created, skipped, rerr := h.importSvc.Register(acc, m.CategoryID, m.ID, targets); rerr != nil {
 			res.Error = rerr.Error()
 		} else {
 			res.Created = created

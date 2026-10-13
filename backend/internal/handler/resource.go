@@ -619,7 +619,9 @@ func (h *ResourceHandler) ImportFromDisk(c *gin.Context) {
 		return
 	}
 
-	created, skipped, err := h.importSvc.Register(acc, req.CategoryID, targets)
+	// mappingID 传 0：手动「浏览 → 勾选 → 导入」进来的资源不属于任何映射，
+	// 不该在将来某次"删映射连带清理"里被误伤。
+	created, skipped, err := h.importSvc.Register(acc, req.CategoryID, 0, targets)
 	if err != nil {
 		util.ServerError(c, "导入失败: "+err.Error())
 		return

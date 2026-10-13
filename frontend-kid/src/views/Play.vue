@@ -16,9 +16,14 @@
     <div v-if="loading" class="loading"><div class="spinner"></div></div>
 
     <div v-else-if="error" class="empty">
-      <div class="emoji">😢</div>
+      <div class="emoji">{{ needSmooth ? '🎬' : '😢' }}</div>
       <p>{{ error }}</p>
-      <button class="retry pressable" @click="load">再试一次</button>
+      <!-- 原画放不出来时唯一的正解就是切到流畅，按钮直接给出来，
+           别让孩子/家长去猜"哪里能改"。 -->
+      <button v-if="needSmooth" class="retry pressable" @click="setQuality('smooth')">
+        用「流畅」播放
+      </button>
+      <button v-else class="retry pressable" @click="load()">再试一次</button>
     </div>
 
     <!-- ===== 播放区 ===== -->
@@ -124,6 +129,32 @@
             打开网盘
           </a>
         </div>
+      </section>
+
+      <!-- ===== 画质切换（原画 / 流畅） =====
+           默认「原画」：直接播源文件，**不转码**，点开就有画面。
+           选「流畅」才转码成 HLS，弱网更稳、更省流量，代价是首次要等一会儿。 -->
+      <section v-if="(isVideo || isAudio) && !error" class="quality-bar">
+        <span class="qb-label">画质</span>
+        <div class="qb-group">
+          <button
+            class="qb pressable"
+            :class="{ on: !isSmooth }"
+            @click="setQuality('original')"
+          >
+            原画
+          </button>
+          <button
+            class="qb pressable"
+            :class="{ on: isSmooth }"
+            :disabled="!transcodeAvailable"
+            @click="setQuality('smooth')"
+          >
+            流畅
+          </button>
+        </div>
+        <span class="qb-hint">{{ isSmooth ? '转码后更省流量' : '不转码，点开就播' }}</span>
+        <p v-if="smoothUnavailable" class="qb-warn">转码服务暂时不可用，「流畅」用不了</p>
       </section>
 
       <!-- ===== 播放控制条（音频 / 图片 / PDF 用，视频用原生控件） ===== -->
@@ -272,6 +303,74 @@ const pdfBlobUrl = ref('')
 const transcoding = ref(false)
 const transcodeProgress = ref(0)
 
+/* ---------- 画质（原画 / 流畅） ---------- */
+//
+// 为什么要把这个选择权交给用户：
+//   - 原画：直接把源文件播出去，**不转码**，点开就有画面；
+//   - 流畅：转成 HLS，等一会儿，但码率更低、弱网更稳、能扛 RMVB 这类
+//     浏览器根本放不出来的容器。
+//
+// 默认必须是原画。以前是后端按容器自动决定，用户没有任何选择权，
+// 结果一个 RMVB 目录每次点开都是"正在转码"，等十几分钟是常态。
+const QUALITY_KEY = 'kid_play_quality'
+const QUALITY_ORIGINAL = 'original'
+const QUALITY_SMOOTH = 'smooth'
+
+function readQuality() {
+  try {
+    return localStorage.getItem(QUALITY_KEY) === QUALITY_SMOOTH ? QUALITY_SMOOTH : QUALITY_ORIGINAL
+  } catch {
+    // 隐私模式 / 禁用存储：读不到就用默认值，不影响播放
+    return QUALITY_ORIGINAL
+  }
+}
+
+const quality = ref(readQuality())
+// 转码引擎不可用（未装 ffmpeg / 后台关掉了转码）时，前端把「流畅」置灰，
+// 而不是让孩子点了以后干等一个永远不会来的产物。
+const transcodeAvailable = ref(true)
+const smoothUnavailable = ref(false)
+
+const isSmooth = computed(() => quality.value === QUALITY_SMOOTH)
+
+// containerUnsupported 与"还没选流畅"同时成立时，界面上要给一条明确的出路：
+// 一个「用流畅播放」的按钮。否则孩子看到的就只是一句"放不出来"。
+const needSmooth = computed(
+  () => !!info.value?.containerUnsupported && !isSmooth.value
+)
+
+// containerHint 容器浏览器放不出来时的引导文案。
+//
+// 关键区别在于"有没有出路"：
+//   - 原画模式下要给出「切到流畅」这条明路（用户自己就能解决）；
+//   - 已经是流畅了还放不出来，那就是转码真的没成功，只能请家长处理。
+function containerHint(ext) {
+  const label = ext ? `「${String(ext).toUpperCase()}」格式` : '这个格式'
+  if (isSmooth.value) {
+    return `${label}需要转码才能播，但转码没有成功。请让家长检查后台的转码设置`
+  }
+  return `${label}手机浏览器直接放不出来，点下面用「流畅」播放（首次要转一会儿）`
+}
+
+// setQuality 切换画质并重新拉取播放信息。
+//
+// 切换等于换源重放，所以先把当前进度落库/带过去，别让孩子每次换画质都从头看。
+async function setQuality(q) {
+  const pos = currentTime()
+  flushProgress(false)
+  // 先落存储再判断"是否变化"：后端可能刚把画质纠正过（比如请求了流畅但
+  // 转码不可用），此时 quality 已经是 q，但存储里还是旧值 —— 直接 return
+  // 会让下次进来又按旧值请求一遍。
+  try {
+    localStorage.setItem(QUALITY_KEY, q)
+  } catch {
+    /* 存不下不影响本次切换 */
+  }
+  if (q === quality.value) return
+  quality.value = q
+  await load(pos)
+}
+
 let reportTimer = null
 let seekReported = 0
 
@@ -314,7 +413,9 @@ function fmtClock(sec) {
 }
 
 /* ---------- 加载播放信息 ---------- */
-async function load() {
+// resumeAt > 0 时用它作为续播点（切换画质时用得上：那会儿还没上报，
+// 库里的 lastPosition 可能是十几秒前的旧值）。
+async function load(resumeAt = 0) {
   loading.value = true
   error.value = ''
   errorRetried = false
@@ -322,9 +423,13 @@ async function load() {
   stopTranscodePolling()
 
   try {
-    const data = await playApi.info(resourceId.value)
+    const data = await playApi.info(resourceId.value, quality.value)
     info.value = data || {}
     duration.value = Number(data?.duration) || 0
+    // 后端回传本次实际生效的画质：以它为准，避免本地状态和真实播放不一致
+    if (data?.quality) quality.value = data.quality
+    transcodeAvailable.value = data?.transcodeAvailable !== false
+    smoothUnavailable.value = !!data?.smoothUnavailable
 
     // 外部播放（无直链）：直接跳网盘
     if (data?.playMode === 'external' && data?.url) {
@@ -345,7 +450,7 @@ async function load() {
     }
 
     // 断点续播位置（等元数据加载后再 seek）
-    pendingSeek = Number(data?.lastPosition) || 0
+    pendingSeek = resumeAt > 0 ? resumeAt : Number(data?.lastPosition) || 0
 
     if (isPDF.value) {
       await preparePDF(data.url)
@@ -380,7 +485,7 @@ function startTranscodePolling(taskId) {
   // 10 秒一次：转码本身是分钟级，没必要问太勤
   transcodeTimer = setInterval(async () => {
     try {
-      const st = await playApi.info(resourceId.value)
+      const st = await playApi.info(resourceId.value, quality.value)
       const mode = st?.playMode
       if (mode === 'hls' && st?.url) {
         // 转好了：换源，保留当前播放位置
@@ -402,8 +507,7 @@ function startTranscodePolling(taskId) {
         transcoding.value = false
         info.value = { ...info.value, ...st }
         if (!st?.url) {
-          const ext = String(st?.ext || '').toUpperCase()
-          error.value = `${ext ? '「' + ext + '」格式' : '这个格式'}需要转码才能播，但转码没有成功。请让家长检查后台的转码设置`
+          error.value = containerHint(st?.ext || info.value.ext)
         }
       }
     } catch {
@@ -507,13 +611,11 @@ function onMediaError() {
 
   // —— 情况一：容器格式浏览器根本不支持（rmvb / avi / mkv …）——
   //
-  // 这类资源后端本应转码后再给 HLS；能走到这里说明转码没排上
-  // （引擎正忙、转码被关、或这是绕过转码的即时播放）。
-  // 此时"播放地址可能已过期"是完全错误的引导 —— 用户会一直刷新重试，
-  // 而问题根本不在地址上。所以要说清楚是什么格式、该怎么办。
+  // 原画模式下这是**预期**结果：我们明知它浏览器放不出来，还是按用户
+  // 选的"不转码"给了直链。所以这里不能重试（重试一百次也还是同一个容器），
+  // 而要给出唯一的正解：切到「流畅」。已经是流畅了那就是转码真失败了。
   if (info.value?.containerUnsupported) {
-    const ext = String(info.value.ext || '').toUpperCase()
-    error.value = `${ext ? '「' + ext + '」格式' : '这个格式'}手机浏览器直接放不出来，需要转码。请让家长在后台开启转码，转好后再来看`
+    error.value = containerHint(info.value.ext)
     return
   }
 
@@ -551,11 +653,15 @@ function onMediaError() {
 async function reloadInfo() {
   let data
   try {
-    data = await playApi.info(resourceId.value)
+    data = await playApi.info(resourceId.value, quality.value)
   } catch {
     error.value = '网络好像不太稳定，点下面再试一次'
     return
   }
+
+  if (data?.quality) quality.value = data.quality
+  transcodeAvailable.value = data?.transcodeAvailable !== false
+  smoothUnavailable.value = !!data?.smoothUnavailable
 
   // 只要是转码中，等待提示就该立起来 —— 但**别急着丢掉地址**：
   // 后端对"容器本身能播"的资源会在转码期间照给一条直链先播着
@@ -587,14 +693,6 @@ async function reloadInfo() {
   }
 
   // —— 没有地址且正在转码：这是**预期**结果，不是错误 ——
-  //
-  // 这一步正是本次故障的修复点。存量网盘资源 Ext 为空，第一次播放被
-  // 当成"浏览器能播"代理了出去，浏览器一取流就 MediaError(4)；而这次取流
-  // 让后端认出了真实容器（rmvb），于是本次重取拿到的就是
-  // playMode=transcoding + url=""。
-  // 也就是说 **url 为空恰恰说明修复生效了**。以前这里写的是
-  // `if (!data?.url) throw`，把它打成了"播放地址可能已过期"，
-  // 害得用户反复刷新重试（问题根本不在地址上）。
   if (data?.playMode === 'transcoding') {
     info.value = { ...info.value, ...data }
     error.value = ''
@@ -602,10 +700,11 @@ async function reloadInfo() {
   }
 
   // —— 既没地址也没排上转码：说清楚到底是什么问题 ——
-  // containerUnsupported 语义就是"这个容器浏览器放不出来，且当前没有转码任务"，
-  // 这种情况下转圈是永远转不完的，必须明确告知。
-  const ext = String(data?.ext || info.value.ext || '').toUpperCase()
-  error.value = `${ext ? '「' + ext + '」格式' : '这个格式'}手机浏览器直接放不出来，需要转码。请让家长在后台开启转码，转好后再来看`
+  // containerUnsupported 语义就是"这个容器浏览器放不出来，且当前没有转码任务"。
+  // 原画模式下这正是预期外的失败（用户在等他点「流畅」），
+  // 已经是流畅了才说明转码真没成功。
+  info.value = { ...info.value, ...data }
+  error.value = containerHint(data?.ext || info.value.ext)
 }
 
 /* ---------- 播放控制 ---------- */
@@ -1052,6 +1151,62 @@ watch(isPlaying, (v) => {
 @keyframes transcode-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.35; transform: scale(0.75); }
+}
+
+/* 画质切换：原画 / 流畅
+   放在播放区正下方而不是塞进「设置」里 —— 放不出来的时候，
+   孩子/家长一眼就要能看到这个开关，藏起来等于没有。 */
+.quality-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 12px 16px 0;
+  padding: 10px 12px;
+  background: #f4f7fc;
+  border-radius: var(--r-sm);
+}
+.qb-label {
+  flex: 0 0 auto;
+  font-size: 12.5px;
+  color: var(--c-text-sub);
+}
+.qb-group {
+  display: flex;
+  flex: 0 0 auto;
+  padding: 3px;
+  background: #e3eaf4;
+  border-radius: 999px;
+}
+.qb {
+  border: none;
+  background: transparent;
+  color: var(--c-text-sub);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 16px;
+  border-radius: 999px;
+  transition: background 0.18s, color 0.18s;
+}
+.qb.on {
+  background: #fff;
+  color: var(--c-primary);
+  box-shadow: 0 1px 4px rgba(38, 154, 153, 0.18);
+}
+.qb:disabled {
+  opacity: 0.42;
+}
+.qb-hint {
+  flex: 1 1 auto;
+  text-align: right;
+  font-size: 12px;
+  color: var(--c-text-sub);
+}
+.qb-warn {
+  flex: 1 1 100%;
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: #c0392b;
 }
 
 /* PDF */

@@ -261,7 +261,11 @@ type ImportService struct {
 func NewImportService(db *gorm.DB) *ImportService { return &ImportService{db: db} }
 
 // Register 登记一批文件。已存在（同账号 + 同 fileId）的跳过。
-func (s *ImportService) Register(acc *model.DiskAccount, categoryID uint64, targets []DiskImportTarget) (int, int, error) {
+//
+// mappingID 记录这批资源由哪条映射导入（0 = 手动导入/搜索收录）。
+// 它决定了"删除映射"时能不能精确地连带清理资源，所以调用方务必传对：
+// 同步链路传 m.ID，手动导入传 0。
+func (s *ImportService) Register(acc *model.DiskAccount, categoryID, mappingID uint64, targets []DiskImportTarget) (int, int, error) {
 	if len(targets) == 0 {
 		return 0, 0, nil
 	}
@@ -303,6 +307,7 @@ func (s *ImportService) Register(acc *model.DiskAccount, categoryID uint64, targ
 			OwnerDirID:    path.Dir(t.FileID),
 			MediaType:     GuessMediaType(t.Title),
 			Ext:           ext,
+			MappingID:     mappingID,
 			FileCount:     1,
 			TotalSize:     t.Size,
 			// 文件是刚从存储源列出来的，存在性是确定的，

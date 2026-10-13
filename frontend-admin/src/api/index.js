@@ -113,7 +113,12 @@ export const mappingApi = {
   list: (accountId) => http.get('/admin/mappings', { params: accountId ? { accountId } : {} }),
   create: (data) => http.post('/admin/mappings', data),
   update: (id, data) => http.put(`/admin/mappings/${id}`, data),
-  remove: (id) => http.delete(`/admin/mappings/${id}`),
+  // withResources=true 时连带清理这条映射同步进来的资源。
+  // 不传则只删映射本身（已导入的资源保留）。
+  remove: (id, withResources) =>
+    http.delete(`/admin/mappings/${id}`, {
+      params: withResources ? { withResources: 1 } : {},
+    }),
   sync: (id) => http.post(`/admin/mappings/${id}/sync`),
   syncAll: () => http.post('/admin/mappings/sync'),
 }

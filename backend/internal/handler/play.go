@@ -39,6 +39,38 @@ func canProxy(res *model.Resource) bool {
 	return res.DiskAccountID != nil && *res.DiskAccountID > 0 && res.FileID != ""
 }
 
+// 播放画质。
+//
+// 为什么要让孩子/家长来选，而不是后端自动决定：
+// 转码这件事的两端差别极大 ——
+//   - mp4/m4v 这类源，转码纯粹是白等（几分钟起，画质还可能被降档）；
+//   - rmvb/mkv 这类源，不转码浏览器根本放不出来（MediaError(4)）。
+// 一个默认值不可能同时照顾好这两种情况，所以默认走"不等待"的原画，
+// 需要兼容性的场景由用户显式切到流畅。
+const (
+	QualityOriginal = "original"
+	QualitySmooth   = "smooth"
+)
+
+// parsePlayQuality 解析画质参数，无法识别时一律回落到 original。
+//
+// 剥离成纯函数是为了可单测：Query 的取值分散在 HTTP 层，
+// 而"默认必须是不转码"这条约定值得被测试锁住 —— 一旦回归成默认转码，
+// 用户看到的就是刚修好的"一直提示在转码"重新出现。
+func parsePlayQuality(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case QualitySmooth, "fluent", "low":
+		return QualitySmooth
+	default:
+		return QualityOriginal
+	}
+}
+
+// playQuality 取请求里的画质参数。
+func playQuality(c *gin.Context) string {
+	return parsePlayQuality(c.Query("quality"))
+}
+
 // needsProxy 判断该资源的播放地址是否**必须**由后端代理转发。
 //
 // 结论：只要具备代理条件就一律代理。
@@ -134,6 +166,10 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	var qualities []gin.H
 	var transcodeTaskID uint64
 	var transcodeProgress int
+	// smoothUnavailable：用户点了「流畅」但转码引擎不可用（未装 ffmpeg /
+	// 被配置关掉），已按原画降级。如实告诉前端，否则用户只会看到
+	// 画质按钮点了没反应，以为是坏的。
+	var smoothUnavailable bool
 
 	// 先补容器格式，再决定播放方式。
 	//
@@ -143,14 +179,21 @@ func (h *PlayHandler) Info(c *gin.Context) {
 		h.probeContainer(c.Request.Context(), &res)
 	}
 
-	// DirectPlay（搜全网的即时转存）默认跳过转码，保证"点了就播"。
+	// 画质选择：由孩子在播放页决定走不走转码。
 	//
-	// 但仅限于**浏览器原生放得出来**的容器。如果是一个 rmvb/mkv，
-	// 跳过转码换来的不是"秒播"，而是 <video> 抛 MediaError 加一句
-	// 让人摸不着头脑的"播放地址可能已过期"。这时候宁可贵几分钟。
-	skipTranscode := res.DirectPlay && !service.ContainerUnsupported(&res)
+	//   original（默认）—— 不转码，直接把源文件代理出去（秒开）
+	//   smooth          —— 转成 HLS（360p/480p/720p），更省流量、弱网更稳
+	//
+	// 这段替换掉了原先"按容器自动决定要不要转码"的逻辑。老逻辑的问题是
+	// 用户完全没有选择权：只要容器被判为需要转码，每次点开都是"正在转码"，
+	// 而且转码产物一旦存在就再也播不回源文件。现在默认不等待，
+	// 只有用户明确选了流畅才付出等待成本。
+	quality := playQuality(c)
+	wantSmooth := quality == QualitySmooth
+	transcodeReady := h.transcode != nil && h.transcode.Enabled()
 
-	if h.transcode != nil && h.transcode.Enabled() && !skipTranscode && service.NeedsTranscode(&res) {
+	switch {
+	case wantSmooth && transcodeReady:
 		// EnsureHLS 会：已就绪→直接返回；未开始→入队并返回；进行中→返回进度
 		masterURL, ready, taskID, err := h.transcode.EnsureHLS(c.Request.Context(), &res)
 		switch {
@@ -182,10 +225,18 @@ func (h *PlayHandler) Info(c *gin.Context) {
 				playURL = ""
 			}
 		default:
-			// 转码不可用（引擎忙、ffmpeg 缺失等）→ 回退可播地址
+			// 转码不可用（引擎忙、ffmpeg 缺失等）→ 退回原画，不阻塞播放
+			smoothUnavailable = true
 			h.setDirectPlay(&res, &playMode, &playURL)
 		}
-	} else {
+	case wantSmooth && !transcodeReady:
+		smoothUnavailable = true
+		h.setDirectPlay(&res, &playMode, &playURL)
+	default:
+		// 原画：不转码，直接用源文件。
+		//
+		// 注意这里特意**不看**是否已有 HLS 产物：用户选了原画就是要原始画质，
+		// 拿转码产物糊弄过去属于表里不一。
 		h.setDirectPlay(&res, &playMode, &playURL)
 	}
 
@@ -222,6 +273,13 @@ func (h *PlayHandler) Info(c *gin.Context) {
 		"categoryName":      categoryNameOf(res.Category),
 		"transcodeTaskId":   transcodeTaskID,
 		"transcodeProgress": transcodeProgress,
+		// 本次实际生效的画质（原样回给前端，便于前端纠正 UI 状态）
+		"quality": quality,
+		// 转码引擎是否可用：不可用时前端把「流畅」按钮置灰，
+		// 而不是让孩子点了以后干等一个永远不会来的产物。
+		"transcodeAvailable": transcodeReady,
+		// 用户点了流畅但转码没接上，已按原画降级
+		"smoothUnavailable": smoothUnavailable,
 		// 浏览器放不出来的容器：前端据此给出「格式需要转码」而不是
 		// 含糊的「地址可能已过期」。转码成功进入 hls 模式后即为 false。
 		"containerUnsupported": service.ContainerUnsupported(&res) &&
