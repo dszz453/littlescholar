@@ -67,11 +67,29 @@
                 当前 {{ config.download_concurrency }} 线程
               </span>
             </el-form-item>
+            <el-form-item label="播放分块并发">
+              <el-slider v-model.number="config.multi_conn" :min="0" :max="32" style="width: 300px" />
+              <span class="text-secondary" style="margin-left: 12px">
+                {{
+                  Number(config.multi_conn) > 1
+                    ? `当前 ${config.multi_conn} 连接`
+                    : '已关闭（单流）'
+                }}
+              </span>
+              <div class="text-secondary">
+                播放时把网盘直链切成多段<b>并发拉取</b>、再按序吐给浏览器 —— 这就是「非会员加速」。
+                网盘对非会员普遍做单连接限速，拆成几条连接总吞吐常常能翻好几倍。
+                默认 4，<b>0 或 1 表示关闭</b>。并非越大越好：并发开太大容易被网盘判为滥用，
+                反而限速甚至封号。
+              </div>
+            </el-form-item>
             <el-form-item label="外部加速代理">
               <el-input v-model="config.accel_proxy" placeholder="http://192.168.1.5:8888/proxy?url={url}" />
               <div class="text-secondary">
-                留空则不启用。填写后，网盘直链会先经该代理（如 aliproxy）多连接拉流再转发，
-                用于突破非会员的单连接限速。支持 <code>{url}</code> 占位符，也支持直接作为前缀拼接。
+                留空则不启用。<b>填了它就优先走它</b>，上面的分块并发会自动让位
+                —— 两者不叠加，叠加等于把同一件事做两遍。
+                适合"服务器带宽不够、需要外部节点中转"的场景，可对接 aliproxy 一类的多连接代理。
+                支持 <code>{url}</code> 占位符，也支持直接作为前缀拼接。
               </div>
             </el-form-item>
           </el-form>
@@ -200,6 +218,7 @@ const config = ref({
   transcode_concurrency: 2,
   download_accelerate: 'true',
   download_concurrency: 16,
+  multi_conn: 4,
   accel_proxy: '',
   instant_enabled: 'true',
   instant_account_id: '',

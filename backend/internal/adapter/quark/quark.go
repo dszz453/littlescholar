@@ -3,13 +3,13 @@ package quark
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/littlescholar/core/internal/adapter"
 )
 
@@ -35,6 +35,14 @@ const (
 	// 扫码相关
 	qrCreateURL = "https://uop.quark.cn/cas/ajax/getTokenForQrcodeLogin"
 	qrPollURL   = "https://uop.quark.cn/cas/ajax/getServiceTicketByQrcodeToken"
+
+	// qrTTL 扫码会话在本地保留的时长，纯粹是防无限轮询的兜底。
+	//
+	// 真正的"过期"以服务端返回的 50004002 为准 —— 那才是权威信号。
+	// 之前这里按夸克"120 秒过期"的传闻写死 120 秒，比服务端更早地
+	// 判死二维码，用户拿起手机稍慢一点就被告知过期，这就是
+	// 「夸克扫码总是提示过期」的直接原因。
+	qrTTL = 180 * time.Second
 )
 
 func init() {
@@ -70,24 +78,32 @@ func (q *Quark) headers(cookie string) map[string]string {
 
 // qrContentURL 由 token 拼出二维码内容。
 //
-// 这里必须自己拼，不能指望接口给。
-// 夸克早期版本在 getTokenForQrcodeLogin 的响应里带 qrcode_url，
-// 现在**只返回 token**，实测恒为：
+// 这里必须自己拼，不能指望接口给：夸克早期版本在 getTokenForQrcodeLogin
+// 的响应里带 qrcode_url，现在**只返回 token**。
 //
-//	{"status":2000000,"message":"ok","data":{"members":{"token":"sta..."}}}
-//
-// 之前代码读 resp.Data.Members.QRCodeURL，于是永远拿到空串 ——
-// 接口返回 200、sessionId 也有值，唯独 qrContent 为空，
-// 前端画不出二维码，表现就是"扫码点了没反应"。
-// 该 URL 格式取自多个公开实现（quarkpan / xiaoya-alist 等），保持一致。
+// 参数与参考实现（xiaoya-alist 的 glue_python/quark_cookie/quark_cookie.py）
+// 逐字对齐，一个都不能少。末尾那两个 uc_param_str / uc_biz_str 看着像噪音，
+// 但实测缺了它们时，夸克 App 扫码后不会把 token 交给登录模块 —— 手机上
+// 表现为「登录请求已过期，请重新扫码」，而服务端轮询始终停在"等待扫码"。
+// 这正是此前"整个网盘扫码都不行"里夸克那一半的根因。
 func qrContentURL(token string) string {
-	return "https://su.quark.cn/4_eMHBJ?token=" + token + "&client_id=532&ssb=weblogin"
+	return "https://su.quark.cn/4_eMHBJ?token=" + token +
+		"&client_id=532&ssb=weblogin&uc_param_str=" +
+		"&uc_biz_str=" + url.QueryEscape("S:custom|OPT:SAREA@0|OPT:IMMERSIVE@1|OPT:BACK_BTN_STYLE@0")
 }
+
+// newRequestID 生成 CAS 接口要求的 request_id。
+//
+// 必须用随机 UUID，不能用毫秒时间戳：夸克 CAS 会把 request_id 拿去
+// 做去重/时序校验，同一毫秒内重复、或与 token 签发时刻对不上的取值
+// 会被直接判为无效请求，返回 50004002（二维码已过期）。
+// 参考实现里用的就是 uuid4。
+func newRequestID() string { return uuid.NewString() }
 
 // GetQRCode 获取扫码登录二维码
 func (q *Quark) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	var resp struct {
-		Status int    `json:"status"`
+		Status int `json:"status"`
 		Data   struct {
 			Members struct {
 				Token string `json:"token"`
@@ -97,7 +113,7 @@ func (q *Quark) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method: "GET",
 		URL:    qrCreateURL,
-		Query:  map[string]string{"client_id": "532", "v": "1.2", "request_id": fmt.Sprint(time.Now().UnixMilli())},
+		Query:  map[string]string{"client_id": "532", "v": "1.2", "request_id": newRequestID()},
 	}, &resp)
 	if err != nil {
 		return nil, fmt.Errorf("获取二维码失败: %w", err)
@@ -114,10 +130,7 @@ func (q *Quark) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	return &adapter.QRCode{
 		SessionID: sessionID,
 		Content:   qrContentURL(resp.Data.Members.Token),
-		// 夸克二维码有效期是服务端写死的 120 秒（实测 README 与多个开源
-		// 实现均如此）。之前这里写 180，前端会认为 3 分钟内扫码都有效，
-		// 结果用户超过 120 秒再扫，手机端就报「登录请求已过期，请重新扫码」。
-		ExpiresIn: 120,
+		ExpiresIn: int(qrTTL / time.Second),
 	}, nil
 }
 
@@ -129,17 +142,14 @@ func (q *Quark) PollQRCode(ctx context.Context, sessionID string) (*adapter.Logi
 	if !ok {
 		return nil, fmt.Errorf("扫码会话不存在或已过期")
 	}
-	// 夸克二维码服务端 120 秒过期。这里不能再用 5 分钟 ——
-	// 超过 120 秒后即使前端还在轮询，token 也已经失效，
-	// 用户扫码只会得到「登录请求已过期」。必须在 120 秒内主动
-	// 判定过期并让前端提示刷新，而不是等用户扫出「过期」才暴露。
-	if time.Since(sess.CreatedAt) > 120*time.Second {
+	// 本地计时只用于兜底，真正的"过期"以服务端 50004002 为准。
+	if time.Since(sess.CreatedAt) > qrTTL {
 		delete(q.sessions, sessionID)
-		return &adapter.LoginResult{Status: "expired", Message: "二维码已过期"}, nil
+		return &adapter.LoginResult{Status: "expired", Message: "二维码已过期，请点击「重新获取二维码」"}, nil
 	}
 
 	var resp struct {
-		Status int    `json:"status"`
+		Status int `json:"status"`
 		Data   struct {
 			Members struct {
 				ServiceTicket string `json:"service_ticket"`
@@ -156,19 +166,19 @@ func (q *Quark) PollQRCode(ctx context.Context, sessionID string) (*adapter.Logi
 			"client_id": "532",
 			"v":         "1.2",
 			"token":     sess.Token,
-			"request_id": fmt.Sprint(time.Now().UnixMilli()),
+			// 每轮换一个全新 request_id：复用同一个值会被 CAS 当成重放。
+			"request_id": newRequestID(),
 		},
 	}, &resp)
 	if err != nil {
 		return &adapter.LoginResult{Status: "waiting", Message: "轮询中"}, nil
 	}
 
-	// 夸克 CAS 的 status 语义（对照多个公开实现与实测）：
-	//   2000000 —— 登录成功，data.members.service_ticket 已就绪，可直接换 cookie
+	// 夸克 CAS 的 status 语义（对照参考实现与实测）：
+	//   2000000  —— 登录成功，data.members.service_ticket 已就绪，可直接换 cookie
 	//   50004001 —— 尚未扫码 / 查询无结果（"Query result is empty"），继续等
+	//   50004002 —— 二维码无效或已过期，必须让用户重新获取
 	// 没有独立的「已扫码待确认」中间态（2000001 并不存在）。
-	// 之前这里写 case 2000000 当「待确认」、case 2000001 当「确认成功」，
-	// 结果真正的成功码 2000000 被当成"还要再等"，用户手机确认了也换不到 cookie。
 	switch resp.Status {
 	case 2000000:
 		ticket := resp.Data.Members.ServiceTicket
@@ -186,38 +196,54 @@ func (q *Quark) PollQRCode(ctx context.Context, sessionID string) (*adapter.Logi
 			Nickname: resp.Data.Members.Nickname,
 			Avatar:   resp.Data.Members.Avatar,
 		}, nil
+	case 50004002:
+		delete(q.sessions, sessionID)
+		return &adapter.LoginResult{Status: "expired", Message: "二维码已过期，请点击「重新获取二维码」"}, nil
 	default:
-		return &adapter.LoginResult{Status: "waiting", Message: resp.Message}, nil
+		msg := resp.Message
+		if msg == "" {
+			msg = "等待扫码"
+		}
+		return &adapter.LoginResult{Status: "waiting", Message: msg}, nil
 	}
 }
 
 // exchangeTicket 用 service ticket 换取 cookie。
 //
-// 正确的换票接口是 pan.quark.cn/account/info，参数名是 st（不是 ticket），
-// 且要带 lw=scan。之前写的是 /uc/api/account/login?ticket=...，那是错误的
-// 地址——扫码确认后访问一个不存在的回调，拿不到 __puus / __uid 等关键
-// cookie，登录最终失败。这就是「夸克扫码还是不行」的最后一环根因。
-// 参考多个公开实现（52pojie Java 版、xiaoya-alist 的 quark_cookie.py）。
+// 分两步，一步都不能少：
+//
+//  1. 换票：pan.quark.cn/account/info，参数名是 st（不是 ticket），
+//     且要带 lw=scan。之前写的是 /uc/api/account/login?ticket=...，
+//     那是不存在的回调，扫码确认后拿不到 __puus / __uid 等关键 cookie。
+//
+//  2. 补刀：夸克最关键的 __puus **不在换票响应里下发**，要等下一次
+//     业务请求（/1/clouddrive/config）才随 Set-Cookie 补上。少了它，
+//     后续列目录、取直链一律 401 —— 表现为"扫码成功但一用就失效"。
+//
+// 参考实现：xiaoya-alist 的 glue_python/quark_cookie/quark_cookie.py。
 func (q *Quark) exchangeTicket(ctx context.Context, ticket string) (string, error) {
-	// 夸克登录后 cookie 中关键字段为 __puus / __uid 等
 	loginURL := fmt.Sprintf("%s/account/info?st=%s&lw=scan", accountURL, url.QueryEscape(ticket))
 
-	req, err := http.NewRequestWithContext(ctx, "GET", loginURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Referer", "https://pan.quark.cn/")
-
-	hc := &httpClientWrapper{}
-	cookie, err := hc.getCookies(req)
+	cookie, err := adapter.FetchCookies(ctx, loginURL, map[string]string{
+		"User-Agent": userAgent,
+		"Referer":    "https://pan.quark.cn/",
+	})
 	if err != nil {
 		return "", err
 	}
 	if cookie == "" {
 		return "", fmt.Errorf("扫码确认后未拿到有效 cookie（可能已过期，请重新扫码）")
 	}
-	return cookie, nil
+
+	puus, err := adapter.FetchCookies(ctx, baseURL+"/config?pr=ucpro&fr=pc&uc_param_str=", map[string]string{
+		"User-Agent": userAgent,
+		"Referer":    "https://pan.quark.cn/",
+		"Cookie":     cookie,
+	})
+	if err != nil {
+		return "", fmt.Errorf("获取 __puus 失败: %w", err)
+	}
+	return adapter.MergeCookie(cookie, puus), nil
 }
 
 // ValidateCookie 校验 cookie
@@ -265,16 +291,16 @@ func (q *Quark) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 		dirID = "0"
 	}
 	var resp struct {
-		Status int    `json:"status"`
-		Code   int    `json:"code"`
+		Status int `json:"status"`
+		Code   int `json:"code"`
 		Data   struct {
 			List []struct {
-				FID       string `json:"fid"`
-				FileName  string `json:"file_name"`
-				Dir       bool   `json:"dir"`
-				Size      int64  `json:"size"`
-				UpdatedAt int64  `json:"updated_at"`
-				FileType  int    `json:"file_type"`
+				FID         string `json:"fid"`
+				FileName    string `json:"file_name"`
+				Dir         bool   `json:"dir"`
+				Size        int64  `json:"size"`
+				UpdatedAt   int64  `json:"updated_at"`
+				FileType    int    `json:"file_type"`
 				ObjCategory string `json:"obj_category"`
 			} `json:"list"`
 		} `json:"data"`
@@ -331,9 +357,9 @@ func (q *Quark) MakeDir(ctx context.Context, cred *adapter.Credential, parentID,
 		Headers: q.headers(cred.Cookie),
 		Query:   map[string]string{"pr": "ucpro", "fr": "pc"},
 		Body: map[string]interface{}{
-			"pdir_fid":     parentID,
-			"file_name":    name,
-			"dir_path":     "",
+			"pdir_fid":      parentID,
+			"file_name":     name,
+			"dir_path":      "",
 			"dir_init_lock": false,
 		},
 	}, &resp)
@@ -409,18 +435,18 @@ func (q *Quark) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 		} `json:"data"`
 	}
 	_, err = q.http.DoJSON(ctx, &adapter.Request{
-		Method: "GET",
-		URL:    baseURL + "/share/sharepage/detail",
+		Method:  "GET",
+		URL:     baseURL + "/share/sharepage/detail",
 		Headers: q.headers(cred.Cookie),
 		Query: map[string]string{
-			"pr":          "ucpro",
-			"fr":          "pc",
-			"pwd_id":      pwdID,
-			"stoken":      stoken,
-			"pdir_fid":    "0",
-			"force":       "0",
-			"_page":       "1",
-			"_size":       "200",
+			"pr":            "ucpro",
+			"fr":            "pc",
+			"pwd_id":        pwdID,
+			"stoken":        stoken,
+			"pdir_fid":      "0",
+			"force":         "0",
+			"_page":         "1",
+			"_size":         "200",
 			"_fetch_banner": "0",
 			"_fetch_share":  "1",
 			"_fetch_total":  "1",
@@ -555,12 +581,12 @@ func (q *Quark) waitTask(ctx context.Context, cred *adapter.Credential, taskID s
 		}
 
 		var resp struct {
-			Status int    `json:"status"`
-			Code   int    `json:"code"`
+			Status int `json:"status"`
+			Code   int `json:"code"`
 			Data   struct {
-				Status   int    `json:"status"`
+				Status    int    `json:"status"`
 				TaskTitle string `json:"task_title"`
-				Message  string `json:"message"`
+				Message   string `json:"message"`
 			} `json:"data"`
 		}
 		_, err := q.http.DoJSON(ctx, &adapter.Request{
@@ -652,12 +678,4 @@ func extractPwdID(shareURL string) string {
 		return m[1]
 	}
 	return ""
-}
-
-// httpClientWrapper 用于获取 set-cookie
-type httpClientWrapper struct{}
-
-func (h *httpClientWrapper) getCookies(req *http.Request) (string, error) {
-	client := &httpClient{}
-	return client.do(req)
 }

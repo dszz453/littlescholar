@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -35,13 +36,13 @@ type StreamHandler struct {
 	secret    string
 	client    *http.Client
 
-	// 外部加速代理配置的短缓存。
+	// 系统配置的短缓存。
 	//
-	// 读系统配置要查库，而这里是每个媒体分片请求都会走的热路径，
-	// 所以缓存 10 秒 —— 管理员改完配置最多 10 秒生效，且不牺牲吞吐。
-	accelMu  sync.Mutex
-	accelURL string
-	accelAt  time.Time
+	// 读配置要查库，而这里是每个媒体分片请求都会走的热路径，
+	// 所以整表缓存 10 秒 —— 管理员改完最多 10 秒生效，且不牺牲吞吐。
+	cfgMu sync.Mutex
+	cfg   map[string]string
+	cfgAt time.Time
 }
 
 func NewStreamHandler(db *gorm.DB, encryptor *util.Encryptor, secret string) *StreamHandler {
@@ -186,16 +187,21 @@ func (h *StreamHandler) Serve(c *gin.Context) {
 
 	// ============ 非会员加速 ============
 	//
-	// 网盘对非会员普遍做单连接限速，"多线程/分块并发"由外部加速代理
-	// （参考包里的 aliproxy 就是这样一个二进制）来承担。
-	// 这里不做重复实现，而是把上游直链改写到用户配置的代理上：
-	// 代理负责多连接拉流，我们仍负责补鉴权头、透传 Range、转发给浏览器。
+	// 优先级：配了外部代理就交给它（它专门做多连接）；没配就用自研的
+	// 分块并发。两者不叠加 —— 叠了等于把同一件事做两遍，只会互相拖慢。
 	//
-	// 支持两种配置写法：
+	// 外部代理支持两种配置写法：
 	//   1. 含 {url} 占位符 → 按模板替换（可对接任意网关，如 /proxy?url={url}）
 	//   2. 不含占位符      → 直接把直链拼在其后（适配 http://host:port/https://… 形式）
-	if accel := h.accelProxy(); accel != "" {
+	accel := h.accelProxy()
+	if accel != "" {
 		link.URL = applyAccel(accel, link.URL)
+	} else if n := h.multiConn(); n > 1 && link.AcceptRanges && link.Size > 0 &&
+		isWholeFileRequest(c.GetHeader("Range")) {
+		if h.serveMultiConn(c, link, n) {
+			return
+		}
+		// 返回 false 表示一个字节都没写出去，可以安全回退到下面的单流。
 	}
 
 	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, link.URL, nil)
@@ -245,22 +251,276 @@ func (h *StreamHandler) Serve(c *gin.Context) {
 	}
 }
 
-// ============ 非会员加速：外部代理 ============
+// ============ 非会员加速 ============
+//
+// 网盘对非会员普遍做**单连接限速**：一条连接再快也就几百 KB/s，而拆成
+// 多条连接各拉一段，总吞吐常常能翻好几倍。参考包（影视播放器的本地
+// 资源 jar）用的正是这个思路 —— 它把这件事交给一个外部代理二进制
+// （aliproxy），并用 thread_limit 系列参数控制并发数。
+//
+// 这里把两种做法都保留，按优先级自动选：
+//
+//	1. 配了「外部加速代理」→ 单流改写直链过去（外挂，交给它做并发）
+//	2. 没配代理但 multi_conn > 1 → **自己分块并发拉**（默认路径）
+//	3. 都不满足 → 老老实实单流
+//
+// 之所以自研而不是照搬外挂：外挂代理是给"盒子性能不够"的场景用的，
+// 我们的服务端 CPU/内存都富余，多一层外部进程只是多一个故障点。
 
-// accelProxy 读取「外部加速代理」配置，带 10 秒缓存。
-func (h *StreamHandler) accelProxy() string {
-	h.accelMu.Lock()
-	defer h.accelMu.Unlock()
-	if !h.accelAt.IsZero() && time.Since(h.accelAt) < 10*time.Second {
-		return h.accelURL
+// configValue 读取系统配置，带 10 秒整表缓存。
+func (h *StreamHandler) configValue(key string) string {
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
+
+	if !h.cfgAt.IsZero() && time.Since(h.cfgAt) < 10*time.Second {
+		return h.cfg[key]
 	}
-	h.accelAt = time.Now()
-	h.accelURL = ""
-	var row model.SystemConfig
-	if err := h.db.Where("key = ?", "accel_proxy").First(&row).Error; err == nil {
-		h.accelURL = strings.TrimSpace(row.Value)
+
+	h.cfgAt = time.Now()
+	h.cfg = map[string]string{}
+	var rows []model.SystemConfig
+	if err := h.db.Find(&rows).Error; err == nil {
+		for _, r := range rows {
+			h.cfg[r.Key] = strings.TrimSpace(r.Value)
+		}
 	}
-	return h.accelURL
+	return h.cfg[key]
+}
+
+// accelProxy 外部加速代理地址，可能为空。
+func (h *StreamHandler) accelProxy() string { return h.configValue("accel_proxy") }
+
+// multiConn 分块并发的连接数。
+//
+// 默认 4：足以拉开非会员的单连接限速，又不至于把账号的并发数顶爆
+// —— 参考包里反复强调"遇到账号被限制并发数，请把数值改小"，
+// 说明并发开太大是有代价的（甚至封号）。
+// 配 0 或 1 表示关闭，退回单流。
+func (h *StreamHandler) multiConn() int {
+	v := h.configValue("multi_conn")
+	if v == "" {
+		return defaultMultiConn
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return defaultMultiConn
+	}
+	if n > maxMultiConn {
+		n = maxMultiConn
+	}
+	return n
+}
+
+const (
+	defaultMultiConn = 4
+	maxMultiConn     = 32
+
+	// 首块刻意切小：播放器要的是"尽快出画面"，让第一块只覆盖
+	// 起播所需的头部数据，首字节延迟就不会被块体积拖长。
+	firstChunkSize = 256 << 10 // 256 KiB
+	// 后续块 4 MiB：块太小会让请求数暴涨，容易被网盘判成滥用。
+	chunkSize = 4 << 20
+)
+
+// planChunks 切分分块计划（首块小、后续块大）。
+func planChunks(size int64) []adapter.Chunk {
+	if size <= 0 {
+		return nil
+	}
+	if size <= firstChunkSize {
+		return []adapter.Chunk{{Index: 0, Start: 0, End: size - 1}}
+	}
+	chunks := []adapter.Chunk{{Index: 0, Start: 0, End: firstChunkSize - 1}}
+	idx := 1
+	for start := int64(firstChunkSize); start < size; start += chunkSize {
+		end := start + chunkSize - 1
+		if end >= size {
+			end = size - 1
+		}
+		chunks = append(chunks, adapter.Chunk{Index: idx, Start: start, End: end})
+		idx++
+	}
+	return chunks
+}
+
+// isWholeFileRequest 判断客户端是不是在要"整个文件"。
+//
+// 只在"从头播整份"时启用多线程。客户端带 Range 时通常是在拖进度，
+// 或浏览器先探一小段看能不能播 —— 那种小范围请求单流更快，
+// 强行分块只是徒增调度开销和对源站的并发压力。
+func isWholeFileRequest(rng string) bool {
+	rng = strings.TrimSpace(rng)
+	if rng == "" {
+		return true
+	}
+	v, ok := strings.CutPrefix(rng, "bytes=")
+	if !ok || strings.Contains(v, ",") {
+		return false
+	}
+	return strings.TrimSpace(v) == "0-"
+}
+
+// fetchRange 拉取一个字节区间。
+//
+// 只接受 206：源站回 200 说明它不认 Range，会把**整份文件**当成这一段
+// 塞回来 —— 那既撑爆内存，又会让后续每一块都重复整份文件。必须拒绝。
+func (h *StreamHandler) fetchRange(ctx context.Context, link *adapter.DirectLink, ck adapter.Chunk) ([]byte, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link.URL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	for k, v := range link.Headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", ck.Start, ck.End))
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return nil, "", fmt.Errorf("源站不支持分块请求（HTTP %d）", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	return data, resp.Header.Get("Content-Type"), nil
+}
+
+// serveMultiConn 用 n 个并发连接分块拉流。
+//
+// 返回 true 表示已经接管响应（可能已写出数据）；返回 false 表示
+// 一个字节都还没写，调用方可以安全回退到单流。
+func (h *StreamHandler) serveMultiConn(c *gin.Context, link *adapter.DirectLink, n int) bool {
+	chunks := planChunks(link.Size)
+	if len(chunks) == 0 {
+		return false
+	}
+	ctx := c.Request.Context()
+
+	// 先自己取第一块：既验证源站是否真支持 Range（必须 206），
+	// 也顺带把首字节拿到手。这一步失败就干净地交回单流。
+	first, contentType, err := h.fetchRange(ctx, link, chunks[0])
+	if err != nil {
+		return false
+	}
+	want := chunks[0].End - chunks[0].Start + 1
+	if int64(len(first)) != want {
+		return false
+	}
+
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	c.Header("Content-Type", contentType)
+	c.Header("Accept-Ranges", "bytes")
+	c.Header("Content-Length", strconv.FormatInt(link.Size, 10))
+	// 票据过期后同一 URL 不应被缓存复用
+	c.Header("Cache-Control", "no-store")
+	c.Status(http.StatusOK)
+
+	if _, err := c.Writer.Write(first); err != nil {
+		return true
+	}
+	c.Writer.Flush()
+
+	if len(chunks) == 1 {
+		return true
+	}
+
+	type result struct {
+		idx  int
+		data []byte
+		err  error
+	}
+
+	tasks := make(chan adapter.Chunk, n)
+	results := make(chan result, n)
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ck := range tasks {
+				data, _, err := h.fetchRange(ctx, link, ck)
+				select {
+				case results <- result{idx: ck.Index, data: data, err: err}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	// 收尾：先关任务队列让 worker 退出，再等它们结束。
+	// 顺序反了会 panic（向已关闭 channel 发送）。
+	defer func() {
+		close(tasks)
+		wg.Wait()
+	}()
+
+	inFlight := 0
+	push := func(i int) bool {
+		if i >= len(chunks) {
+			return false
+		}
+		select {
+		case tasks <- chunks[i]:
+			inFlight++
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	// 第 0 块已写出，从 1 开始预填窗口
+	sent := 1
+	for i := 1; i < len(chunks) && inFlight < n; i++ {
+		if !push(i) {
+			break
+		}
+		sent = i + 1
+	}
+
+	pending := map[int]result{}
+	for next := 1; next < len(chunks); {
+		res, ok := pending[next]
+		if ok {
+			delete(pending, next)
+			inFlight--
+		} else {
+			select {
+			case r := <-results:
+				if r.idx != next {
+					// 还没轮到的块先攒着；它仍占着在飞名额。
+					pending[r.idx] = r
+					continue
+				}
+				inFlight--
+				res = r
+			case <-ctx.Done():
+				return true
+			}
+		}
+
+		if res.err != nil {
+			// 已经写出一部分，没法再改状态码，只能断开让播放器重试。
+			return true
+		}
+		if _, err := c.Writer.Write(res.data); err != nil {
+			return true
+		}
+		c.Writer.Flush()
+
+		next++
+		if sent < len(chunks) {
+			push(sent)
+			sent++
+		}
+	}
+	return true
 }
 
 // applyAccel 把上游直链改写到外部加速代理。

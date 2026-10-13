@@ -3,19 +3,34 @@ package uc
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/littlescholar/core/internal/adapter"
 )
 
 // UC UC网盘适配器
 //
-// UC网盘与夸克同属阿里体系，接口协议高度相似（UC 是夸克的姊妹产品），
+// UC网盘与夸克同属阿里体系，文件接口协议高度相似（UC 是夸克的姊妹产品），
 // 主要差异在 baseURL、client_id 与部分字段命名。
+//
+// 但**扫码登录这一块两者差得很远**，不能照抄（见下方扫码段落）。
 type UC struct {
 	http *adapter.HTTPClient
+
+	// 扫码会话暂存：sessionID -> token。
+	// token 只对签发它的那个进程有效，所以必须自己存着 —— 轮询时要用。
+	mu       sync.RWMutex
+	sessions map[string]*qrSession
+}
+
+type qrSession struct {
+	Token     string
+	CreatedAt time.Time
 }
 
 func init() {
@@ -23,7 +38,10 @@ func init() {
 }
 
 func New() *UC {
-	return &UC{http: adapter.NewHTTPClient(30 * time.Second)}
+	return &UC{
+		http:     adapter.NewHTTPClient(30 * time.Second),
+		sessions: make(map[string]*qrSession),
+	}
 }
 
 func (u *UC) Type() adapter.DiskType { return adapter.DiskUC }
@@ -32,8 +50,12 @@ func (u *UC) Name() string           { return "UC网盘" }
 const (
 	apiBase = "https://pc-api.uc.cn/1/clouddrive"
 	ucPan   = "https://drive.uc.cn"
-	// UC 的 client_id
-	clientID = "5"
+	// clientID UC 扫码所用的客户端标识，必须与二维码短链里的 client_id 一致。
+	//
+	// 要用 381，不是 5。5 是"UC 浏览器内嵌网页"那一套的 id，拿它去 CAS
+	// 建 token 虽然也返回 200，但生成的二维码在 UC App 里不被认作登录凭证。
+	// 取值对齐参考实现（xiaoya-alist 的 uc_cookie.py）。
+	clientID = "381"
 	ucUA     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) uc-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
 )
 
@@ -49,25 +71,90 @@ func (u *UC) headers(cookie string) map[string]string {
 
 // ============ 认证 ============
 
-// UC 扫码登录域名。
+// ============ 扫码登录 ============
 //
-// ⚠️ 原代码写的是 uop.uc.cn（那是夸克用的域名）。实测该主机对 UC 的
-// client_id 返回**空响应体**，所以永远拿不到 token，扫码必然失败。
-// UC 的正确域名是 api.open.uc.cn。
-const qrCreateURL = "https://api.open.uc.cn/cas/ajax/getTokenForQrcodeLogin"
+// 逐条对齐参考实现（xiaoya-alist 的 glue_python/uc_cookie/uc_cookie.py）。
+// UC 与夸克虽然同属阿里、共用一套 CAS 语义，但**扫码这一步差异很大**：
+//
+//	              夸克                         UC
+//	client_id     532                          381
+//	建 token      GET  + query                 POST + form + __dt/__t
+//	二维码短码     su.quark.cn/4_eMHBJ          su.uc.cn/1_n0ZCv
+//	换票域名       pan.quark.cn/account/info    drive.uc.cn/account/info
+//	补 __puus      /1/clouddrive/config         /1/clouddrive/file/sort
+//
+// 之前这几项全部按夸克抄，于是出现两个症状：
+//  1. 选了 UC 却扫出夸克二维码 —— su.uc.cn 与 su.quark.cn 共用同一套短链
+//     路由，拿夸克的短码去 su.uc.cn，会一路跳到 b.quark.cn 的端内确认页；
+//  2. 轮询永远走不到最后 —— 原 PollQRCode 是个桩，直接返回"尚未实现"。
+
+// UC 扫码相关端点。建 token / 轮询都走 api.open.uc.cn 的 CAS。
+const (
+	qrCreateURL = "https://api.open.uc.cn/cas/ajax/getTokenForQrcodeLogin"
+	qrPollURL   = "https://api.open.uc.cn/cas/ajax/getServiceTicketByQrcodeToken"
+	// qrTicketURL 用 service_ticket 换 cookie 的入口
+	qrTicketURL = "https://drive.uc.cn/account/info"
+
+	// qrTTL 扫码会话本地保留时长，纯粹是防无限轮询的兜底；
+	// 真正的"过期"以服务端返回的 50004002 为准。
+	qrTTL = 180 * time.Second
+
+	// ucParamStr UC 客户端的埋点串。二维码 URL 里必须带上，
+	// 缺了它 UC App 打开短链后不会进入登录流程。
+	ucParamStr = "dsdnfrpfbivesscpgimibtbmnijblauputogpintnwktprchmt"
+)
+
+// ucStart 进程启动时刻，用来算 CAS 要求的 __dt（"页面已停留多久"）。
+// 官方脚本在模块加载时取一次，此处等价。
+var ucStart = time.Now().UnixMilli()
 
 // qrContentURL 由 token 拼出二维码内容。
 //
-// 与夸克同样的原因：接口只返回 token，没有 qrcode_url 字段。
-// 实测 api.open.uc.cn 的响应恒为
-//
-//	{"status":2000000,"message":"ok","data":{"members":{"token":"sta..."}}}
-//
-// UC 与夸克同源（同一套 CAS），故路径格式一致，仅换 su 域名。
+// 短码取 1_n0ZCv，**不能沿用夸克的 4_eMHBJ** —— 那正是"选 UC 扫出夸克码"
+// 的根因（详见上方对照表）。
 func qrContentURL(token string) string {
-	return "https://su.uc.cn/4_eMHBJ?token=" + token + "&client_id=" + clientID + "&ssb=weblogin"
+	return "https://su.uc.cn/1_n0ZCv?uc_param_str=" + ucParamStr +
+		"&token=" + token +
+		"&client_id=" + clientID +
+		"&uc_biz_str=" + url.QueryEscape("S:custom|C:titlebar_fix")
 }
 
+// casPost 以 form 表单 POST 一个 CAS 接口。
+//
+// UC 的这两个端点都只认 application/x-www-form-urlencoded，且要求 URL 上
+// 带 __dt / __t 两个埋点参数：
+//
+//	__t  —— 当前毫秒时间戳
+//	__dt —— 页面打开至今的毫秒数
+//
+// 之前用 GET + query 调用，接口会返回 200 但 data 为空，token 自然拿不到。
+func (u *UC) casPost(ctx context.Context, apiURL, token string, out interface{}) error {
+	now := time.Now().UnixMilli()
+
+	form := url.Values{}
+	form.Set("client_id", clientID)
+	form.Set("v", "1.2")
+	form.Set("request_id", fmt.Sprint(now))
+	if token != "" {
+		form.Set("token", token)
+	}
+
+	full := fmt.Sprintf("%s?__dt=%d&__t=%d", apiURL, now-ucStart, now)
+	_, err := u.http.DoJSON(ctx, &adapter.Request{
+		Method: "POST",
+		URL:    full,
+		Headers: map[string]string{
+			"Content-Type": "application/x-www-form-urlencoded",
+			"User-Agent":   ucUA,
+			"Referer":      ucPan + "/",
+			"Origin":       ucPan,
+		},
+		RawBody: []byte(form.Encode()),
+	}, out)
+	return err
+}
+
+// GetQRCode 获取 UC 扫码登录二维码
 func (u *UC) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	var resp struct {
 		Status int `json:"status"`
@@ -77,33 +164,117 @@ func (u *UC) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 			} `json:"members"`
 		} `json:"data"`
 	}
-	_, err := u.http.DoJSON(ctx, &adapter.Request{
-		Method: "GET",
-		URL:    qrCreateURL,
-		Query:  map[string]string{"client_id": clientID, "v": "1.2", "request_id": fmt.Sprint(time.Now().UnixMilli())},
-	}, &resp)
-	if err != nil {
+	if err := u.casPost(ctx, qrCreateURL, "", &resp); err != nil {
 		return nil, fmt.Errorf("获取 UC 二维码失败: %w", err)
 	}
 	if resp.Data.Members.Token == "" {
 		return nil, fmt.Errorf("UC 返回的二维码 token 为空")
 	}
+
+	sessionID := "uc_" + uuid.NewString()
+	u.mu.Lock()
+	u.sessions[sessionID] = &qrSession{Token: resp.Data.Members.Token, CreatedAt: time.Now()}
+	u.mu.Unlock()
+
 	return &adapter.QRCode{
-		SessionID: fmt.Sprintf("uc_%d", time.Now().UnixNano()),
+		SessionID: sessionID,
 		Content:   qrContentURL(resp.Data.Members.Token),
-		ExpiresIn: 180,
+		ExpiresIn: int(qrTTL / time.Second),
 	}, nil
 }
 
+// PollQRCode 轮询扫码状态，成功后换票落 cookie
 func (u *UC) PollQRCode(ctx context.Context, sessionID string) (*adapter.LoginResult, error) {
-	// ⚠️ 这里是**桩实现**，不是 bug 被藏起来：UC 的轮询/换票链路
-	// （getServiceTicketByQrcodeToken + ticket 换 cookie）尚未实现，
-	// 所以 UC 扫码目前**走不到最后一步**，请引导用户改用「手动添加 Cookie」。
-	// 夸克那条链路是完整的，可参照 quark.go 的 PollQRCode/exchangeTicket 补齐。
-	return &adapter.LoginResult{
-		Status:  "waiting",
-		Message: "UC 扫码换票尚未实现，请改用「手动添加」粘贴 Cookie",
-	}, nil
+	u.mu.RLock()
+	sess, ok := u.sessions[sessionID]
+	u.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("扫码会话不存在或已过期")
+	}
+	if time.Since(sess.CreatedAt) > qrTTL {
+		u.forget(sessionID)
+		return &adapter.LoginResult{Status: "expired", Message: "二维码已过期，请点击「重新获取二维码」"}, nil
+	}
+
+	var resp struct {
+		Status int `json:"status"`
+		Data   struct {
+			Members struct {
+				ServiceTicket string `json:"service_ticket"`
+			} `json:"members"`
+		} `json:"data"`
+		Message string `json:"message"`
+	}
+	if err := u.casPost(ctx, qrPollURL, sess.Token, &resp); err != nil {
+		return &adapter.LoginResult{Status: "waiting", Message: "轮询中"}, nil
+	}
+
+	// UC 的 status 语义与夸克同源：
+	//   2000000  —— 扫码成功，members.service_ticket 就绪
+	//   50004001 —— 尚未扫码 / 查询无结果，继续等
+	//   50004002 —— 二维码无效或已过期
+	switch resp.Status {
+	case 2000000:
+		ticket := resp.Data.Members.ServiceTicket
+		if ticket == "" {
+			return &adapter.LoginResult{Status: "failed", Message: "未获取到 service ticket"}, nil
+		}
+		cookie, err := u.exchangeTicket(ctx, ticket)
+		if err != nil {
+			return &adapter.LoginResult{Status: "failed", Message: err.Error()}, nil
+		}
+		u.forget(sessionID)
+		return &adapter.LoginResult{Status: "confirmed", Cookie: cookie, Message: "登录成功"}, nil
+	case 50004002:
+		u.forget(sessionID)
+		return &adapter.LoginResult{Status: "expired", Message: "二维码已过期，请点击「重新获取二维码」"}, nil
+	default:
+		msg := resp.Message
+		if msg == "" {
+			msg = "等待扫码"
+		}
+		return &adapter.LoginResult{Status: "waiting", Message: msg}, nil
+	}
+}
+
+// forget 丢弃一个扫码会话。
+func (u *UC) forget(sessionID string) {
+	u.mu.Lock()
+	delete(u.sessions, sessionID)
+	u.mu.Unlock()
+}
+
+// exchangeTicket 用 service_ticket 换 cookie，并补上 __puus。
+//
+// 同样是两步，一步都不能少：
+//  1. GET drive.uc.cn/account/info?st=<ticket>，从 Set-Cookie 拿主 cookie；
+//  2. 再用该 cookie 打一次 file/sort，把 **__puus** 捞回来 —— UC 的 __puus
+//     不在换票响应里下发，缺了它后续所有接口都会鉴权失败，表现就是
+//     "扫码成功了但一用就失效"。
+func (u *UC) exchangeTicket(ctx context.Context, ticket string) (string, error) {
+	cookie, err := adapter.FetchCookies(ctx, qrTicketURL+"?st="+url.QueryEscape(ticket), map[string]string{
+		"User-Agent": ucUA,
+		"Referer":    ucPan + "/",
+	})
+	if err != nil {
+		return "", err
+	}
+	if cookie == "" {
+		return "", fmt.Errorf("扫码确认后未拿到有效 cookie（可能已过期，请重新扫码）")
+	}
+
+	puus, err := adapter.FetchCookies(ctx,
+		apiBase+"/file/sort?pr=UCBrowser&fr=pc&pdir_fid=0&_page=1&_size=50"+
+			"&_fetch_total=1&_fetch_sub_dirs=0&_sort=file_type:asc,updated_at:desc",
+		map[string]string{
+			"User-Agent": ucUA,
+			"Referer":    ucPan + "/",
+			"Cookie":     cookie,
+		})
+	if err != nil {
+		return "", fmt.Errorf("获取 __puus 失败: %w", err)
+	}
+	return adapter.MergeCookie(cookie, puus), nil
 }
 
 func (u *UC) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*adapter.AccountInfo, error) {
@@ -152,11 +323,11 @@ func (u *UC) ListDir(ctx context.Context, cred *adapter.Credential, dirID string
 		Code   int `json:"code"`
 		Data   struct {
 			List []struct {
-				FID         string `json:"fid"`
-				FileName    string `json:"file_name"`
-				Dir         bool   `json:"dir"`
-				Size        int64  `json:"size"`
-				UpdatedAt   int64  `json:"updated_at"`
+				FID       string `json:"fid"`
+				FileName  string `json:"file_name"`
+				Dir       bool   `json:"dir"`
+				Size      int64  `json:"size"`
+				UpdatedAt int64  `json:"updated_at"`
 			} `json:"list"`
 		} `json:"data"`
 	}
@@ -289,8 +460,8 @@ func (u *UC) ParseShare(ctx context.Context, cred *adapter.Credential, shareURL,
 		} `json:"data"`
 	}
 	_, err = u.http.DoJSON(ctx, &adapter.Request{
-		Method: "GET",
-		URL:    apiBase + "/share/sharepage/detail",
+		Method:  "GET",
+		URL:     apiBase + "/share/sharepage/detail",
 		Headers: u.headers(cred.Cookie),
 		Query: map[string]string{
 			"pr": "UCBrowser", "fr": "pc", "pwd_id": pwdID,

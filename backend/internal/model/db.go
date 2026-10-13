@@ -101,17 +101,21 @@ func SeedDefaultData(db *gorm.DB, adminUser, adminPassHash string) error {
 
 	// 2. 默认系统配置
 	defaults := map[string]string{
-		"pansou_url":             "",
-		"pancheck_url":           "",
-		"enable_transcode":       "true",
-		"transcode_concurrency":  "2",
-		"download_accelerate":    "true",
-		"download_concurrency":   "16",
+		"pansou_url":            "",
+		"pancheck_url":          "",
+		"enable_transcode":      "true",
+		"transcode_concurrency": "2",
+		"download_accelerate":   "true",
+		"download_concurrency":  "16",
 		// 外部加速代理（对应参考包里的 aliproxy）：留空则不启用。
 		// 支持 http://host:port?url={url} 模板写法，也支持直接作为前缀拼接。
-		"accel_proxy":            "",
-		"play_mode_default":      "proxy",
-		"site_name":              "小书童学习系统",
+		"accel_proxy": "",
+		// 分块并发的连接数（自研「非会员加速」）。
+		// 4 是提速与账号风控之间的折中：参考包里明确提醒，并发开太大
+		// 会被网盘限速甚至封号。配 0 或 1 即关闭、退回单流，上限 32。
+		"multi_conn":        "4",
+		"play_mode_default": "proxy",
+		"site_name":         "小书童学习系统",
 		// 「搜一搜 · 搜全网」即时转存播放：默认开启，但账号/目录留空，
 		// 由管理员在「系统设置」里指定（留空时会自动挑该网盘的默认账号）。
 		"instant_enabled":     "true",

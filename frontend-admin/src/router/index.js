@@ -31,12 +31,19 @@ const routes = [
         meta: { title: '目录管理', icon: 'FolderOpened' },
       },
       {
-        // 「资源与映射」把"已收录的资源"和"从接入源映射进来的资源"放在一起：
-        // 两者是同一件事的前后两段，拆成两个菜单只会让人来回跳。
+        // 「资源管理」下两个二级菜单：资源列表（接入源的平铺文件夹视图）
+        // 和资源映射（把接入源目录绑进系统目录）。两者操作对象不同、
+        // 使用节奏也不同，拆开比塞进一个页面的三个页签更顺手。
         path: 'resources',
-        name: 'Resources',
-        component: () => import('@/views/Resources.vue'),
-        meta: { title: '资源与映射', icon: 'Files', group: '资源管理', groupIcon: 'Files' },
+        name: 'ResourceList',
+        component: () => import('@/views/ResourceList.vue'),
+        meta: { title: '资源列表', icon: 'FolderOpened', group: '资源管理', groupIcon: 'Files' },
+      },
+      {
+        path: 'resources/mapping',
+        name: 'ResourceMapping',
+        component: () => import('@/views/ResourceMapping.vue'),
+        meta: { title: '资源映射', icon: 'Connection', group: '资源管理' },
       },
       {
         path: 'transfer',

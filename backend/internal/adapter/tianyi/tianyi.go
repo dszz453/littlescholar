@@ -46,17 +46,29 @@ func (t *Tianyi) headers(cookie string) map[string]string {
 
 // ============ 认证 ============
 
+// ============ 扫码登录 ============
+//
+// 天翼扫码也是三段式，之前只做了前两段且第二段的判定写反了：
+//
+//	1. getLoginQrCode      取 uuid + 二维码
+//	2. getLoginQrCodeInfo  轮询，res_code=0 且带 redirectUrl 才算"已确认"
+//	3. redirectUrl         拿它换 cookie（COOKIE_LOGIN_USER 等）
+//
+// 之前 getLoginQrCodeInfo 只回了个"已扫码"就结束了，cookie 一步没走，
+// 用户扫完等于白扫。
+
+// GetQRCode 获取扫码登录二维码
 func (t *Tianyi) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
-	// 天翼扫码登录：/api/logbox/getLoginQrCode
 	var resp struct {
-		ResCode   int    `json:"res_code"`
-		UUID      string `json:"uuid"`
-		QrCodeURL string `json:"qrCodeUrl"`
+		ResCode    int    `json:"res_code"`
+		UUID       string `json:"uuid"`
+		QrCodeURL  string `json:"qrCodeUrl"`
+		QrLoginURL string `json:"qrLoginUrl"`
 	}
 	_, err := t.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
 		URL:     apiBase + "/logbox/getLoginQrCode",
-		Headers: map[string]string{"User-Agent": tyUA},
+		Headers: map[string]string{"User-Agent": tyUA, "Referer": webURL + "/web/login.html"},
 		Query:   map[string]string{"noCache": fmt.Sprint(time.Now().UnixMilli())},
 	}, &resp)
 	if err != nil {
@@ -65,45 +77,69 @@ func (t *Tianyi) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	if resp.UUID == "" {
 		return nil, fmt.Errorf("天翼未返回 uuid")
 	}
+
+	// 二维码内容优先取 qrLoginUrl；qrCodeUrl 多数时候只是第三方生成的
+	// 图片地址，拿它当"内容"再编码一次会得到"二维码的二维码"。
+	content := resp.QrLoginURL
+	if content == "" {
+		content = resp.QrCodeURL
+	}
 	return &adapter.QRCode{
 		SessionID: "tianyi_" + resp.UUID,
-		Content:   resp.QrCodeURL,
-		ExpiresIn: 120,
+		Content:   content,
+		Image:     resp.QrCodeURL,
+		ExpiresIn: 180,
 	}, nil
 }
 
+// PollQRCode 轮询扫码状态，确认后用它给的 redirectUrl 换 cookie。
 func (t *Tianyi) PollQRCode(ctx context.Context, sessionID string) (*adapter.LoginResult, error) {
 	uuid := strings.TrimPrefix(sessionID, "tianyi_")
+	if uuid == "" {
+		return nil, fmt.Errorf("扫码会话无效")
+	}
 	var resp struct {
-		ResCode  int    `json:"res_code"`
-		ResMsg   string `json:"res_msg"`
+		ResCode     int    `json:"res_code"`
+		ResMsg      string `json:"res_msg"`
 		RedirectURL string `json:"redirectUrl"`
 	}
 	_, err := t.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
 		URL:     apiBase + "/logbox/getLoginQrCodeInfo",
-		Headers: map[string]string{"User-Agent": tyUA},
+		Headers: map[string]string{"User-Agent": tyUA, "Referer": webURL + "/web/login.html"},
 		Query:   map[string]string{"uuid": uuid, "noCache": fmt.Sprint(time.Now().UnixMilli())},
 	}, &resp)
 	if err != nil {
-		return &adapter.LoginResult{Status: "waiting"}, nil
+		return &adapter.LoginResult{Status: "waiting", Message: "轮询中"}, nil
 	}
-	switch resp.ResCode {
-	case 0:
-		return &adapter.LoginResult{
-			Status:  "scanned",
-			Message: "已扫码，请在手机上确认",
-		}, nil
-	default:
-		return &adapter.LoginResult{Status: "waiting", Message: resp.ResMsg}, nil
+
+	// res_code=0 且带 redirectUrl ⇒ 用户已在手机上确认。
+	// 只有 redirectUrl 才说明可以换票；拿不到它就还停在"等待/已扫码"。
+	if resp.ResCode == 0 && resp.RedirectURL != "" {
+		cookie, err := adapter.FetchCookies(ctx, resp.RedirectURL, map[string]string{
+			"User-Agent": tyUA,
+			"Referer":    webURL + "/web/login.html",
+		})
+		if err != nil || cookie == "" {
+			msg := "未取到登录 Cookie"
+			if err != nil {
+				msg += ": " + err.Error()
+			}
+			return &adapter.LoginResult{Status: "failed", Message: msg}, nil
+		}
+		return &adapter.LoginResult{Status: "confirmed", Cookie: cookie, Message: "登录成功"}, nil
 	}
+	if resp.ResCode == 0 {
+		return &adapter.LoginResult{Status: "scanned", Message: "已扫码，请在手机上确认"}, nil
+	}
+	return &adapter.LoginResult{Status: "waiting", Message: orDefault(resp.ResMsg, "等待扫码")}, nil
 }
 
 func (t *Tianyi) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*adapter.AccountInfo, error) {
 	var resp struct {
-		ResCode int `json:"res_code"`
+		ResCode    int    `json:"res_code"`
 		ResMessage string `json:"res_message"`
-		UserInfo struct {
+		UserInfo   struct {
 			LoginName string `json:"loginName"`
 			Nickname  string `json:"nickname"`
 			IconURL   string `json:"iconURL"`
@@ -140,14 +176,14 @@ func (t *Tianyi) ListDir(ctx context.Context, cred *adapter.Credential, dirID st
 		dirID = "-11" // 天翼根目录 ID
 	}
 	var resp struct {
-		ResCode int `json:"res_code"`
+		ResCode    int `json:"res_code"`
 		FileListAO struct {
 			FileList []struct {
-				ID           int64  `json:"id"`
-				Name         string `json:"name"`
-				Size         int64  `json:"size"`
-				LastOpTime   string `json:"lastOpTime"`
-				IsFolder     bool   `json:"isFolder"`
+				ID         int64  `json:"id"`
+				Name       string `json:"name"`
+				Size       int64  `json:"size"`
+				LastOpTime string `json:"lastOpTime"`
+				IsFolder   bool   `json:"isFolder"`
 			} `json:"fileList"`
 			FolderList []struct {
 				ID   int64  `json:"id"`
@@ -156,8 +192,8 @@ func (t *Tianyi) ListDir(ctx context.Context, cred *adapter.Credential, dirID st
 		} `json:"fileListAO"`
 	}
 	_, err := t.http.DoJSON(ctx, &adapter.Request{
-		Method: "GET",
-		URL:    apiBase + "/listFiles.action",
+		Method:  "GET",
+		URL:     apiBase + "/listFiles.action",
 		Headers: t.headers(cred.Cookie),
 		Query: map[string]string{
 			"folderId": dirID, "mediaType": "0", "iconOption": "5",
@@ -253,12 +289,12 @@ func (t *Tianyi) ParseShare(ctx context.Context, cred *adapter.Credential, share
 
 	// 1. 获取分享访问码会话
 	var checkResp struct {
-		ResCode int `json:"res_code"`
+		ResCode int   `json:"res_code"`
 		ShareID int64 `json:"shareId"`
 	}
 	_, err := t.http.DoJSON(ctx, &adapter.Request{
-		Method: "GET",
-		URL:    apiBase + "/share/getShareInfoByCodeV2.action",
+		Method:  "GET",
+		URL:     apiBase + "/share/getShareInfoByCodeV2.action",
 		Headers: t.headers(cred.Cookie),
 		Query: map[string]string{
 			"shareCode": shareCode, "noCache": fmt.Sprint(time.Now().UnixMilli()),
@@ -273,13 +309,13 @@ func (t *Tianyi) ParseShare(ctx context.Context, cred *adapter.Credential, share
 
 	// 2. 列出分享文件
 	var listResp struct {
-		ResCode int `json:"res_code"`
+		ResCode    int `json:"res_code"`
 		FileListAO struct {
 			FileList []struct {
-				ID   int64  `json:"id"`
-				Name string `json:"name"`
-				Size int64  `json:"size"`
-				IsFolder bool `json:"isFolder"`
+				ID       int64  `json:"id"`
+				Name     string `json:"name"`
+				Size     int64  `json:"size"`
+				IsFolder bool   `json:"isFolder"`
 			} `json:"fileList"`
 			FolderList []struct {
 				ID   int64  `json:"id"`
@@ -288,8 +324,8 @@ func (t *Tianyi) ParseShare(ctx context.Context, cred *adapter.Credential, share
 		} `json:"fileListAO"`
 	}
 	_, err = t.http.DoJSON(ctx, &adapter.Request{
-		Method: "GET",
-		URL:    apiBase + "/share/listShareDir.action",
+		Method:  "GET",
+		URL:     apiBase + "/share/listShareDir.action",
 		Headers: t.headers(cred.Cookie),
 		Query: map[string]string{
 			"shareId": fmt.Sprint(checkResp.ShareID), "accessCode": passcode,
@@ -324,7 +360,7 @@ func (t *Tianyi) SaveToDir(ctx context.Context, cred *adapter.Credential, share 
 		ids = append(ids, f.ID)
 	}
 	var resp struct {
-		ResCode int `json:"res_code"`
+		ResCode int   `json:"res_code"`
 		TaskID  int64 `json:"taskId"`
 	}
 	_, err := t.http.DoJSON(ctx, &adapter.Request{
@@ -360,7 +396,7 @@ func (t *Tianyi) Transfer(ctx context.Context, cred *adapter.Credential, shareUR
 
 func (t *Tianyi) GetDirectLink(ctx context.Context, cred *adapter.Credential, fileID string) (*adapter.DirectLink, error) {
 	var resp struct {
-		ResCode int `json:"res_code"`
+		ResCode  int `json:"res_code"`
 		FileInfo struct {
 			DownloadURL string `json:"downloadUrl"`
 			Size        int64  `json:"size"`
@@ -368,8 +404,8 @@ func (t *Tianyi) GetDirectLink(ctx context.Context, cred *adapter.Credential, fi
 		} `json:"fileInfo"`
 	}
 	_, err := t.http.DoJSON(ctx, &adapter.Request{
-		Method: "GET",
-		URL:    apiBase + "/getFileDownloadUrl.action",
+		Method:  "GET",
+		URL:     apiBase + "/getFileDownloadUrl.action",
 		Headers: t.headers(cred.Cookie),
 		Query: map[string]string{
 			"fileId": fileID, "dt": "1", "noCache": fmt.Sprint(time.Now().UnixMilli()),

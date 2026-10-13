@@ -2,6 +2,9 @@ package baidu
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -35,9 +38,24 @@ func (b *Baidu) Name() string           { return "百度网盘" }
 const (
 	panURL     = "https://pan.baidu.com"
 	basePanAPI = "https://pan.baidu.com/api"
+	passport   = "https://passport.baidu.com"
 )
 
 const ua = "netdisk;P2SP;2.2.60.26"
+
+// webUA passport 域下的登录/扫码接口认浏览器 UA，
+// 拿网盘客户端 UA（netdisk;P2SP;…）去调会直接被拒。
+const webUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+	"(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+// gid 百度用的设备标识，任意 32 位十六进制串即可，但要每次新生成。
+func gid() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "A1B2C3D4E5F60718293A4B5C6D7E8F90"
+	}
+	return strings.ToUpper(hex.EncodeToString(b))
+}
 
 func (b *Baidu) headers(cred *adapter.Credential) map[string]string {
 	h := map[string]string{
@@ -55,8 +73,19 @@ func (b *Baidu) headers(cred *adapter.Credential) map[string]string {
 
 // ============ 认证 ============
 
+// ============ 扫码登录 ============
+//
+// 百度的扫码是三段式，之前只做了第一段，所以永远停在"已扫码待确认"：
+//
+//	1. getqrcode  取 sign + 图片；sign 的**前 32 位**就是 channel_id
+//	2. unicast    拿 channel_id 换 channel_v（URL 编码的 JSON）
+//	3. channel_v  里 status=2 时 v 字段就是 BDUSS，再用它换 STOKEN
+//
+// 之前第 2 步把**自己生成的 sessionID** 当成 channel_id 传了过去，
+// 服务端根本查不到这个通道；第 3 步则完全没有，用户扫完还得手抄 BDUSS。
+
+// GetQRCode 获取扫码登录二维码
 func (b *Baidu) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
-	// 百度网盘扫码登录：先取 sign，再生成二维码
 	var devResp struct {
 		Errno int    `json:"errno"`
 		Sign  string `json:"sign"`
@@ -64,57 +93,147 @@ func (b *Baidu) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     "https://passport.baidu.com/v2/api/getqrcode",
-		Headers: map[string]string{"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+		URL:     passport + "/v2/api/getqrcode",
+		Headers: map[string]string{"User-Agent": webUA},
 		Query: map[string]string{
-			"lp":   "pc",
+			"lp":          "pc",
 			"qrloginfrom": "pc",
-			"gid":  "A1B2C3D4",
-			"apiver": "v3",
+			"gid":         gid(),
+			"apiver":      "v3",
 		},
 	}, &devResp)
 	if err != nil {
 		return nil, fmt.Errorf("获取百度二维码失败: %w", err)
 	}
+	if devResp.Errno != 0 {
+		return nil, fmt.Errorf("百度返回 errno=%d", devResp.Errno)
+	}
 	if devResp.Sign == "" {
 		return nil, fmt.Errorf("百度未返回二维码 sign")
 	}
-	sessionID := fmt.Sprintf("baidu_%d", time.Now().UnixNano())
-	qrContent := "https://passport.baidu.com/v2/api/qrcode?sign=" + url.QueryEscape(devResp.Sign)
+
+	// sign 前 32 位即 channel_id —— 轮询必须用它，不能用自造的 ID。
+	channelID := devResp.Sign
+	if len(channelID) > 32 {
+		channelID = channelID[:32]
+	}
+
 	return &adapter.QRCode{
-		SessionID: sessionID,
-		Content:   qrContent,
+		SessionID: "baidu_" + channelID,
+		Content: passport + "/v2/api/qrcode?sign=" + url.QueryEscape(devResp.Sign) +
+			"&lp=pc&qrloginfrom=pc",
+		// img 已经是 data:image/png;base64,... 的完整 data URI，
+		// 前端拿到就能直接塞进 <img>，不必再自己画二维码。
 		Image:     devResp.Img,
 		ExpiresIn: 180,
 	}, nil
 }
 
+// PollQRCode 轮询扫码状态
 func (b *Baidu) PollQRCode(ctx context.Context, sessionID string) (*adapter.LoginResult, error) {
-	// 百度扫码轮询接口
+	channelID := strings.TrimPrefix(sessionID, "baidu_")
+	if channelID == "" {
+		return nil, fmt.Errorf("扫码会话无效")
+	}
+
 	var resp struct {
-		Errno int    `json:"errno"`
-		ChannelID string `json:"channel_id"`
-		Bdstoken  string `json:"bdstoken"`
+		Errno    int    `json:"errno"`
+		ChannelV string `json:"channel_v"`
+		Msg      string `json:"msg"`
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     "https://passport.baidu.com/channel/unicast",
-		Headers: map[string]string{"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-		Query:   map[string]string{"channel_id": sessionID, "tpl": "netdisk", "apiver": "v3"},
+		URL:     passport + "/channel/unicast",
+		Headers: map[string]string{"User-Agent": webUA},
+		Query:   map[string]string{"channel_id": channelID, "tpl": "netdisk", "apiver": "v3"},
 	}, &resp)
 	if err != nil {
 		return &adapter.LoginResult{Status: "waiting", Message: "轮询中"}, nil
 	}
-	if resp.Errno == 1 {
+	if resp.Errno != 0 {
+		// errno=1 是"尚未产生结果"，属正常等待；其余才算失败。
+		if resp.Errno == 1 {
+			return &adapter.LoginResult{Status: "waiting", Message: "等待扫码"}, nil
+		}
+		return &adapter.LoginResult{
+			Status:  "failed",
+			Message: fmt.Sprintf("百度扫码失败: errno=%d %s", resp.Errno, resp.Msg),
+		}, nil
+	}
+
+	// channel_v 是 URL 编码的 JSON：{"status":2,"v":"<BDUSS>"}
+	raw, err := url.QueryUnescape(resp.ChannelV)
+	if err != nil {
+		raw = resp.ChannelV
+	}
+	var cv struct {
+		Status int    `json:"status"`
+		V      string `json:"v"`
+	}
+	if err := json.Unmarshal([]byte(raw), &cv); err != nil {
 		return &adapter.LoginResult{Status: "waiting", Message: "等待扫码"}, nil
 	}
-	if resp.Errno != 0 {
-		return &adapter.LoginResult{Status: "failed", Message: fmt.Sprintf("扫码失败: errno=%d", resp.Errno)}, nil
+
+	switch cv.Status {
+	case 0:
+		return &adapter.LoginResult{Status: "waiting", Message: "等待扫码"}, nil
+	case 1:
+		return &adapter.LoginResult{Status: "scanned", Message: "已扫码，请在手机上确认"}, nil
+	case 2:
+		if cv.V == "" {
+			return &adapter.LoginResult{Status: "failed", Message: "未取到 BDUSS"}, nil
+		}
+		cookie, err := b.cookieFromBDUSS(ctx, cv.V)
+		if err != nil {
+			// 拿不到 STOKEN 也算"能用一半"：BDUSS 本身足够读，
+			// 只是转存会失败。把 BDUSS 存进去并如实说明。
+			return &adapter.LoginResult{
+				Status:  "confirmed",
+				Cookie:  "BDUSS=" + cv.V,
+				Message: "已登录，但 " + err.Error(),
+			}, nil
+		}
+		return &adapter.LoginResult{Status: "confirmed", Cookie: cookie, Message: "登录成功"}, nil
+	default:
+		return &adapter.LoginResult{Status: "waiting", Message: "等待扫码"}, nil
 	}
-	return &adapter.LoginResult{
-		Status:  "scanned",
-		Message: "已扫码，请在手机上确认（确认后请在后台手动粘贴 BDUSS 完成绑定）",
-	}, nil
+}
+
+// cookieFromBDUSS 用 BDUSS 补齐 STOKEN，拼出可用的完整 cookie。
+//
+// 百度网盘除 BDUSS 外，转存类接口还要 STOKEN；STOKEN 不能凭空造，
+// 必须拿 BDUSS 去问 gettemplatevariable。少了它，账号"校验通过"，
+// 一列目录就报 -6（登录失效）。
+func (b *Baidu) cookieFromBDUSS(ctx context.Context, bduss string) (string, error) {
+	var resp struct {
+		Errno  int                 `json:"errno"`
+		Stoken string              `json:"stoken"`
+		Result []map[string]string `json:"result"`
+	}
+	_, err := b.http.DoJSON(ctx, &adapter.Request{
+		Method: "GET",
+		URL:    basePanAPI + "/gettemplatevariable",
+		Headers: map[string]string{
+			"User-Agent": ua,
+			"Cookie":     "BDUSS=" + bduss,
+			"Referer":    panURL + "/disk/home",
+		},
+		Query: map[string]string{
+			"clienttype": "0", "app_id": "250528", "web": "1",
+			"fields": `["stoken"]`,
+		},
+	}, &resp)
+	if err != nil {
+		return "", fmt.Errorf("获取 STOKEN 失败: %w", err)
+	}
+	stoken := resp.Stoken
+	if stoken == "" && len(resp.Result) > 0 {
+		stoken = resp.Result[0]["stoken"]
+	}
+	if stoken == "" {
+		return "", fmt.Errorf("未取到 STOKEN")
+	}
+	return "BDUSS=" + bduss + "; STOKEN=" + stoken, nil
 }
 
 func (b *Baidu) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*adapter.AccountInfo, error) {
@@ -125,7 +244,7 @@ func (b *Baidu) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*
 			Used  int64 `json:"used"`
 			Total int64 `json:"total"`
 		} `json:"quota"`
-		Username string `json:"username"`
+		Username    string `json:"username"`
 		NetdiskName string `json:"netdisk_name"`
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
@@ -159,12 +278,12 @@ func (b *Baidu) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 	var resp struct {
 		Errno int `json:"errno"`
 		List  []struct {
-			FsID      int64  `json:"fs_id"`
-			Path      string `json:"path"`
-			ServerName string `json:"server_filename"`
-			IsDir     int    `json:"isdir"`
-			Size      int64  `json:"size"`
-			ServerMtime int64 `json:"server_mtime"`
+			FsID        int64  `json:"fs_id"`
+			Path        string `json:"path"`
+			ServerName  string `json:"server_filename"`
+			IsDir       int    `json:"isdir"`
+			Size        int64  `json:"size"`
+			ServerMtime int64  `json:"server_mtime"`
 		} `json:"list"`
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
@@ -276,7 +395,7 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 
 	// 1. 验证提取码并获取 shareid / uk
 	var verifyResp struct {
-		Errno int    `json:"errno"`
+		Errno    int    `json:"errno"`
 		RandSkey string `json:"randsk"`
 		ShareID  int64  `json:"shareid"`
 		UK       int64  `json:"uk"`
@@ -302,16 +421,16 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 	var listResp struct {
 		Errno int `json:"errno"`
 		List  []struct {
-			FsID      int64  `json:"fs_id"`
-			Path      string `json:"path"`
+			FsID       int64  `json:"fs_id"`
+			Path       string `json:"path"`
 			ServerName string `json:"server_filename"`
-			IsDir     int    `json:"isdir"`
-			Size      int64  `json:"size"`
+			IsDir      int    `json:"isdir"`
+			Size       int64  `json:"size"`
 		} `json:"list"`
 	}
 	_, err = b.http.DoJSON(ctx, &adapter.Request{
-		Method: "GET",
-		URL:    panURL + "/share/list",
+		Method:  "GET",
+		URL:     panURL + "/share/list",
 		Headers: b.headers(cred),
 		Query: map[string]string{
 			"shorturl": shareID, "root": "1", "web": "1", "app_id": "250528",
@@ -353,9 +472,9 @@ func (b *Baidu) SaveToDir(ctx context.Context, cred *adapter.Credential, share *
 		fsidList = append(fsidList, f.ID)
 	}
 	var resp struct {
-		Errno   int   `json:"errno"`
-		TaskID  int64 `json:"task_id"`
-		ErrMsg  string `json:"err_msg"`
+		Errno  int    `json:"errno"`
+		TaskID int64  `json:"task_id"`
+		ErrMsg string `json:"err_msg"`
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
