@@ -27,10 +27,14 @@ type TransferTask struct {
 	SharePassword string `gorm:"size:50" json:"sharePassword"`
 
 	DiskAccountID uint64 `gorm:"index" json:"diskAccountId"`
-	// 网盘内目标目录
+	// 网盘内目标目录。TargetDirID 是网盘侧的目录 ID（如夸克的 fid），
+	// TargetDirName 是给人看的路径（如「牛津树1-9童老师 / L1」）。
+	// 两个都存：前者用于定位，后者用于「转存任务」列表里显示——
+	// 只显示一串 fid 的话，用户根本无从确认自己选的是哪个目录。
 	TargetDirID   string `gorm:"size:200" json:"targetDirId"`
 	TargetDirName string `gorm:"size:300" json:"targetDirName"`
-	// 转存成功后资源归属的系统目录
+	// Deprecated: 转存不再负责"资源归属"，一律不写。保留字段只为兼容历史行。
+	// 归属关系由 ResourceMapping（账号 + 目录 → 本地分类）统管。
 	CategoryID uint64 `gorm:"index" json:"categoryId"`
 
 	Status   string `gorm:"size:20;default:'pending';index" json:"status"`
@@ -38,6 +42,7 @@ type TransferTask struct {
 	Message  string `gorm:"size:1000" json:"message"`
 
 	// 转存结果
+	// Deprecated: 转存不再直接造资源记录，永远是 NULL。保留只为兼容历史行。
 	CreatedResourceID *uint64    `json:"createdResourceId"`
 	RetryCount        int        `gorm:"default:0" json:"retryCount"`
 	StartedAt         *time.Time `json:"startedAt"`

@@ -116,19 +116,10 @@
           </el-select>
         </el-form-item>
         <el-form-item label="网盘目标目录">
-          <el-input v-model="form.targetDirId" placeholder="留空为根目录" />
+          <el-input v-model="form.targetDirId" placeholder="目录 ID，留空为根目录" />
         </el-form-item>
-        <el-form-item label="资源归属目录">
-          <el-tree-select
-            v-model="form.categoryId"
-            :data="categoryTree"
-            :props="{ label: 'name', value: 'id', children: 'children' }"
-            check-strictly
-            clearable
-            node-key="id"
-            placeholder="转存成功后资源归入的目录"
-            style="width: 100%"
-          />
+        <el-form-item label="目录名称">
+          <el-input v-model="form.targetDirName" placeholder="可选，只用于列表显示（否则列表里只有一串目录 ID）" />
         </el-form-item>
         <el-form-item label="标题">
           <el-input v-model="form.title" placeholder="可选，留空自动识别" />
@@ -146,7 +137,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import {  ElMessage  } from 'element-plus'
 import { Refresh, Plus } from '@element-plus/icons-vue'
-import { transferApi, diskApi, categoryApi } from '@/api'
+import { transferApi, diskApi } from '@/api'
 
 const list = ref([])
 const total = ref(0)
@@ -158,7 +149,6 @@ const loading = ref(false)
 const dialogVisible = ref(false)
 const submitting = ref(false)
 const accounts = ref([])
-const categoryTree = ref([])
 
 const form = reactive({
   shareUrl: '',
@@ -166,7 +156,9 @@ const form = reactive({
   diskType: 'quark',
   diskAccountId: null,
   targetDirId: '',
-  categoryId: null,
+  // targetDirName 仅用于列表显示。这里**没有** categoryId：
+  // 转存不负责资源归属，归属统一交给「资源与映射」。
+  targetDirName: '',
   title: '',
 })
 
@@ -249,7 +241,6 @@ onMounted(async () => {
   load()
   try {
     accounts.value = await diskApi.list()
-    categoryTree.value = await categoryApi.tree(false)
   } catch (e) {
     /* 忽略 */
   }

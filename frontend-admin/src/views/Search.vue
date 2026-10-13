@@ -63,13 +63,6 @@
         <div>
           <el-button
             size="small"
-            :disabled="!selected.length"
-            @click="openImportDialog"
-          >
-            导入选中资源（{{ selected.length }}）
-          </el-button>
-          <el-button
-            size="small"
             type="primary"
             :disabled="!selected.length"
             @click="openTransferDialog"
@@ -145,32 +138,6 @@
       </div>
     </div>
 
-    <!-- 导入对话框 -->
-    <el-dialog v-model="importDialog" title="导入资源到目录" width="560px">
-      <el-form label-width="90px">
-        <el-form-item label="目标目录" required>
-          <el-tree-select
-            v-model="importForm.categoryId"
-            :data="categoryTree"
-            :props="{ label: 'name', value: 'id', children: 'children' }"
-            check-strictly
-            node-key="id"
-            placeholder="请选择目录"
-            style="width: 100%"
-          />
-        </el-form-item>
-        <el-form-item label="资源数量">
-          <span>{{ selected.length }} 个资源将被导入</span>
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="importDialog = false">取消</el-button>
-        <el-button type="primary" :loading="importing" @click="confirmImport">
-          确认导入
-        </el-button>
-      </template>
-    </el-dialog>
-
     <!-- 转存对话框 -->
     <el-dialog v-model="transferDialog" title="转存到网盘" width="620px">
       <el-form label-width="100px">
@@ -189,27 +156,34 @@
         </el-form-item>
         <el-form-item label="网盘目录">
           <div class="disk-browser">
-            <el-input v-model="transferForm.targetDirId" placeholder="默认为根目录，可留空">
+            <el-input
+              v-model="transferForm.targetDirName"
+              readonly
+              placeholder="根目录"
+            >
               <template #append>
                 <el-button @click="openBrowser">浏览</el-button>
               </template>
             </el-input>
+            <div class="text-secondary mt-8">
+              <template v-if="transferForm.targetDirId">
+                将转存到该目录
+                <el-button link type="primary" size="small" @click="clearTargetDir">
+                  改回根目录
+                </el-button>
+              </template>
+              <template v-else>未选择目录，将转存到网盘根目录</template>
+            </div>
           </div>
-        </el-form-item>
-        <el-form-item label="资源归属目录">
-          <el-tree-select
-            v-model="transferForm.categoryId"
-            :data="categoryTree"
-            :props="{ label: 'name', value: 'id', children: 'children' }"
-            check-strictly
-            node-key="id"
-            placeholder="转存成功后资源归入哪个目录（可选）"
-            clearable
-            style="width: 100%"
-          />
         </el-form-item>
         <el-form-item label="待转存">
           <span>{{ selected.length }} 个资源</span>
+        </el-form-item>
+        <el-form-item label=" ">
+          <span class="text-secondary">
+            转存只负责把文件放进网盘目录。要让孩子端看到，请到「资源与映射」
+            把这个目录映射成本地目录。
+          </span>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -243,18 +217,25 @@
         </el-table-column>
       </el-table>
       <template #footer>
-        <el-button @click="browserDialog = false">取消</el-button>
-        <el-button type="primary" @click="confirmBrowserDir">选择当前目录</el-button>
+        <div class="browser-footer">
+          <span class="text-secondary">
+            当前目录：<b>{{ browserPath }}</b>
+          </span>
+          <div>
+            <el-button @click="browserDialog = false">取消</el-button>
+            <el-button type="primary" @click="confirmBrowserDir">转存到该目录</el-button>
+          </div>
+        </div>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {  ElMessage  } from 'element-plus'
 import { Search, Refresh, Folder, Document } from '@element-plus/icons-vue'
-import { searchApi, categoryApi, diskApi, resourceApi, transferApi } from '@/api'
+import { searchApi, diskApi, transferApi } from '@/api'
 
 const keyword = ref('')
 const results = ref([])
@@ -281,21 +262,42 @@ const diskOptions = [
 const diskTypes = ref(['quark', 'baidu', 'uc', 'tianyi'])
 
 const selected = ref([])
-const categoryTree = ref([])
 const accounts = ref([])
 
-const importDialog = ref(false)
-const importForm = ref({ categoryId: null })
-const importing = ref(false)
-
 const transferDialog = ref(false)
-const transferForm = ref({ diskAccountId: null, targetDirId: '', categoryId: null })
+// targetDirId 是网盘侧的目录 ID（发给后端），targetDirName 只是给人看的名。
+//
+// 为什么要拆成两个字段：网盘目录 ID 是一串无意义的字符（夸克是形如
+// 3f2a… 的 fid），直接把它显示在输入框里，用户根本无从确认"我到底选到哪了"，
+// 也就没人能一眼看出"选了目录却转存到根目录"这个 bug。
+//
+// 这里**没有** categoryId：转存不负责"资源归属"。归属（账号 + 目录 → 本地分类）
+// 统一由「资源与映射」负责，转存只把文件放进网盘目录。
+const transferForm = ref({ diskAccountId: null, targetDirId: '', targetDirName: '' })
 const transferring = ref(false)
 
 const browserDialog = ref(false)
 const browserItems = ref([])
+// browserStack 存的是**已经进入过**的那一串目录，元素格式 {id, name}。
+//
+// 这里是本 bug 的根因所在：原实现 push 的是 `currentDirId()`（即进入前的
+// 父目录 id）配上子目录的 name，于是栈里每一项的 id 都指向上一级，
+// 最深一项的 id 恒为 '' —— 无论点进多少层，currentDirId() 都返回空串，
+// 转存自然全部落到根目录。
 const browserStack = ref([])
-const browserPath = ref('根目录')
+
+// 当前所在目录 ID（'' = 根目录）。与「资源与映射」「资源列表」里的
+// 同名函数保持一致取法：栈顶就是当前目录。
+function currentDirId() {
+  return browserStack.value.length ? browserStack.value[browserStack.value.length - 1].id : ''
+}
+
+// 路径面包屑：根目录 / A / B
+const browserPath = computed(() =>
+  browserStack.value.length
+    ? ['根目录', ...browserStack.value.map((s) => s.name)].join(' / ')
+    : '根目录'
+)
 
 function diskName(t) {
   return { quark: '夸克', baidu: '百度', uc: 'UC', tianyi: '天翼', aliyun: '阿里', xunlei: '迅雷', 123: '123', mobile: '移动', 115: '115' }[t] || t
@@ -366,55 +368,11 @@ async function checkHealth() {
   }
 }
 
-async function loadCategories() {
-  try {
-    categoryTree.value = await categoryApi.tree(false)
-  } catch (e) {
-    /* 忽略 */
-  }
-}
-
 async function loadAccounts() {
   try {
     accounts.value = await diskApi.list()
   } catch (e) {
     /* 忽略 */
-  }
-}
-
-function openImportDialog() {
-  if (!categoryTree.value.length) {
-    ElMessage.warning('请先创建目录')
-    return
-  }
-  importForm.value.categoryId = null
-  importDialog.value = true
-}
-
-async function confirmImport() {
-  if (!importForm.value.categoryId) {
-    ElMessage.warning('请选择目标目录')
-    return
-  }
-  importing.value = true
-  try {
-    const items = selected.value.map((r) => ({
-      title: r.note,
-      diskType: r.diskType,
-      shareUrl: r.url,
-      passcode: r.password,
-      note: r.note,
-    }))
-    const res = await resourceApi.import({
-      categoryId: importForm.value.categoryId,
-      items,
-    })
-    ElMessage.success(`导入完成：成功 ${res.created} 个，跳过 ${res.skipped} 个`)
-    importDialog.value = false
-  } catch (e) {
-    /* 忽略 */
-  } finally {
-    importing.value = false
   }
 }
 
@@ -424,7 +382,7 @@ async function openTransferDialog() {
     ElMessage.warning('请先到「网盘账号」页面绑定网盘账号')
     return
   }
-  transferForm.value = { diskAccountId: null, targetDirId: '', categoryId: null }
+  transferForm.value = { diskAccountId: null, targetDirId: '', targetDirName: '' }
   transferDialog.value = true
 }
 
@@ -444,10 +402,14 @@ async function confirmTransfer() {
     const res = await transferApi.batch({
       diskAccountId: transferForm.value.diskAccountId,
       targetDirId: transferForm.value.targetDirId,
-      categoryId: transferForm.value.categoryId || 0,
+      targetDirName: transferForm.value.targetDirName,
       items,
     })
-    ElMessage.success(`已提交 ${res.count} 个转存任务，可在「转存任务」页面查看进度`)
+    // 提示里点明"下一步去哪"，因为转存完孩子端还看不到东西 —— 还得去建映射。
+    ElMessage.success(
+      `已提交 ${res.count} 个转存任务，可在「转存任务」页面查看进度；` +
+        '转存完成后到「资源与映射」把这个目录映射成本地目录，孩子端即可看到'
+    )
     transferDialog.value = false
   } catch (e) {
     /* 忽略 */
@@ -462,7 +424,6 @@ async function openBrowser() {
     return
   }
   browserStack.value = []
-  browserPath.value = '根目录'
   await loadBrowserDir('')
   browserDialog.value = true
 }
@@ -478,31 +439,35 @@ async function loadBrowserDir(dirId) {
 
 function enterDir(row) {
   if (!row.isDir) return
-  browserStack.value.push({ id: currentDirId(), name: row.name })
-  browserPath.value = browserStack.value.map((s) => s.name).join(' / ')
+  // 入栈的是**被进入的目录自己**的 id，不是父目录的。
+  browserStack.value.push({ id: row.id, name: row.name })
   loadBrowserDir(row.id)
 }
 
 function browserBack() {
+  if (!browserStack.value.length) return
   browserStack.value.pop()
-  browserPath.value = browserStack.value.length
-    ? browserStack.value.map((s) => s.name).join(' / ')
-    : '根目录'
   loadBrowserDir(currentDirId())
-}
-
-function currentDirId() {
-  return browserStack.value.length ? browserStack.value[browserStack.value.length - 1].id : ''
 }
 
 function confirmBrowserDir() {
   transferForm.value.targetDirId = currentDirId()
+  // 面包屑去掉最前面的「根目录」前缀，得到的正好是 根目录 / A / B 的
+  // 「A / B」；在根目录时栈为空，显示「根目录」。
+  transferForm.value.targetDirName = browserStack.value.length
+    ? browserStack.value.map((s) => s.name).join(' / ')
+    : '根目录'
   browserDialog.value = false
+}
+
+// 恢复到"不指定目录 → 转存到根目录"
+function clearTargetDir() {
+  transferForm.value.targetDirId = ''
+  transferForm.value.targetDirName = ''
 }
 
 onMounted(() => {
   checkHealth()
-  loadCategories()
 })
 </script>
 
@@ -551,5 +516,20 @@ onMounted(() => {
   align-items: center;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+/* 底部左边写清"当前目录是谁"，右边才是按钮 —— 转存到哪必须一眼可验，
+   否则用户只能靠"转完了去看网盘"来发现问题。 */
+.browser-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.browser-footer span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

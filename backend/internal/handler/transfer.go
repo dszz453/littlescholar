@@ -10,7 +10,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/littlescholar/core/internal/adapter"
 	"github.com/littlescholar/core/internal/model"
-	"github.com/littlescholar/core/internal/service"
 	"github.com/littlescholar/core/internal/task"
 	"github.com/littlescholar/core/internal/util"
 	"gorm.io/gorm"
@@ -27,13 +26,20 @@ func NewTransferHandler(db *gorm.DB, encryptor *util.Encryptor, pool *task.Worke
 	return &TransferHandler{db: db, encryptor: encryptor, pool: pool}
 }
 
+// createTransferRequest 转存请求。
+//
+// 刻意**不含** categoryId：转存的职责边界就是"把分享里的文件落到指定网盘目录"，
+// 不包括"资源归属到哪个分类"。归属由 ResourceMapping（账号 + 目录 → 本地分类）
+// 统管；转存这边要是也能写 Resource，同一个目录就会出现两份互相矛盾的来源记录，
+// 而"删了映射资源还在"那类问题正是这么长出来的。
 type createTransferRequest struct {
 	ShareURL      string `json:"shareUrl" binding:"required"`
 	Passcode      string `json:"passcode"`
 	DiskType      string `json:"diskType" binding:"required"`
 	DiskAccountID uint64 `json:"diskAccountId"`
 	TargetDirID   string `json:"targetDirId"`
-	CategoryID    uint64 `json:"categoryId"`
+	// TargetDirName 只是给人看的目录名（面包屑），定位仍然靠 TargetDirID。
+	TargetDirName string `json:"targetDirName"`
 	Title         string `json:"title"`
 }
 
@@ -64,7 +70,7 @@ func (h *TransferHandler) Create(c *gin.Context) {
 		SharePassword: req.Passcode,
 		DiskAccountID: accountID,
 		TargetDirID:   req.TargetDirID,
-		CategoryID:    req.CategoryID,
+		TargetDirName: req.TargetDirName,
 		Status:        model.TaskStatusPending,
 		OperatorID:    util.CurrentUserID(c),
 	}
@@ -82,7 +88,7 @@ func (h *TransferHandler) BatchCreate(c *gin.Context) {
 	var req struct {
 		DiskAccountID uint64 `json:"diskAccountId"`
 		TargetDirID   string `json:"targetDirId"`
-		CategoryID    uint64 `json:"categoryId"`
+		TargetDirName string `json:"targetDirName"`
 		Items         []struct {
 			ShareURL string `json:"shareUrl"`
 			Passcode string `json:"passcode"`
@@ -114,7 +120,7 @@ func (h *TransferHandler) BatchCreate(c *gin.Context) {
 			SharePassword: it.Passcode,
 			DiskAccountID: accountID,
 			TargetDirID:   req.TargetDirID,
-			CategoryID:    req.CategoryID,
+			TargetDirName: req.TargetDirName,
 			Status:        model.TaskStatusPending,
 			OperatorID:    operatorID,
 		}
@@ -198,36 +204,19 @@ func (h *TransferHandler) processTransfer(ctx context.Context, taskID uint64) er
 		return h.fail(&t, "转存失败: "+err.Error())
 	}
 
-	// 转存成功 → 建立资源记录
-	var resourceID *uint64
-	if t.CategoryID > 0 {
-		res := &model.Resource{
-			CategoryID:    t.CategoryID,
-			Title:         orDefaultStr(share.Title, t.Title),
-			DiskType:      t.DiskType,
-			ShareURL:      t.ShareURL,
-			Passcode:      t.SharePassword,
-			DiskAccountID: &t.DiskAccountID,
-			FileCount:     result.Count,
-			TotalSize:     share.TotalSize,
-			Status:        model.ResourceStatusAlive,
-			MediaType:     model.MediaTypeVideo,
-			// 整份转存的分享，标题就是分享名；能取到后缀就记下来，
-			// 取不到也不影响（ResourceExt 还有 FileID 兜底）。
-			Ext: service.ExtOfName(orDefaultStr(share.Title, t.Title)),
-		}
-		if err := h.db.Create(res).Error; err == nil {
-			resourceID = &res.ID
-		}
-	}
+	// 转存到此为止：只负责把分享里的文件落进网盘目录，**不再**顺手造 Resource。
+	//
+	// 资源归属统一交给「资源与映射」：那边按「账号 + 目录」建 ResourceMapping，
+	// 由同步任务扫描目录后登记资源。这样资源的来源永远只有一处，
+	// 删映射时能干净地连带清理；也不会出现"转存顺手塞进来一条，
+	// 事后谁也说不清它是哪条映射导入的"这类孤儿记录。
 
 	finish := time.Now()
 	h.db.Model(&t).Updates(map[string]interface{}{
-		"status":              model.TaskStatusSuccess,
-		"progress":            100,
-		"message":             result.Message,
-		"finished_at":         finish,
-		"created_resource_id": resourceID,
+		"status":      model.TaskStatusSuccess,
+		"progress":    100,
+		"message":     result.Message,
+		"finished_at": finish,
 	})
 	log.Printf("[transfer] 任务 %d 转存成功: %s", t.ID, result.Message)
 	return nil
