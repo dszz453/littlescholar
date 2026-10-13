@@ -167,7 +167,22 @@ func (s *TranscodeService) EnsureHLS(ctx context.Context, res *model.Resource) (
 		[]string{model.TaskStatusPending, model.TaskStatusRunning}).
 		Order("id desc").First(&running).Error
 	if err == nil {
-		return "", false, running.ID, nil
+		// 数据库说"进行中"，但本进程的 inflight 里没有它 —— 说明这是
+		// **上一个进程遗留**的任务：容器重启 / OOM 被杀时 ffmpeg 会随
+		// 进程一起消失，而那条 running 记录没人收尾。
+		//
+		// 不处理的后果很严重（线上已实际发生，资源 2402 卡在 progress=30）：
+		// 该资源此后每次播放都会命中这条死记录，前端永远显示"转码中"、
+		// 进度条永远不动，只能靠人工改库才能恢复。
+		//
+		// 所以复用的判据不是"数据库怎么记"，而是"本进程是否真的在跑它"。
+		s.logger.Warn("发现上个进程遗留的转码任务，标记失败后重新入队",
+			zap.Uint64("taskId", running.ID),
+			zap.Uint64("resourceId", res.ID),
+			zap.String("staleStatus", running.Status))
+		s.fail(running.ID, "服务重启导致转码中断，已重新排队")
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", false, 0, err
 	}
 
 	// 3. 新建任务
