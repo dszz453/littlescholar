@@ -482,7 +482,18 @@ func (q *Quark) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 	}
 
 	info.Title = listResp.Data.Share.Title
-	info.RootID = listResp.Data.ShareToken
+	// RootID 必须用 **token 接口返回的 stoken**。
+	//
+	// 详情响应里的 data.share_token 实测**恒为空串**（实测 data 顶层键
+	// 只有 is_owner / list / share），旧代码却把它当成 stoken 用，
+	// 于是转存必然报 code=14001 Bad Parameter: [token内容错误]。
+	// 这一点已用真实账号在服务器上直连接口验证过：
+	//   stoken 用 token 接口的值 → code=0 且返回 task_id
+	//   stoken 用详情的 share_token（空）→ code=14001
+	info.RootID = stoken
+	if info.RootID == "" {
+		info.RootID = listResp.Data.ShareToken
+	}
 	for _, f := range listResp.Data.List {
 		info.Files = append(info.Files, adapter.FileItem{
 			ID:    f.FID,
