@@ -219,6 +219,8 @@ func Setup(deps *Deps) *gin.Engine {
 		// 搜一搜 · 搜全网 + 即时转存播放
 		app.POST("/search/global", resourceH.SearchGlobal)
 		app.POST("/instant/play", resourceH.InstantPlay)
+		// 分享目录浏览：搜全网里"一层文件夹一层打开"。
+		app.POST("/instant/browse", resourceH.BrowseShare)
 
 		app.GET("/play/:id", playH.Info)
 		app.POST("/play/:id/progress", playH.ReportProgress)

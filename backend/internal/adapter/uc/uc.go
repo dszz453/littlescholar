@@ -428,13 +428,41 @@ func (u *UC) Rename(ctx context.Context, cred *adapter.Credential, fileID, newNa
 var ucShareRe = regexp.MustCompile(`/s/([0-9a-zA-Z]+)`)
 
 func (u *UC) ParseShare(ctx context.Context, cred *adapter.Credential, shareURL, passcode string) (*adapter.ShareInfo, error) {
+	stoken, pwdID, err := u.shareToken(ctx, cred, shareURL, passcode)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. 列出分享内容
+	files, err := u.listShareFiles(ctx, cred, pwdID, stoken, "0")
+	if err != nil {
+		return nil, err
+	}
+
+	info := &adapter.ShareInfo{
+		ShareURL: shareURL,
+		Passcode: passcode,
+		RootID:   stoken,
+		Title:    fmt.Sprintf("UC分享_%s", pwdID),
+		Files:    files,
+	}
+	for _, f := range files {
+		info.TotalSize += f.Size
+	}
+	if len(info.Files) == 1 {
+		info.Title = info.Files[0].Name
+	}
+	return info, nil
+}
+
+// shareToken 取分享 stoken（UC 与夸克同协议）。
+func (u *UC) shareToken(ctx context.Context, cred *adapter.Credential, shareURL, passcode string) (string, string, error) {
 	m := ucShareRe.FindStringSubmatch(shareURL)
 	if len(m) < 2 {
-		return nil, fmt.Errorf("无法提取 UC 分享 ID: %s", shareURL)
+		return "", "", fmt.Errorf("无法提取 UC 分享 ID: %s", shareURL)
 	}
 	pwdID := m[1]
 
-	// 1. 获取 stoken
 	var tokenResp struct {
 		Code int `json:"code"`
 		Data struct {
@@ -449,16 +477,27 @@ func (u *UC) ParseShare(ctx context.Context, cred *adapter.Credential, shareURL,
 		Body:    map[string]interface{}{"pwd_id": pwdID, "passcode": passcode},
 	}, &tokenResp)
 	if err != nil {
-		return nil, err
+		return "", "", err
 	}
 	if tokenResp.Code == 41013 || tokenResp.Code == 41012 {
-		return nil, adapter.ErrNeedPassword
+		return "", "", adapter.ErrNeedPassword
 	}
 	if tokenResp.Code != 0 {
-		return nil, adapter.ErrShareExpired
+		return "", "", adapter.ErrShareExpired
 	}
+	if tokenResp.Data.Stoken == "" {
+		return "", "", adapter.ErrShareExpired
+	}
+	return tokenResp.Data.Stoken, pwdID, nil
+}
 
-	// 2. 列出分享内容
+// listShareFiles 列出分享内指定目录（pdirFid "0" = 根目录）。
+//
+// 与夸克同协议；抽出来给「解析整个分享」和「一层层打开文件夹」共用。
+func (u *UC) listShareFiles(ctx context.Context, cred *adapter.Credential, pwdID, stoken, pdirFid string) ([]adapter.FileItem, error) {
+	if pdirFid == "" {
+		pdirFid = "0"
+	}
 	var listResp struct {
 		Code int `json:"code"`
 		Data struct {
@@ -473,13 +512,13 @@ func (u *UC) ParseShare(ctx context.Context, cred *adapter.Credential, shareURL,
 			ShareToken string `json:"share_token"`
 		} `json:"data"`
 	}
-	_, err = u.http.DoJSON(ctx, &adapter.Request{
+	_, err := u.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
 		URL:     apiBase + "/share/sharepage/detail",
 		Headers: u.headers(cred.Cookie),
 		Query: map[string]string{
 			"pr": "UCBrowser", "fr": "pc", "pwd_id": pwdID,
-			"stoken": tokenResp.Data.Stoken, "pdir_fid": "0",
+			"stoken": stoken, "pdir_fid": pdirFid,
 			"force": "0", "_page": "1", "_size": "200",
 		},
 	}, &listResp)
@@ -489,24 +528,30 @@ func (u *UC) ParseShare(ctx context.Context, cred *adapter.Credential, shareURL,
 	if listResp.Code != 0 {
 		return nil, fmt.Errorf("UC 分享列出失败: code=%d", listResp.Code)
 	}
-
-	info := &adapter.ShareInfo{
-		ShareURL: shareURL,
-		Passcode: passcode,
-		RootID:   tokenResp.Data.Stoken,
-		Title:    fmt.Sprintf("UC分享_%s", pwdID),
-	}
+	files := make([]adapter.FileItem, 0, len(listResp.Data.List))
 	for _, f := range listResp.Data.List {
-		info.Files = append(info.Files, adapter.FileItem{
-			ID: f.FID, Name: f.FileName, IsDir: f.Dir, Size: f.Size, Ext: extOf(f.FileName),
-			Token: f.ShareFidToken,
+		files = append(files, adapter.FileItem{
+			ID: f.FID, Name: f.FileName, IsDir: f.Dir, Size: f.Size,
+			Ext: extOf(f.FileName), Token: f.ShareFidToken,
 		})
-		info.TotalSize += f.Size
 	}
-	if len(info.Files) == 1 {
-		info.Title = info.Files[0].Name
+	return files, nil
+}
+
+// ListShareDir 列出分享内某一层目录 —— 供前端"一层文件夹一层打开"。
+func (u *UC) ListShareDir(ctx context.Context, cred *adapter.Credential, shareURL, passcode, pdirFid string) (*adapter.ShareEntry, error) {
+	stoken, pwdID, err := u.shareToken(ctx, cred, shareURL, passcode)
+	if err != nil {
+		return nil, err
 	}
-	return info, nil
+	files, err := u.listShareFiles(ctx, cred, pwdID, stoken, pdirFid)
+	if err != nil {
+		return nil, err
+	}
+	if pdirFid == "" {
+		pdirFid = "0"
+	}
+	return &adapter.ShareEntry{Fid: pdirFid, Title: fmt.Sprintf("UC分享_%s", pwdID), Files: files, RootID: stoken}, nil
 }
 
 func (u *UC) SaveToDir(ctx context.Context, cred *adapter.Credential, share *adapter.ShareInfo, targetDirID string) (*adapter.SaveResult, error) {

@@ -104,6 +104,14 @@ type FileItem struct {
 	// 之前把 fid 原样当成 token 传，服务端一律拒绝 —— 这就是
 	// 「夸克/UC 转存失败」的直接原因。
 	Token string `json:"-"`
+
+	// SharePath 分享内的相对路径（仅百度用）。
+	//
+	// 夸克/UC 下钻子目录靠**目录 fid**，而百度的 /share/list 靠**路径**
+	// （dir=/xxx），transfer 又要 fs_id —— 同一层目录在百度那边需要
+	// "ID 用 fs_id、下钻用路径"两个值，所以单独放一个字段。
+	// 同样只在服务端流转，不下发前端。
+	SharePath string `json:"-"`
 }
 
 // ShareInfo 分享链接解析结果
@@ -140,6 +148,40 @@ type SaveResult struct {
 	FileIDs []string `json:"fileIds"`
 	Count   int      `json:"count"`
 	Message string   `json:"message"`
+}
+
+// ShareEntry 分享内某一层目录的内容（支撑「搜全网 → 一层文件夹一层打开」）。
+//
+// ⚠️ Files 里每个 FileItem 的 Token 是**转存准入令牌**，只能留在服务端。
+// handler 回给前端之前必须剥掉，否则等于把转存凭据发给了客户端。
+type ShareEntry struct {
+	// Fid 本层目录的 ID（"0" 表示分享根目录），前端用作面包屑与下钻参数。
+	Fid string `json:"fid"`
+	// Title 分享标题（根目录层才有意义）。
+	Title string     `json:"title"`
+	Files []FileItem `json:"files"`
+
+	// 下面三个是**转存所需的分享级凭据**，同样只留在服务端。
+	//
+	// 为什么 ListShareDir 要返回它们：用户"只转存点中的那一项"时，
+	// handler 会用它构造一个只含该项的 ShareInfo 交给 SaveToDir，
+	// 而 SaveToDir 除了逐项的 Token 之外还依赖分享级的凭据
+	// （夸克/UC 用 stoken，百度用 shareid + 分享者 uk + randsk）。
+	RootID  string `json:"-"`
+	OwnerID string `json:"-"`
+	SeKey   string `json:"-"`
+}
+
+// ShareBrowser 是 DiskAdapter 的**可选**能力：浏览分享内部的目录层级。
+//
+// 为什么不直接塞进 DiskAdapter：只有夸克 / UC / 百度这类"能把分享当目录看"
+// 的网盘才支持它，WebDAV、本地硬盘、天翼、阿里云盘根本不适用，
+// 不该被逼着实现一个只会 return error 的方法。所以单列一个接口，
+// 由 handler 用类型断言按需取用。
+type ShareBrowser interface {
+	// ListShareDir 列出分享内指定目录的内容。
+	// pdirFid 为空或 "0" 表示分享根目录。
+	ListShareDir(ctx context.Context, cred *Credential, shareURL, passcode, pdirFid string) (*ShareEntry, error)
 }
 
 // DirectLink 直链信息

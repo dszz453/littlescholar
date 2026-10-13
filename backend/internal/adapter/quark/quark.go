@@ -434,6 +434,40 @@ func (q *Quark) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 
 	// 2. 用 stoken 列出分享内容
 	info := &adapter.ShareInfo{ShareURL: shareURL, Passcode: passcode}
+
+	files, title, err := q.listShareFiles(ctx, cred, pwdID, stoken, "0")
+	if err != nil {
+		return nil, err
+	}
+
+	info.Title = title
+	// RootID 必须用 **token 接口返回的 stoken**。
+	//
+	// 详情响应里的 data.share_token 实测**恒为空串**（实测 data 顶层键
+	// 只有 is_owner / list / share），旧代码却把它当成 stoken 用，
+	// 于是转存必然报 code=14001 Bad Parameter: [token内容错误]。
+	// 这一点已用真实账号在服务器上直连接口验证过：
+	//   stoken 用 token 接口的值 → code=0 且返回 task_id
+	//   stoken 用详情的 share_token（空）→ code=14001
+	info.RootID = stoken
+	info.Files = files
+	for _, f := range files {
+		info.TotalSize += f.Size
+	}
+	return info, nil
+}
+
+// listShareFiles 列出分享内指定目录（pdirFid 为 "0" 表示根目录）。
+//
+// 抽出来是因为「一层文件夹一层打开」和「解析整个分享」用的是同一个
+// 接口，只有 pdir_fid 不同 —— 复制一份迟早会两边改漏。
+//
+// 返回的每个 FileItem 都带着 share_fid_token（转存的准入令牌），
+// 转存时逐项回传；**这是每个文件一个的令牌，不能整份分享共用一个 stoken**。
+func (q *Quark) listShareFiles(ctx context.Context, cred *adapter.Credential, pwdID, stoken, pdirFid string) ([]adapter.FileItem, string, error) {
+	if pdirFid == "" {
+		pdirFid = "0"
+	}
 	var listResp struct {
 		Status int `json:"status"`
 		Code   int `json:"code"`
@@ -455,7 +489,7 @@ func (q *Quark) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 			ShareToken string `json:"share_token"`
 		} `json:"data"`
 	}
-	_, err = q.http.DoJSON(ctx, &adapter.Request{
+	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
 		URL:     baseURL + "/share/sharepage/detail",
 		Headers: q.headers(cred.Cookie),
@@ -464,7 +498,7 @@ func (q *Quark) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 			"fr":            "pc",
 			"pwd_id":        pwdID,
 			"stoken":        stoken,
-			"pdir_fid":      "0",
+			"pdir_fid":      pdirFid,
 			"force":         "0",
 			"_page":         "1",
 			"_size":         "200",
@@ -475,39 +509,48 @@ func (q *Quark) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 		},
 	}, &listResp)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if listResp.Code != 0 {
-		return nil, adapter.ErrShareExpired
+		return nil, "", adapter.ErrShareExpired
 	}
 
-	info.Title = listResp.Data.Share.Title
-	// RootID 必须用 **token 接口返回的 stoken**。
-	//
-	// 详情响应里的 data.share_token 实测**恒为空串**（实测 data 顶层键
-	// 只有 is_owner / list / share），旧代码却把它当成 stoken 用，
-	// 于是转存必然报 code=14001 Bad Parameter: [token内容错误]。
-	// 这一点已用真实账号在服务器上直连接口验证过：
-	//   stoken 用 token 接口的值 → code=0 且返回 task_id
-	//   stoken 用详情的 share_token（空）→ code=14001
-	info.RootID = stoken
-	if info.RootID == "" {
-		info.RootID = listResp.Data.ShareToken
-	}
+	files := make([]adapter.FileItem, 0, len(listResp.Data.List))
 	for _, f := range listResp.Data.List {
-		info.Files = append(info.Files, adapter.FileItem{
+		files = append(files, adapter.FileItem{
 			ID:    f.FID,
 			Name:  f.FileName,
 			IsDir: f.Dir,
 			Size:  f.Size,
 			Ext:   extOf(f.FileName),
-			// 逐项保存转存令牌 —— 注意这是"每个文件一个"，
-			// 不能整份分享共用一个 stoken。
 			Token: f.ShareFidToken,
 		})
-		info.TotalSize += f.Size
 	}
-	return info, nil
+	return files, listResp.Data.Share.Title, nil
+}
+
+// ListShareDir 列出分享内某一层目录 —— 供前端"一层文件夹一层打开"。
+//
+// 实现为 adapter.ShareBrowser（可选能力），不进 DiskAdapter 主接口。
+func (q *Quark) ListShareDir(ctx context.Context, cred *adapter.Credential, shareURL, passcode, pdirFid string) (*adapter.ShareEntry, error) {
+	m := shareURLRe.FindStringSubmatch(shareURL)
+	if len(m) < 2 {
+		return nil, fmt.Errorf("无法从链接中提取分享 ID: %s", shareURL)
+	}
+	pwdID := m[1]
+
+	stoken, err := q.getShareToken(ctx, cred, pwdID, passcode)
+	if err != nil {
+		return nil, err
+	}
+	files, title, err := q.listShareFiles(ctx, cred, pwdID, stoken, pdirFid)
+	if err != nil {
+		return nil, err
+	}
+	if pdirFid == "" {
+		pdirFid = "0"
+	}
+	return &adapter.ShareEntry{Fid: pdirFid, Title: title, Files: files, RootID: stoken}, nil
 }
 
 // getShareToken 获取分享 stoken

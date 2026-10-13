@@ -474,6 +474,43 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 	shareID := m[1]
 
 	// 1. 验证提取码并获取 shareid / uk
+	realShareID, uk, randsk, err := b.shareVerify(ctx, cred, shareID, passcode)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. 列出分享内容
+	files, err := b.listShareDir(ctx, cred, shareID, "")
+	if err != nil {
+		return nil, err
+	}
+
+	info := &adapter.ShareInfo{
+		ShareURL: shareURL,
+		Passcode: passcode,
+		RootID:   fmt.Sprintf("%d", realShareID),
+		// from 参数要的是**分享者的 uk**，不是自己的 uid。
+		// 旧代码把它丢掉了，转存只能传 from=""，服务端直接判参数错误。
+		OwnerID: fmt.Sprintf("%d", uk),
+		// randsk 转存时要作为 sekey 原样回传。
+		SeKey: randsk,
+		Title: fmt.Sprintf("百度分享_%s", shareID),
+		Files: files,
+	}
+	for _, f := range files {
+		info.TotalSize += f.Size
+	}
+	if len(info.Files) == 1 {
+		info.Title = info.Files[0].Name
+	}
+	return info, nil
+}
+
+// shareVerify 验证百度分享的提取码，返回 shareid / 分享者 uk / randsk。
+//
+// 抽出来给「解析整个分享」和「一层层打开文件夹」共用 —— 两者都要先过
+// 这一关，复制一份迟早会两边改漏。
+func (b *Baidu) shareVerify(ctx context.Context, cred *adapter.Credential, surl, passcode string) (int64, int64, string, error) {
 	var verifyResp struct {
 		Errno    int    `json:"errno"`
 		RandSkey string `json:"randsk"`
@@ -484,20 +521,46 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 		Method:  "POST",
 		URL:     panURL + "/share/verify",
 		Headers: b.headers(cred),
-		Query:   map[string]string{"surl": shareID, "bdstoken": "", "t": fmt.Sprint(time.Now().UnixMilli()), "channel": "chunlei", "web": "1", "app_id": "250528", "clienttype": "0"},
+		Query:   map[string]string{"surl": surl, "bdstoken": "", "t": fmt.Sprint(time.Now().UnixMilli()), "channel": "chunlei", "web": "1", "app_id": "250528", "clienttype": "0"},
 		Body:    map[string]interface{}{"pwd": passcode, "vcode": "", "vcode_str": ""},
 	}, &verifyResp)
 	if err != nil {
-		return nil, err
+		return 0, 0, "", err
 	}
 	if verifyResp.Errno == -9 {
-		return nil, adapter.ErrNeedPassword
+		return 0, 0, "", adapter.ErrNeedPassword
 	}
 	if verifyResp.Errno != 0 {
-		return nil, adapter.ErrShareExpired
+		return 0, 0, "", adapter.ErrShareExpired
+	}
+	return verifyResp.ShareID, verifyResp.UK, verifyResp.RandSkey, nil
+}
+
+// listShareDir 列出百度分享内某一层目录。
+//
+// 百度的 /share/list 用两种模式：
+//
+//	root=1            列分享根目录
+//	root=0&dir=<路径> 列分享内的子目录（dir 是分享内的**相对路径**）
+//
+// 目录项同时带 fs_id 和 path：转存要前者、下钻要后者，
+// 所以目录项把 path 一起放进 SharePath。
+//
+// ⚠️ 本函数与 ListShareDir 未经线上验证：线上百度账号的 STOKEN 已失效
+// （share/verify 对所有分享一律 errno=-12），拿不到有效数据。
+// 实现与 ParseShare 走同一套调用，账号恢复后即可生效。
+func (b *Baidu) listShareDir(ctx context.Context, cred *adapter.Credential, surl, pdir string) ([]adapter.FileItem, error) {
+	q := map[string]string{
+		"shorturl": surl, "web": "1", "app_id": "250528",
+		"channel": "chunlei", "clienttype": "0",
+	}
+	if pdir == "" || pdir == "/" {
+		q["root"] = "1"
+	} else {
+		q["root"] = "0"
+		q["dir"] = pdir
 	}
 
-	// 2. 列出分享内容
 	var listResp struct {
 		Errno int `json:"errno"`
 		List  []struct {
@@ -508,14 +571,11 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 			Size       int64  `json:"size"`
 		} `json:"list"`
 	}
-	_, err = b.http.DoJSON(ctx, &adapter.Request{
+	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
 		URL:     panURL + "/share/list",
 		Headers: b.headers(cred),
-		Query: map[string]string{
-			"shorturl": shareID, "root": "1", "web": "1", "app_id": "250528",
-			"channel": "chunlei", "clienttype": "0",
-		},
+		Query:   q,
 	}, &listResp)
 	if err != nil {
 		return nil, err
@@ -524,31 +584,48 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 		return nil, fmt.Errorf("百度分享列出失败: errno=%d", listResp.Errno)
 	}
 
-	info := &adapter.ShareInfo{
-		ShareURL: shareURL,
-		Passcode: passcode,
-		RootID:   fmt.Sprintf("%d", verifyResp.ShareID),
-		// from 参数要的是**分享者的 uk**，不是自己的 uid。
-		// 旧代码把它丢掉了，转存只能传 from=""，服务端直接判参数错误。
-		OwnerID: fmt.Sprintf("%d", verifyResp.UK),
-		// randsk 转存时要作为 sekey 原样回传。
-		SeKey: verifyResp.RandSkey,
-		Title: fmt.Sprintf("百度分享_%s", shareID),
-	}
+	files := make([]adapter.FileItem, 0, len(listResp.List))
 	for _, f := range listResp.List {
-		info.Files = append(info.Files, adapter.FileItem{
+		files = append(files, adapter.FileItem{
 			ID:    fmt.Sprint(f.FsID),
 			Name:  f.ServerName,
 			IsDir: f.IsDir == 1,
 			Size:  f.Size,
 			Ext:   extOf(f.ServerName),
+			// 下钻用：目录的相对路径。
+			SharePath: f.Path,
 		})
-		info.TotalSize += f.Size
 	}
-	if len(info.Files) == 1 {
-		info.Title = info.Files[0].Name
+	return files, nil
+}
+
+// ListShareDir 列出百度分享内某一层目录 —— 供前端"一层文件夹一层打开"。
+func (b *Baidu) ListShareDir(ctx context.Context, cred *adapter.Credential, shareURL, passcode, pdirFid string) (*adapter.ShareEntry, error) {
+	m := baiduShareRe.FindStringSubmatch(shareURL)
+	if len(m) < 2 {
+		return nil, fmt.Errorf("无法提取百度分享 ID: %s", shareURL)
 	}
-	return info, nil
+	surl := m[1]
+	realShareID, uk, randsk, err := b.shareVerify(ctx, cred, surl, passcode)
+	if err != nil {
+		return nil, err
+	}
+	files, err := b.listShareDir(ctx, cred, surl, pdirFid)
+	if err != nil {
+		return nil, err
+	}
+	if pdirFid == "" {
+		pdirFid = "/"
+	}
+	return &adapter.ShareEntry{
+		Fid:   pdirFid,
+		Title: fmt.Sprintf("百度分享_%s", surl),
+		Files: files,
+		// 百度转存要 shareid + 分享者 uk + randsk 三件套，缺一转存必失败。
+		RootID:  fmt.Sprintf("%d", realShareID),
+		OwnerID: fmt.Sprintf("%d", uk),
+		SeKey:   randsk,
+	}, nil
 }
 
 // bdstoken 取百度网盘的操作令牌。

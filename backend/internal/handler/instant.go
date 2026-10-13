@@ -85,8 +85,12 @@ func (h *ResourceHandler) SearchGlobal(c *gin.Context) {
 	var req struct {
 		Keyword   string   `json:"keyword" binding:"required"`
 		DiskTypes []string `json:"diskTypes"`
-		Page      int      `json:"page"`
-		PageSize  int      `json:"pageSize"`
+		// DiskType 单值筛选：点前端"网盘筛选"按钮时带上。
+		// 与 DiskTypes 的区别：DiskTypes 是"只要这几家"的多选（来自前端筛选器），
+		// DiskType 是"只看这一家"。两者可共存，先多选再单筛。
+		DiskType string `json:"diskType"`
+		Page     int    `json:"page"`
+		PageSize int    `json:"pageSize"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		util.BadRequest(c, "请输入搜索关键词")
@@ -106,6 +110,50 @@ func (h *ResourceHandler) SearchGlobal(c *gin.Context) {
 		return
 	}
 
+	// 网盘分面：按**全部结果**统计各网盘数量，供前端筛选按钮用。
+	//
+	// 必须基于未筛过的全量列表统计 —— 否则一旦筛了某一种，其他网盘的
+	// 入口就消失了，孩子再也切不回去（「搜系统」的 facets 同理）。
+	type diskFacet struct {
+		DiskType string `json:"diskType"`
+		Name     string `json:"name"`
+		Total    int    `json:"total"`
+	}
+	facetCount := map[string]int{}
+	facetOrder := make([]string, 0, 8)
+	for _, it := range resp.List {
+		dt := it.DiskType
+		if dt == "" {
+			continue
+		}
+		if _, ok := facetCount[dt]; !ok {
+			facetOrder = append(facetOrder, dt)
+		}
+		facetCount[dt]++
+	}
+	facets := make([]diskFacet, 0, len(facetOrder))
+	for _, dt := range facetOrder {
+		name := adapter.DiskTypeNames[adapter.DiskType(dt)]
+		if name == "" {
+			name = dt
+		}
+		facets = append(facets, diskFacet{DiskType: dt, Name: name, Total: facetCount[dt]})
+	}
+
+	// 单网盘筛选（在分页之前做，total 才是该网盘的真实条数）
+	list := resp.List
+	total := resp.Total
+	if req.DiskType != "" {
+		filtered := make([]service.SearchItem, 0, len(list))
+		for _, it := range list {
+			if it.DiskType == req.DiskType {
+				filtered = append(filtered, it)
+			}
+		}
+		list = filtered
+		total = len(list)
+	}
+
 	page, pageSize := req.Page, req.PageSize
 	if page < 1 {
 		page = 1
@@ -114,14 +162,14 @@ func (h *ResourceHandler) SearchGlobal(c *gin.Context) {
 		pageSize = 20
 	}
 	start := (page - 1) * pageSize
-	if start > len(resp.List) {
-		start = len(resp.List)
+	if start > len(list) {
+		start = len(list)
 	}
 	end := start + pageSize
-	if end > len(resp.List) {
-		end = len(resp.List)
+	if end > len(list) {
+		end = len(list)
 	}
-	pageItems := resp.List[start:end]
+	pageItems := list[start:end]
 
 	// 实时有效性检测：只查当前这一页（20 条以内），
 	// 全量查既慢又会把检测服务打满。检测失败不影响搜索本身。
@@ -151,12 +199,16 @@ func (h *ResourceHandler) SearchGlobal(c *gin.Context) {
 	// 若用户只绑了夸克，那些百度/115 的结果点了必然失败，
 	// 与其让人一次次撞墙，不如提前说清楚。
 	util.OK(c, gin.H{
-		"keyword":            req.Keyword,
-		"total":              resp.Total,
-		"costMs":             resp.CostMs,
-		"page":               page,
-		"pageSize":           pageSize,
-		"list":               pageItems,
+		"keyword":  req.Keyword,
+		"total":    total,
+		"costMs":   resp.CostMs,
+		"page":     page,
+		"pageSize": pageSize,
+		"list":     pageItems,
+		// diskTypes 是"全部结果里有哪些网盘、各多少条"，
+		// 前端据此渲染网盘筛选按钮（与「搜系统」的 facets 同一套语义）。
+		"diskTypes":          facets,
+		"diskType":           req.DiskType,
 		"instantReady":       h.instantReady(),
 		"instantTarget":      h.instantTargetLabel(),
 		"instantTargets":     h.instantTargets(),
@@ -220,6 +272,16 @@ type instantPlayRequest struct {
 	Title    string `json:"title"`
 	DiskType string `json:"diskType"`
 	Note     string `json:"note"`
+
+	// FileID / PdirFid 用于「只转存我在分享里点中的那一项」。
+	//
+	// 用户在搜全网点开一个分享后，可以一层层进目录，最后点某个文件播放。
+	// 这时前端回传：PdirFid = 该文件所在目录的游标，FileID = 该条目 ID，
+	// 服务端重新列一次该目录拿到准入令牌，只转存这一个 —— 而不是把
+	// 整个分享（可能有 3000+ 个文件、上百 GB）都搬进网盘。
+	// FileID 为空时退回老行为：转存分享根目录下的全部条目。
+	FileID  string `json:"fileId"`
+	PdirFid string `json:"pdirFid"`
 }
 
 // InstantPlay 一键把全网搜到的分享转存并立即返回可播放地址。
@@ -258,8 +320,17 @@ func (h *ResourceHandler) InstantPlay(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Minute)
 	defer cancel()
 
-	// 3) 解析分享
-	share, err := a.ParseShare(ctx, cred, strings.TrimSpace(req.ShareURL), strings.TrimSpace(req.Passcode))
+	// 3) 解析分享 —— 或是只取用户在「逐层打开」里点中的那一项。
+	//
+	// 为什么点某一项时不能走 ParseShare：那会把整个分享都转存进来。
+	// 实测全网随便一个"牛津树合集"就有 3000+ 个文件、上百 GB，
+	// 既慢又白占网盘空间（线上夸克账号已用 98.6%，整份转必然报空间不足）。
+	var share *adapter.ShareInfo
+	if strings.TrimSpace(req.FileID) != "" || strings.TrimSpace(req.PdirFid) != "" {
+		share, err = h.singleEntryShare(ctx, a, cred, req.ShareURL, req.Passcode, req.PdirFid, req.FileID)
+	} else {
+		share, err = a.ParseShare(ctx, cred, strings.TrimSpace(req.ShareURL), strings.TrimSpace(req.Passcode))
+	}
 	if err != nil {
 		util.ServerError(c, "解析分享失败: "+err.Error())
 		return
@@ -342,6 +413,128 @@ func (h *ResourceHandler) InstantPlay(c *gin.Context) {
 		files = append(files, gin.H{"title": stripExt(t.Title), "size": t.Size})
 	}
 	util.OK(c, h.instantPayload(res, files, "已转存并开始播放"))
+}
+
+// ============ 分享目录浏览（一层文件夹一层打开） ============
+
+type browseRequest struct {
+	ShareURL string `json:"shareUrl" binding:"required"`
+	Passcode string `json:"passcode"`
+	DiskType string `json:"diskType"`
+	PdirFid  string `json:"pdirFid"`
+}
+
+// BrowseShare 列出分享内某一层目录，供孩子端"一层文件夹一层打开"。
+//
+// 返回给前端的每个条目只带：id（选中用）、name、isDir、size、ext、cursor
+// （下钻用）。**绝不带 Token / SharePath** —— 前者是转存准入令牌，
+// 后者是内部游标，都只该留在服务端；取令牌由服务端在真正转存时现取。
+func (h *ResourceHandler) BrowseShare(c *gin.Context) {
+	var req browseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		util.BadRequest(c, "缺少分享链接")
+		return
+	}
+
+	acc, err := h.pickAccount(req.DiskType, h.cfgUint(CfgInstantAccountID))
+	if err != nil {
+		util.BadRequest(c, err.Error())
+		return
+	}
+	_, cred, a, err := loadSource(h.db, h.encryptor, acc.ID)
+	if err != nil {
+		util.ServerError(c, "加载账号失败: "+err.Error())
+		return
+	}
+	browser, ok := a.(adapter.ShareBrowser)
+	if !ok {
+		util.BadRequest(c, adapter.DiskTypeNames[adapter.DiskType(acc.DiskType)]+"暂不支持浏览分享目录")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	defer cancel()
+
+	entry, err := browser.ListShareDir(ctx, cred, strings.TrimSpace(req.ShareURL),
+		strings.TrimSpace(req.Passcode), strings.TrimSpace(req.PdirFid))
+	if err != nil {
+		util.ServerError(c, "打开目录失败: "+err.Error())
+		return
+	}
+
+	files := make([]gin.H, 0, len(entry.Files))
+	for _, f := range entry.Files {
+		// 下钻游标：夸克/UC 是目录 fid 本身；百度是分享内路径。
+		cursor := f.ID
+		if f.IsDir && f.SharePath != "" {
+			cursor = f.SharePath
+		}
+		files = append(files, gin.H{
+			"id": f.ID, "name": f.Name, "isDir": f.IsDir,
+			"size": f.Size, "ext": f.Ext, "cursor": cursor,
+		})
+	}
+	util.OK(c, gin.H{
+		"fid":      entry.Fid,
+		"title":    entry.Title,
+		"files":    files,
+		"diskType": acc.DiskType,
+	})
+}
+
+// singleEntryShare 把用户点中的那一项（或整个当前目录）组织成一个 ShareInfo。
+//
+// 两种用法：
+//
+//	fileID 非空 —— 只转存这一个文件/子目录
+//	fileID 为空 —— 转存当前这一层目录的全部条目
+//
+// 为什么不直接用前端传来的信息：转存需要各家网盘自己的准入令牌
+// （夸克的 share_fid_token、百度的 randsk…），这些必须由服务端现取。
+// 让前端回传令牌等于把凭据交给客户端，所以前端只回传
+// "父目录游标 + 条目 ID"，由服务端重新列一次该目录把令牌取回来。
+func (h *ResourceHandler) singleEntryShare(ctx context.Context, a adapter.DiskAdapter, cred *adapter.Credential, shareURL, passcode, pdirFid, fileID string) (*adapter.ShareInfo, error) {
+	browser, ok := a.(adapter.ShareBrowser)
+	if !ok {
+		return nil, fmt.Errorf("该网盘暂不支持按目录选择")
+	}
+	entry, err := browser.ListShareDir(ctx, cred, strings.TrimSpace(shareURL),
+		strings.TrimSpace(passcode), strings.TrimSpace(pdirFid))
+	if err != nil {
+		return nil, err
+	}
+
+	base := &adapter.ShareInfo{
+		ShareURL: strings.TrimSpace(shareURL),
+		Passcode: strings.TrimSpace(passcode),
+		// 分享级凭据必须带上：SaveToDir 除了逐项的 Token，
+		// 还要 stoken（夸克/UC）或 shareid + uk + randsk（百度）。
+		RootID:  entry.RootID,
+		OwnerID: entry.OwnerID,
+		SeKey:   entry.SeKey,
+	}
+
+	if fileID == "" {
+		if len(entry.Files) == 0 {
+			return nil, fmt.Errorf("这个文件夹是空的")
+		}
+		base.Files = entry.Files
+		base.Title = entry.Title
+		for _, f := range entry.Files {
+			base.TotalSize += f.Size
+		}
+		return base, nil
+	}
+
+	for _, f := range entry.Files {
+		if f.ID == fileID {
+			base.Title = f.Name
+			base.TotalSize = f.Size
+			base.Files = []adapter.FileItem{f}
+			return base, nil
+		}
+	}
+	return nil, fmt.Errorf("未在分享目录里找到所选条目（可能已被删除）")
 }
 
 // instantPayload 组装返回体。

@@ -72,6 +72,8 @@ export const searchApi = {
 export const instantApi = {
   // 即时转存播放：把搜到的分享转存到系统配置的网盘目录，并返回可播放资源
   play: (data) => http.post('/app/instant/play', data),
+  // 浏览分享内的目录层级（搜全网里"一层文件夹一层打开"）
+  browse: (data) => http.post('/app/instant/browse', data),
 }
 
 export const playApi = {
