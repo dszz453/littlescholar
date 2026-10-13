@@ -67,6 +67,59 @@
                 当前 {{ config.download_concurrency }} 线程
               </span>
             </el-form-item>
+            <el-form-item label="外部加速代理">
+              <el-input v-model="config.accel_proxy" placeholder="http://192.168.1.5:8888/proxy?url={url}" />
+              <div class="text-secondary">
+                留空则不启用。填写后，网盘直链会先经该代理（如 aliproxy）多连接拉流再转发，
+                用于突破非会员的单连接限速。支持 <code>{url}</code> 占位符，也支持直接作为前缀拼接。
+              </div>
+            </el-form-item>
+          </el-form>
+        </div>
+
+        <div class="card-box mt-16">
+          <h3 class="section-title">搜一搜 · 搜全网</h3>
+          <el-form :model="config" label-width="140px">
+            <el-form-item label="开启即时播放">
+              <el-switch v-model="config.instant_enabled" active-value="true" inactive-value="false" />
+              <div class="text-secondary">
+                开启后，孩子端「搜一搜」多出「搜全网」：选中结果会<b>自动转存</b>到下面指定的
+                网盘目录，并立即开始播放（边下边播）。
+              </div>
+            </el-form-item>
+            <el-form-item label="默认转存账号">
+              <el-select v-model="config.instant_account_id" clearable placeholder="留空则用该网盘的默认账号" style="width: 100%">
+                <el-option
+                  v-for="a in transferAccounts"
+                  :key="a.id"
+                  :label="`${a.nickname}（${diskName(a.diskType)}）`"
+                  :value="String(a.id)"
+                />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="转存到目录">
+              <el-input v-model="config.instant_remote_dir" readonly placeholder="根目录">
+                <template #append>
+                  <el-button :disabled="!browseAccountId" @click="openBrowse">浏览</el-button>
+                </template>
+              </el-input>
+              <div class="text-secondary">
+                转存到该账号里的哪个目录（留空 = 根目录）。选「默认转存账号」后才可浏览。
+              </div>
+            </el-form-item>
+            <el-form-item label="收录到目录">
+              <el-tree-select
+                v-model="config.instant_category_id"
+                :data="categoryTree"
+                :props="{ label: 'name', value: 'id', children: 'children' }"
+                check-strictly
+                clearable
+                node-key="id"
+                placeholder="留空则自动使用「搜全网」目录"
+                style="width: 100%"
+              />
+              <div class="text-secondary">转存后的资源会登记到这个系统目录，供孩子端播放与回看。</div>
+            </el-form-item>
           </el-form>
         </div>
       </el-col>
@@ -107,14 +160,35 @@
         </div>
       </el-col>
     </el-row>
+
+    <!-- 转存目录浏览 -->
+    <el-dialog v-model="browseDialog" title="选择转存目录" width="560px">
+      <div class="dir-nav mb-8">
+        <el-button size="small" :icon="ArrowLeft" :disabled="!stack.length" @click="goUp">上级</el-button>
+        <span class="text-secondary ml-8">
+          {{ stack.map((s) => s.name).join(' / ') || '根目录' }}
+        </span>
+      </div>
+      <div class="dir-list" v-loading="browsing">
+        <div v-for="d in dirs" :key="d.id" class="dir-item" @click="enterDir(d)">
+          <el-icon><Folder /></el-icon>
+          <span>{{ d.name }}</span>
+        </div>
+        <el-empty v-if="!dirs.length && !browsing" description="该目录下没有子目录" :image-size="60" />
+      </div>
+      <template #footer>
+        <el-button @click="browseDialog = false">取消</el-button>
+        <el-button type="primary" @click="confirmBrowse">选择当前目录</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
-import {  ElMessage  } from 'element-plus'
-import { Refresh } from '@element-plus/icons-vue'
-import { systemApi } from '@/api'
+import { computed, onMounted, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import { Refresh, ArrowLeft, Folder } from '@element-plus/icons-vue'
+import { systemApi, diskApi, categoryApi } from '@/api'
 
 const config = ref({
   pansou_url: '',
@@ -126,9 +200,36 @@ const config = ref({
   transcode_concurrency: 2,
   download_accelerate: 'true',
   download_concurrency: 16,
+  accel_proxy: '',
+  instant_enabled: 'true',
+  instant_account_id: '',
+  instant_remote_dir: '',
+  instant_category_id: '',
 })
 const status = ref({})
 const saving = ref(false)
+
+// 可用来转存的账号（排除 WebDAV / 本地硬盘这类存储源）
+const accounts = ref([])
+const categoryTree = ref([])
+const transferAccounts = computed(() => accounts.value.filter((a) => !a.isStorage))
+const browseAccountId = computed(() => {
+  if (config.value.instant_account_id) return Number(config.value.instant_account_id)
+  return transferAccounts.value.length ? transferAccounts.value[0].id : null
+})
+
+// 目录浏览
+const browseDialog = ref(false)
+const browsing = ref(false)
+const dirs = ref([])
+const stack = ref([])
+
+function diskName(t) {
+  return (
+    { quark: '夸克', baidu: '百度', uc: 'UC', tianyi: '天翼', aliyun: '阿里云盘', webdav: 'WebDAV', local: '本地硬盘' }[t] ||
+    t
+  )
+}
 
 function formatUptime(sec) {
   if (!sec) return '-'
@@ -153,6 +254,71 @@ async function load() {
     /* 忽略 */
   }
 }
+
+async function loadAccounts() {
+  try {
+    accounts.value = await diskApi.list()
+  } catch (e) {
+    /* 忽略 */
+  }
+}
+
+async function loadCategories() {
+  try {
+    categoryTree.value = await categoryApi.tree(false)
+  } catch (e) {
+    /* 忽略 */
+  }
+}
+
+// ===== 转存目录浏览 =====
+async function openBrowse() {
+  if (!browseAccountId.value) {
+    ElMessage.warning('请先在「资源接入」里添加一个网盘账号')
+    return
+  }
+  stack.value = []
+  // 已配置的远端目录作为起点无法反查路径，这里固定从根目录开始选
+  dirs.value = []
+  browseDialog.value = true
+  await loadBrowse('')
+}
+
+async function loadBrowse(dirId) {
+  browsing.value = true
+  try {
+    const res = await diskApi.browse(browseAccountId.value, dirId)
+    dirs.value = (res.items || []).filter((i) => i.isDir)
+  } catch (e) {
+    dirs.value = []
+  } finally {
+    browsing.value = false
+  }
+}
+
+async function enterDir(d) {
+  stack.value.push({ id: d.id, name: d.name })
+  await loadBrowse(d.id)
+}
+
+async function goUp() {
+  stack.value.pop()
+  await loadBrowse(stack.value.length ? stack.value[stack.value.length - 1].id : '')
+}
+
+function confirmBrowse() {
+  const cur = stack.value.length ? stack.value[stack.value.length - 1] : null
+  config.value.instant_remote_dir = cur ? cur.id : ''
+  browseDialog.value = false
+}
+
+// 换了转存账号后，之前选的目录 ID 在新账号里多半不存在，直接清掉
+watch(
+  () => config.value.instant_account_id,
+  () => {
+    config.value.instant_remote_dir = ''
+  }
+)
 
 async function loadStatus() {
   try {
@@ -182,6 +348,8 @@ async function save() {
 onMounted(() => {
   load()
   loadStatus()
+  loadAccounts()
+  loadCategories()
 })
 </script>
 
@@ -190,5 +358,24 @@ onMounted(() => {
   font-size: 15px;
   font-weight: 600;
   margin: 0 0 16px;
+}
+.dir-nav {
+  display: flex;
+  align-items: center;
+}
+.dir-list {
+  max-height: 320px;
+  overflow-y: auto;
+}
+.dir-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.dir-item:hover {
+  background: var(--ls-bg);
 }
 </style>

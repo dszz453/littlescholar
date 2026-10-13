@@ -31,14 +31,22 @@ func NewPlayHandler(db *gorm.DB, perm *service.PermissionService, encryptor *uti
 	return &PlayHandler{db: db, perm: perm, encryptor: encryptor, transcode: transcode, secret: secret}
 }
 
-// needsProxy 判断该存储源的直链能否直接交给浏览器。
-//
-// 网盘（夸克/百度等）的直链自带签名，不需要额外请求头，浏览器能直接播；
-// WebDAV 靠 HTTP Basic Auth，而 <video src> 无法携带 Authorization 头，
-// 必须由后端代取流再转发。
-func needsProxy(diskType string) bool {
-	return diskType == string(adapter.DiskWebdav)
+// canProxy 判断资源是否具备"由后端代取流"的条件：
+// 必须已登记到某个接入账号，并拿到了源文件 ID/路径。
+func canProxy(res *model.Resource) bool {
+	return res.DiskAccountID != nil && *res.DiskAccountID > 0 && res.FileID != ""
 }
+
+// needsProxy 判断该资源的播放地址是否**必须**由后端代理转发。
+//
+// 结论：只要具备代理条件就一律代理。
+//
+// 理由（也是踩过的坑）：夸克/阿里等网盘的直链大多要求带 Referer/UA，
+// 浏览器 <video src> 无法附加请求头，直接把直链丢过去经常 403；
+// 而走同源的 /api/stream 代理，既能把头补上，又顺带解决 CORS。
+// 本地硬盘的 file:// 与 WebDAV 的 Basic Auth 更是只能代理。
+// 只有"拿不到源文件"（纯分享链接）时才回退到直链/网盘页面。
+func needsProxy(res *model.Resource) bool { return canProxy(res) }
 
 // streamURL 生成带票据的代理播放地址。
 func (h *PlayHandler) streamURL(id uint64) string {
@@ -48,13 +56,12 @@ func (h *PlayHandler) streamURL(id uint64) string {
 
 // directURL 返回"可以直接交给浏览器播放"的地址。
 //
-// WebDAV 一类靠请求头鉴权的存储源给不出这种地址 —— 它的直链离开
-// Authorization 头就是 401 —— 所以统一换成后端代理地址（带票据）。
-// 其余网盘走原有的直链解析。
+// 具备代理条件的资源统一换成后端代理地址（带票据）；
+// 其余（只有分享链接、没有源文件）走原有的直链解析。
 //
 // 取不到时返回空串，由调用方决定退路。
 func (h *PlayHandler) directURL(res *model.Resource) string {
-	if needsProxy(res.DiskType) {
+	if needsProxy(res) {
 		return h.streamURL(res.ID)
 	}
 	if link, err := h.resolveDirectLink(res); err == nil && link != "" {
@@ -65,9 +72,10 @@ func (h *PlayHandler) directURL(res *model.Resource) string {
 
 // setDirectPlay 决定"不需要转码时"的播放方式。
 func (h *PlayHandler) setDirectPlay(res *model.Resource, playMode, playURL *string) {
-	if needsProxy(res.DiskType) {
-		// 不能走 fallbackDirect —— 那会把 WebDAV 直链塞给 <video>，
-		// 浏览器必然 401。代理层会自己重新取直链并带上鉴权头。
+	if needsProxy(res) {
+		// 不能走 fallbackDirect —— 那会把需要鉴权头/本地路径的直链
+		// 塞给 <video>，浏览器必然 403 或直接失败。
+		// 代理层会自己重新取直链并带上必要的头。
 		*playMode = "proxy"
 		*playURL = h.streamURL(res.ID)
 		return
@@ -125,7 +133,7 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	var transcodeTaskID uint64
 	var transcodeProgress int
 
-	if h.transcode != nil && h.transcode.Enabled() && service.NeedsTranscode(&res) {
+	if h.transcode != nil && h.transcode.Enabled() && !res.DirectPlay && service.NeedsTranscode(&res) {
 		// EnsureHLS 会：已就绪→直接返回；未开始→入队并返回；进行中→返回进度
 		masterURL, ready, taskID, err := h.transcode.EnsureHLS(c.Request.Context(), &res)
 		switch {

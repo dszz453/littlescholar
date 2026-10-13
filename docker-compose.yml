@@ -55,6 +55,11 @@ services:
       - ./data/media:/app/data/media
       - ./data/transcode:/app/data/transcode
       - ./backend/config.yaml:/app/config.yaml:ro
+      # 本地硬盘接入源：把宿主机上放影片/资料的目录挂进容器。
+      # 挂载后到「资源接入 → 本地硬盘」里填**容器内**路径（如 /media/local）。
+      # 需要可写（支持新建/重命名/删除目录），所以不加 :ro。
+      # 用 LOCAL_MEDIA_DIR=/mnt/disk/films 指定宿主机目录。
+      - ${LOCAL_MEDIA_DIR:-./data/local-media}:/media/local
     depends_on:
       postgres:
         condition: service_healthy

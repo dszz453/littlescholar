@@ -1,112 +1,122 @@
 <template>
   <div class="page-container">
     <div class="page-header">
-      <h2 class="page-title">网盘账号</h2>
+      <h2 class="page-title">资源接入</h2>
       <div>
-        <el-button :icon="Plus" type="primary" @click="openAddDialog">
-          添加账号
-        </el-button>
-        <el-button :icon="Refresh" @click="loadAccounts">刷新</el-button>
+        <el-button :icon="Plus" type="primary" @click="openAdd(tab)">添加接入源</el-button>
+        <el-button :icon="Refresh" @click="loadAll">刷新</el-button>
       </div>
     </div>
 
     <el-alert type="info" :closable="false" class="mb-16">
       <template #title>
-        支持夸克、百度、UC、天翼、阿里云盘。推荐使用<b>扫码登录</b>自动获取 Cookie；
-        若扫码不可用，可选择<b>手动粘贴 Cookie</b>。
-        Cookie 会以 AES-256-GCM 加密后存储，不会明文落库。
+        这里统一管理所有<b>内容来源</b>：网盘接入（夸克/百度/UC/天翼/阿里云盘）、
+        WebDAV 存储、服务器<b>本地硬盘</b>目录。
+        网盘推荐用<b>扫码登录</b>自动获取 Cookie；阿里云盘请粘贴 refresh_token；
+        凭据会以 AES-256-GCM 加密后存储，不会明文落库。
       </template>
     </el-alert>
 
-    <!-- 账号列表 -->
-    <el-row :gutter="16">
-      <el-col :span="8" v-for="acc in accounts" :key="acc.id">
-        <div class="card-box account-card">
-          <div class="acc-header">
-            <el-avatar :size="44" :src="acc.avatar">
-              {{ diskName(acc.diskType).charAt(0) }}
-            </el-avatar>
-            <div class="acc-info">
-              <div class="acc-name">
-                {{ acc.nickname }}
-                <el-tag v-if="acc.isDefault" size="small" type="warning">默认</el-tag>
-              </div>
-              <div class="acc-type" :class="`disk-${acc.diskType}`">
-                {{ diskName(acc.diskType) }}
-              </div>
-            </div>
-            <el-tag :type="statusTagType(acc.status)" size="small">
-              {{ statusText(acc.status) }}
-            </el-tag>
-          </div>
-
-          <div class="acc-capacity" v-if="acc.capacityTotal > 0">
-            <el-progress
-              :percentage="capacityPercent(acc)"
-              :stroke-width="8"
-              :show-text="false"
-            />
-            <span class="text-secondary">
-              {{ formatSize(acc.capacityUsed) }} / {{ formatSize(acc.capacityTotal) }}
-            </span>
-          </div>
-
-          <div class="acc-footer">
-            <span class="text-secondary">
-              {{ acc.lastCheckAt ? '校验于 ' + formatTime(acc.lastCheckAt) : '未校验' }}
-            </span>
-            <div class="acc-actions">
-              <el-button link type="primary" size="small" @click="validate(acc)">
-                校验
-              </el-button>
-              <el-button
-                link
-                type="primary"
-                size="small"
-                v-if="!acc.isDefault"
-                @click="setDefault(acc)"
-              >
-                设为默认
-              </el-button>
-              <el-button link type="primary" size="small" @click="openUpdateCookie(acc)">
-                更新Cookie
-              </el-button>
-              <el-button link type="danger" size="small" @click="remove(acc)">
-                删除
-              </el-button>
-            </div>
-          </div>
+    <el-tabs v-model="tab" @tab-change="onTabChange">
+      <el-tab-pane
+        v-for="g in groups"
+        :key="g.name"
+        :label="g.label"
+        :name="g.name"
+      >
+        <div class="tab-bar">
+          <span class="text-secondary">
+            共 {{ accountsOf(g.name).length }} 个{{ g.label }}接入源
+          </span>
+          <el-button :icon="Plus" type="primary" plain size="small" @click="openAdd(g.name)">
+            添加{{ g.label }}
+          </el-button>
         </div>
-      </el-col>
-    </el-row>
 
-    <el-empty v-if="!accounts.length" description="还没有绑定任何网盘账号" />
+        <el-row :gutter="16">
+          <el-col :span="8" v-for="acc in accountsOf(g.name)" :key="acc.id">
+            <div class="card-box account-card">
+              <div class="acc-header">
+                <el-avatar :size="44" :src="acc.avatar">
+                  {{ (acc.nickname || diskName(acc.diskType)).charAt(0) }}
+                </el-avatar>
+                <div class="acc-info">
+                  <div class="acc-name">
+                    {{ acc.nickname }}
+                    <el-tag v-if="acc.isDefault" size="small" type="warning">默认</el-tag>
+                  </div>
+                  <div class="acc-type">{{ diskName(acc.diskType) }}</div>
+                </div>
+                <el-tag :type="statusTagType(acc.status)" size="small">
+                  {{ statusText(acc.status) }}
+                </el-tag>
+              </div>
 
-    <!-- 添加账号对话框 -->
-    <el-dialog v-model="addDialog" title="添加网盘账号" width="600px" @closed="stopPolling">
-      <el-tabs v-model="addTab">
-        <!-- 扫码 -->
-        <el-tab-pane label="扫码登录" name="qr">
+              <!-- 存储源展示地址 / 路径 -->
+              <div v-if="acc.isStorage" class="acc-path">
+                <el-icon><Link /></el-icon>
+                <span :title="storagePath(acc)">{{ storagePath(acc) }}</span>
+              </div>
+
+              <div class="acc-capacity" v-if="acc.capacityTotal > 0">
+                <el-progress
+                  :percentage="capacityPercent(acc)"
+                  :stroke-width="8"
+                  :show-text="false"
+                />
+                <span class="text-secondary">
+                  {{ formatSize(acc.capacityUsed) }} / {{ formatSize(acc.capacityTotal) }}
+                </span>
+              </div>
+
+              <div class="acc-footer">
+                <span class="text-secondary">
+                  {{ acc.lastCheckAt ? '校验于 ' + formatTime(acc.lastCheckAt) : '未校验' }}
+                </span>
+                <div class="acc-actions">
+                  <el-button link type="primary" size="small" @click="validate(acc)">校验</el-button>
+                  <el-button
+                    link
+                    type="primary"
+                    size="small"
+                    v-if="!acc.isDefault && !acc.isStorage"
+                    @click="setDefault(acc)"
+                  >
+                    设为默认
+                  </el-button>
+                  <el-button link type="primary" size="small" @click="openEdit(acc)">编辑</el-button>
+                  <el-button link type="danger" size="small" @click="remove(acc)">删除</el-button>
+                </div>
+              </div>
+            </div>
+          </el-col>
+        </el-row>
+
+        <el-empty
+          v-if="!accountsOf(g.name).length"
+          :description="`还没有添加${g.label}接入源`"
+        />
+      </el-tab-pane>
+    </el-tabs>
+
+    <!-- 添加接入源 -->
+    <el-dialog v-model="addDialog" title="添加接入源" width="640px" @closed="stopPolling">
+      <el-tabs v-model="addTab" v-if="addKind === 'disk'">
+        <el-tab-pane label="扫码登录" name="qr" v-if="currentSupportQR">
           <div class="qr-pane">
             <div class="qr-left">
               <div class="field-label">选择网盘</div>
-              <el-radio-group v-model="qrDiskType" @change="startQR">
-                <el-radio-button value="quark">夸克</el-radio-button>
-                <el-radio-button value="baidu">百度</el-radio-button>
-                <el-radio-button value="uc">UC</el-radio-button>
-                <el-radio-button value="tianyi">天翼</el-radio-button>
+              <el-radio-group v-model="addDiskType" @change="startQR">
+                <el-radio-button v-for="t in qrTypes" :key="t.type" :value="t.type">
+                  {{ t.name }}
+                </el-radio-button>
               </el-radio-group>
 
               <div class="qr-status mt-16">
                 <el-tag :type="qrStatusType" size="large">{{ qrStatusText }}</el-tag>
               </div>
 
-              <el-button
-                class="mt-16"
-                size="small"
-                @click="startQR"
-                :loading="qrLoading"
-              >
+              <el-button class="mt-16" size="small" @click="startQR" :loading="qrLoading">
                 重新获取二维码
               </el-button>
             </div>
@@ -115,123 +125,185 @@
               <div class="qr-box" v-loading="qrLoading">
                 <img v-if="qrImage" :src="qrImage" class="qr-img" alt="二维码" />
                 <canvas v-else ref="qrCanvas" class="qr-img"></canvas>
-                <el-empty v-if="!qrContent && !qrImage && !qrLoading" description="请选择网盘并获取二维码" :image-size="60" />
+                <el-empty
+                  v-if="!qrContent && !qrImage && !qrLoading"
+                  description="请选择网盘并获取二维码"
+                  :image-size="60"
+                />
               </div>
-              <p class="text-secondary qr-tip">
-                用对应网盘 App 扫描二维码并确认授权
-              </p>
+              <p class="text-secondary qr-tip">用对应网盘 App 扫描二维码并确认授权</p>
             </div>
           </div>
         </el-tab-pane>
 
-        <!-- 手动 -->
-        <el-tab-pane label="手动填写 Cookie" name="manual">
-          <el-form :model="manualForm" label-width="90px">
+        <el-tab-pane label="手动填写" name="manual">
+          <el-form :model="form" label-width="110px">
             <el-form-item label="网盘类型" required>
-              <el-select v-model="manualForm.diskType" style="width: 100%">
-                <el-option label="夸克网盘" value="quark" />
-                <el-option label="百度网盘" value="baidu" />
-                <el-option label="UC网盘" value="uc" />
-                <el-option label="天翼网盘" value="tianyi" />
-                <el-option label="阿里云盘（填 refresh_token）" value="aliyun" />
+              <el-select v-model="form.diskType" style="width: 100%">
+                <el-option
+                  v-for="t in diskTypes"
+                  :key="t.type"
+                  :label="t.name"
+                  :value="t.type"
+                />
               </el-select>
             </el-form-item>
-            <el-form-item label="备注名称">
-              <el-input v-model="manualForm.nickname" placeholder="如：我的夸克" />
-            </el-form-item>
-            <el-form-item label="Cookie" required>
+            <el-form-item v-if="form.diskType === 'aliyun'" label="refresh_token" required>
               <el-input
-                v-model="manualForm.cookie"
+                v-model="form.cookie"
+                type="textarea"
+                :rows="3"
+                placeholder="阿里云盘 refresh_token（从网页版登录态里获取）"
+              />
+              <div class="form-tip">
+                阿里云盘不支持扫码，请在阿里云盘网页版登录后，从浏览器开发者工具的
+                Local Storage / 网络请求中取出 refresh_token 粘贴到此处。
+              </div>
+            </el-form-item>
+            <el-form-item v-else label="Cookie" required>
+              <el-input
+                v-model="form.cookie"
                 type="textarea"
                 :rows="5"
                 placeholder="从浏览器开发者工具中复制完整 Cookie 字符串"
               />
             </el-form-item>
-            <el-form-item>
-              <el-alert type="warning" :closable="false" title="获取方式">
-                <div style="font-size: 12px; line-height: 1.8">
-                  1. 浏览器登录网盘网页版<br />
-                  2. 按 F12 打开开发者工具 → Network 面板<br />
-                  3. 刷新页面，点击任意请求，在 Request Headers 中找到 Cookie<br />
-                  4. 复制完整内容粘贴到上方
-                </div>
-              </el-alert>
+            <el-form-item label="备注名称">
+              <el-input v-model="form.nickname" placeholder="如：我的夸克" />
             </el-form-item>
           </el-form>
         </el-tab-pane>
       </el-tabs>
 
+      <!-- WebDAV -->
+      <el-form v-else-if="addKind === 'webdav'" :model="form" label-width="110px">
+        <el-form-item label="名称">
+          <el-input v-model="form.nickname" placeholder="如：家里 NAS" />
+        </el-form-item>
+        <el-form-item label="地址" required>
+          <el-input v-model="form.url" placeholder="http://192.168.1.10:5006/dav" />
+          <div class="form-tip">WebDAV 根地址（Alist / 群晖 / rclone 各不相同，照抄即可）</div>
+        </el-form-item>
+        <el-form-item label="用户名">
+          <el-input v-model="form.username" placeholder="可留空（匿名 WebDAV）" />
+        </el-form-item>
+        <el-form-item label="密码">
+          <el-input v-model="form.password" type="password" show-password />
+        </el-form-item>
+      </el-form>
+
+      <!-- 本地硬盘 -->
+      <el-form v-else :model="form" label-width="110px">
+        <el-form-item label="名称">
+          <el-input v-model="form.nickname" placeholder="如：下载盘影视目录" />
+        </el-form-item>
+        <el-form-item label="目录路径" required>
+          <el-input v-model="form.rootPath" placeholder="/mnt/docker/ls-data/media" />
+          <div class="form-tip">
+            服务器（运行 core-server 的机器）上的<b>绝对路径</b>。
+            若部署在 Docker 里，需要先把宿主目录挂载进容器，这里填<b>容器内</b>的路径。
+          </div>
+        </el-form-item>
+      </el-form>
+
       <template #footer>
         <el-button @click="addDialog = false">关闭</el-button>
         <el-button
-          v-if="addTab === 'manual'"
+          v-if="addTab === 'manual' || addKind !== 'disk'"
           type="primary"
-          :loading="manualSaving"
-          @click="saveManual"
+          :loading="saving"
+          @click="save"
         >
           校验并保存
         </el-button>
       </template>
     </el-dialog>
 
-    <!-- 更新 Cookie 对话框 -->
-    <el-dialog v-model="updateDialog" title="更新 Cookie" width="520px">
-      <el-input
-        v-model="newCookie"
-        type="textarea"
-        :rows="5"
-        placeholder="粘贴新的 Cookie"
-      />
+    <!-- 编辑接入源 -->
+    <el-dialog v-model="editDialog" title="编辑接入源" width="560px">
+      <el-form :model="editForm" label-width="110px">
+        <el-form-item label="名称">
+          <el-input v-model="editForm.nickname" />
+        </el-form-item>
+        <template v-if="editForm.isStorage">
+          <el-form-item v-if="editForm.diskType === 'webdav'" label="地址">
+            <el-input v-model="editForm.url" />
+          </el-form-item>
+          <el-form-item v-else label="目录路径">
+            <el-input v-model="editForm.rootPath" />
+          </el-form-item>
+        </template>
+        <el-form-item v-else label="Cookie">
+          <el-input
+            v-model="editForm.cookie"
+            type="textarea"
+            :rows="4"
+            placeholder="留空表示不修改"
+          />
+        </el-form-item>
+      </el-form>
       <template #footer>
-        <el-button @click="updateDialog = false">取消</el-button>
-        <el-button type="primary" @click="confirmUpdateCookie">保存</el-button>
+        <el-button @click="editDialog = false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="saveEdit">保存</el-button>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Refresh } from '@element-plus/icons-vue'
+import { Plus, Refresh, Link } from '@element-plus/icons-vue'
 import QRCode from 'qrcode'
 import { diskApi } from '@/api'
 
+const groups = [
+  { name: 'disk', label: '网盘接入' },
+  { name: 'webdav', label: 'WebDAV' },
+  { name: 'local', label: '本地硬盘' },
+]
+const tab = ref('disk')
 const accounts = ref([])
+const diskTypes = ref([])
+
 const addDialog = ref(false)
 const addTab = ref('qr')
+const addDiskType = ref('quark')
+const addKind = ref('disk')
+const saving = ref(false)
+const form = ref({})
 
-const qrDiskType = ref('quark')
 const qrContent = ref('')
 const qrImage = ref('')
 const qrLoading = ref(false)
-const qrStatus = ref('')
+const qrStatusText = ref('未开始')
+const qrStatusType = ref('info')
 const qrSessionId = ref('')
 const qrCanvas = ref()
 let pollTimer = null
 
-const manualForm = ref({ diskType: 'quark', nickname: '', cookie: '' })
-const manualSaving = ref(false)
+const editDialog = ref(false)
+const editForm = ref({})
 
-const updateDialog = ref(false)
-const newCookie = ref('')
-const updateTarget = ref(null)
+const diskTypesOnly = computed(() => diskTypes.value.filter((t) => !t.isStorage))
+const qrTypes = computed(() => diskTypesOnly.value.filter((t) => t.supportQR))
+const currentSupportQR = computed(
+  () => diskTypesOnly.value.some((t) => t.type === addDiskType.value && t.supportQR) && qrTypes.value.length > 0
+)
 
 function diskName(t) {
-  return { quark: '夸克网盘', baidu: '百度网盘', uc: 'UC网盘', tianyi: '天翼网盘', aliyun: '阿里云盘' }[t] || t
+  return (
+    { quark: '夸克网盘', baidu: '百度网盘', uc: 'UC网盘', tianyi: '天翼网盘', aliyun: '阿里云盘', webdav: 'WebDAV', local: '本地硬盘' }[t] ||
+    t
+  )
 }
 
 function statusText(s) {
   return { valid: '正常', invalid: '失效', expired: '过期' }[s] || s
 }
-
 function statusTagType(s) {
   return { valid: 'success', invalid: 'danger', expired: 'warning' }[s] || 'info'
 }
-
-const qrStatusText = ref('未开始')
-const qrStatusType = ref('info')
-
 function formatSize(bytes) {
   if (!bytes) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -243,44 +315,79 @@ function formatSize(bytes) {
   }
   return `${n.toFixed(1)} ${units[i]}`
 }
-
 function capacityPercent(acc) {
   if (!acc.capacityTotal) return 0
   return Math.min(100, Math.round((acc.capacityUsed / acc.capacityTotal) * 100))
 }
-
 function formatTime(t) {
   if (!t) return '-'
   return new Date(t).toLocaleString('zh-CN', { hour12: false })
 }
 
-async function loadAccounts() {
+// storagePath 展示存储源的地址/路径（来自 extraPublic 白名单字段）
+function storagePath(acc) {
+  const e = acc.extraPublic || {}
+  return e.url || e.rootPath || '-'
+}
+
+function accountsOf(group) {
+  return accounts.value.filter((a) => groupOf(a) === group)
+}
+function groupOf(a) {
+  if (a.diskType === 'local') return 'local'
+  if (a.diskType === 'webdav') return 'webdav'
+  return 'disk'
+}
+
+async function loadAll() {
   try {
     accounts.value = await diskApi.list()
   } catch (e) {
     /* 忽略 */
   }
 }
+async function loadTypes() {
+  try {
+    diskTypes.value = await diskApi.types()
+  } catch (e) {
+    /* 忽略 */
+  }
+}
 
-function openAddDialog() {
-  addDialog.value = true
+function onTabChange(name) {
+  // 切换分组时重置默认类型，避免"本地硬盘"tab 里默认选中夸克
+  const map = { disk: 'quark', webdav: 'webdav', local: 'local' }
+  addDiskType.value = map[name] || 'quark'
+}
+
+function openAdd(kind) {
+  addKind.value = kind || 'disk'
+  form.value = { diskType: addKind.value === 'disk' ? addDiskType.value : addKind.value, cookie: '', nickname: '', url: '', username: '', password: '', rootPath: '' }
   addTab.value = 'qr'
   qrContent.value = ''
   qrImage.value = ''
   qrStatusText.value = '未开始'
   qrStatusType.value = 'info'
+  addDialog.value = true
+  if (addKind.value === 'disk' && addTab.value === 'qr' && currentSupportQR.value) {
+    startQR()
+  }
 }
 
 async function startQR() {
   stopPolling()
+  if (!qrTypes.value.length) return
+  if (!currentSupportQR.value) {
+    addTab.value = 'manual'
+    return
+  }
   qrLoading.value = true
   qrContent.value = ''
   qrImage.value = ''
   qrStatusText.value = '获取二维码中...'
   qrStatusType.value = 'warning'
-
   try {
-    const res = await diskApi.getQR(qrDiskType.value)
+    const res = await diskApi.getQR(addDiskType.value)
     qrSessionId.value = res.sessionId
     qrContent.value = res.qrContent
     if (res.qrImage) {
@@ -295,7 +402,7 @@ async function startQR() {
     qrStatusType.value = 'warning'
     startPolling()
   } catch (e) {
-    qrStatusText.value = '获取失败'
+    qrStatusText.value = '获取失败（该网盘可能不支持扫码，请用手动填写）'
     qrStatusType.value = 'danger'
   } finally {
     qrLoading.value = false
@@ -317,8 +424,8 @@ function startPolling() {
         ElMessage.success(`已绑定账号：${res.nickname || ''}`)
         setTimeout(() => {
           addDialog.value = false
-          loadAccounts()
-        }, 1000)
+          loadAll()
+        }, 800)
       } else if (res.status === 'expired') {
         qrStatusText.value = '二维码已过期，请重新获取'
         qrStatusType.value = 'danger'
@@ -337,38 +444,59 @@ function stopPolling() {
   }
 }
 
-async function saveManual() {
-  if (!manualForm.value.cookie.trim()) {
-    ElMessage.warning('请填写 Cookie')
-    return
+async function save() {
+  const f = form.value
+  let payload = null
+
+  if (addKind.value === 'disk') {
+    if (!f.cookie || !f.cookie.trim()) {
+      ElMessage.warning('请填写 Cookie / Token')
+      return
+    }
+    payload = { diskType: f.diskType, cookie: f.cookie.trim(), nickname: f.nickname }
+  } else if (addKind.value === 'webdav') {
+    if (!f.url || !f.url.trim()) {
+      ElMessage.warning('请填写 WebDAV 地址')
+      return
+    }
+    payload = {
+      diskType: 'webdav',
+      nickname: f.nickname,
+      cookie: `${(f.username || '').trim()}:${f.password || ''}`,
+      extra: { url: f.url.trim() },
+    }
+  } else {
+    if (!f.rootPath || !f.rootPath.trim()) {
+      ElMessage.warning('请填写目录路径')
+      return
+    }
+    payload = {
+      diskType: 'local',
+      nickname: f.nickname,
+      cookie: '',
+      extra: { rootPath: f.rootPath.trim() },
+    }
   }
-  manualSaving.value = true
+
+  saving.value = true
   try {
-    await diskApi.addManual({
-      diskType: manualForm.value.diskType,
-      cookie: manualForm.value.cookie.trim(),
-      nickname: manualForm.value.nickname,
-    })
+    await diskApi.addManual(payload)
     ElMessage.success('添加成功')
     addDialog.value = false
-    manualForm.value = { diskType: 'quark', nickname: '', cookie: '' }
-    loadAccounts()
+    loadAll()
   } catch (e) {
-    /* 忽略 */
+    /* 拦截器已提示 */
   } finally {
-    manualSaving.value = false
+    saving.value = false
   }
 }
 
 async function validate(acc) {
   try {
     const res = await diskApi.validate(acc.id)
-    if (res.valid) {
-      ElMessage.success('账号有效')
-    } else {
-      ElMessage.error(res.message || '账号已失效')
-    }
-    loadAccounts()
+    if (res.valid) ElMessage.success('接入正常')
+    else ElMessage.error(res.message || '接入失效')
+    loadAll()
   } catch (e) {
     /* 忽略 */
   }
@@ -377,75 +505,101 @@ async function validate(acc) {
 async function setDefault(acc) {
   await diskApi.setDefault(acc.id)
   ElMessage.success('已设为默认账号')
-  loadAccounts()
+  loadAll()
 }
 
-function openUpdateCookie(acc) {
-  updateTarget.value = acc
-  newCookie.value = ''
-  updateDialog.value = true
-}
-
-async function confirmUpdateCookie() {
-  if (!newCookie.value.trim()) {
-    ElMessage.warning('请填写 Cookie')
-    return
+function openEdit(acc) {
+  const e = acc.extraPublic || {}
+  editForm.value = {
+    id: acc.id,
+    diskType: acc.diskType,
+    isStorage: acc.isStorage,
+    nickname: acc.nickname,
+    cookie: '',
+    url: e.url || '',
+    rootPath: e.rootPath || '',
   }
-  await diskApi.updateCookie(updateTarget.value.id, newCookie.value.trim())
-  ElMessage.success('Cookie 已更新')
-  updateDialog.value = false
-  loadAccounts()
+  editDialog.value = true
+}
+
+async function saveEdit() {
+  const f = editForm.value
+  const payload = { nickname: f.nickname }
+  if (f.isStorage) {
+    payload.extra = f.diskType === 'webdav' ? { url: (f.url || '').trim() } : { rootPath: (f.rootPath || '').trim() }
+  } else if (f.cookie && f.cookie.trim()) {
+    payload.cookie = f.cookie.trim()
+  }
+  saving.value = true
+  try {
+    await diskApi.update(f.id, payload)
+    ElMessage.success('已保存')
+    editDialog.value = false
+    loadAll()
+  } catch (e) {
+    /* 拦截器已提示 */
+  } finally {
+    saving.value = false
+  }
 }
 
 async function remove(acc) {
   try {
-    await ElMessageBox.confirm(`确定删除账号「${acc.nickname}」吗？`, '删除确认', {
-      type: 'warning',
-    })
+    await ElMessageBox.confirm(`确定删除接入源「${acc.nickname}」吗？`, '删除确认', { type: 'warning' })
     await diskApi.remove(acc.id)
     ElMessage.success('已删除')
-    loadAccounts()
+    loadAll()
   } catch (e) {
     /* 取消 */
   }
 }
 
-onMounted(loadAccounts)
+onMounted(() => {
+  loadAll()
+  loadTypes()
+})
 </script>
 
 <style scoped>
 .account-card {
   margin-bottom: 16px;
 }
-
 .acc-header {
   display: flex;
   align-items: center;
   gap: 12px;
 }
-
 .acc-info {
   flex: 1;
+  min-width: 0;
 }
-
 .acc-name {
   font-weight: 600;
   display: flex;
   align-items: center;
   gap: 6px;
 }
-
 .acc-type {
   font-size: 12px;
+  color: var(--ls-text-secondary);
 }
-
+.acc-path {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--ls-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .acc-capacity {
   margin: 14px 0 10px;
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
-
 .acc-footer {
   display: flex;
   align-items: center;
@@ -454,33 +608,33 @@ onMounted(loadAccounts)
   padding-top: 10px;
   margin-top: 10px;
 }
-
 .acc-actions {
   display: flex;
   gap: 4px;
 }
-
+.tab-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
 .qr-pane {
   display: flex;
   gap: 32px;
   padding: 12px 0;
 }
-
 .qr-left {
   flex: 1;
 }
-
 .qr-right {
   width: 220px;
   text-align: center;
 }
-
 .field-label {
   font-size: 13px;
   color: var(--ls-text-secondary);
   margin-bottom: 8px;
 }
-
 .qr-box {
   width: 220px;
   height: 220px;
@@ -491,14 +645,17 @@ onMounted(loadAccounts)
   justify-content: center;
   overflow: hidden;
 }
-
 .qr-img {
   width: 200px;
   height: 200px;
 }
-
 .qr-tip {
   margin-top: 10px;
   font-size: 12px;
+}
+.form-tip {
+  font-size: 12px;
+  color: var(--ls-text-secondary);
+  line-height: 1.7;
 }
 </style>

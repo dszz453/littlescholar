@@ -10,6 +10,7 @@ import (
 	"github.com/littlescholar/core/internal/adapter"
 	_ "github.com/littlescholar/core/internal/adapter/aliyun"
 	_ "github.com/littlescholar/core/internal/adapter/baidu"
+	_ "github.com/littlescholar/core/internal/adapter/local"
 	_ "github.com/littlescholar/core/internal/adapter/quark"
 	_ "github.com/littlescholar/core/internal/adapter/tianyi"
 	_ "github.com/littlescholar/core/internal/adapter/uc"
@@ -29,11 +30,11 @@ func NewDiskHandler(db *gorm.DB, encryptor *util.Encryptor) *DiskHandler {
 	return &DiskHandler{db: db, encryptor: encryptor}
 }
 
-// Types 支持的网盘类型列表
+// Types 支持的接入类型列表
 func (h *DiskHandler) Types(c *gin.Context) {
 	var out []gin.H
 	for _, t := range adapter.List() {
-		// 默认支持扫码（5 个网盘都支持）；WebDAV 通过 QRCapable
+		// 默认支持扫码（5 个网盘都支持）；WebDAV / 本地硬盘通过 QRCapable
 		// 声明为 false，前端据此把「扫码添加」置灰。
 		supportQR := true
 		if qc, ok := t.(adapter.QRCapable); ok {
@@ -44,9 +45,45 @@ func (h *DiskHandler) Types(c *gin.Context) {
 			"name":          t.Name(),
 			"supportQR":     supportQR,
 			"supportManual": true,
+			// isStorage：WebDAV / 本地硬盘这类"存储源"，前端归类到
+			// 「存储接入」分组，与网盘账号分开呈现。
+			"isStorage": adapter.IsStorageType(t.Type()),
 		})
 	}
 	util.OK(c, out)
+}
+
+// publicExtraKeys 允许返回给前端的 Extra 键（白名单）。
+//
+// 为什么用白名单而不是黑名单：Extra 里混着两类东西 ——
+// 一类是"配置参数"（WebDAV 地址、本地根目录、并发线程数），前端要回显、要编辑；
+// 另一类是"凭证"（阿里云盘 refresh_token、迅雷密码……），泄露即等于交出账号。
+// 黑名单漏一个键就等于泄一个凭证，白名单漏一个键只是少显示一个字段。
+var publicExtraKeys = map[string]bool{
+	"url":           true,
+	"rootPath":      true,
+	"isVip":         true,
+	"is_vip":        true,
+	"threadLimit":   true,
+	"thread_limit":  true,
+	"openApiUrl":    true,
+	"open_api_url":  true,
+	"accelerate":    true,
+	"noMemberBoost": true,
+	"path":          true,
+	"saveDir":       true,
+}
+
+// DiskAccountDTO 账号返回结构。
+//
+// 直接在 model.DiskAccount 上 embed：CookieEncrypted / Extra 本来就是
+// json:"-"，不会泄露；这里额外补一个经过白名单过滤的 extraPublic
+// 供前端回显配置。
+type DiskAccountDTO struct {
+	model.DiskAccount
+	ExtraPublic map[string]string `json:"extraPublic"`
+	// IsStorage 便于前端区分"网盘"与"存储源（WebDAV/本地硬盘）"
+	IsStorage bool `json:"isStorage"`
 }
 
 // List 账号列表
@@ -54,17 +91,51 @@ func (h *DiskHandler) Types(c *gin.Context) {
 // 支持 ?diskType=webdav 过滤：管理后台的「WebDAV 资源」页只需要
 // 存储源账号，把网盘账号一并返回会让用户在下拉里选到夸克账号，
 // 然后得到一个"这个账号不是 WebDAV"的报错。
+//
+// 支持 ?group=storage / disk 做分组过滤：资源接入页把
+// 「网盘接入」与「存储接入（WebDAV/本地硬盘）」分两个 tab。
 func (h *DiskHandler) List(c *gin.Context) {
 	var accounts []model.DiskAccount
 	q := h.db.Order("disk_type asc, id asc")
 	if t := c.Query("diskType"); t != "" {
 		q = q.Where("disk_type = ?", t)
 	}
+	if g := c.Query("group"); g == "storage" {
+		q = q.Where("disk_type IN ?", adapter.StorageTypes)
+	} else if g == "disk" {
+		q = q.Where("disk_type NOT IN ?", adapter.StorageTypes)
+	}
 	if err := q.Find(&accounts).Error; err != nil {
 		util.ServerError(c, "查询失败")
 		return
 	}
-	util.OK(c, accounts)
+
+	out := make([]DiskAccountDTO, 0, len(accounts))
+	for _, a := range accounts {
+		out = append(out, DiskAccountDTO{
+			DiskAccount: a,
+			ExtraPublic: publicExtra(a.Extra),
+			IsStorage:   adapter.IsStorageType(adapter.DiskType(a.DiskType)),
+		})
+	}
+	util.OK(c, out)
+}
+
+// publicExtra 按白名单过滤 Extra，只回传配置类字段。
+func publicExtra(extra model.JSONMap) map[string]string {
+	if len(extra) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(extra))
+	for k, v := range extra {
+		if !publicExtraKeys[k] {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			out[k] = s
+		}
+	}
+	return out
 }
 
 // GetQRCode 获取扫码二维码
@@ -189,36 +260,50 @@ func (h *DiskHandler) PollQRCode(c *gin.Context) {
 	util.OK(c, resp)
 }
 
-// AddManual 手动添加（粘贴 Cookie / token）
+// AddManual 手动添加（粘贴 Cookie / token / 存储源参数）
 func (h *DiskHandler) AddManual(c *gin.Context) {
 	var req struct {
 		DiskType string            `json:"diskType" binding:"required"`
-		Cookie   string            `json:"cookie" binding:"required"`
+		Cookie   string            `json:"cookie"`
 		Nickname string            `json:"nickname"`
 		Extra    map[string]string `json:"extra"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		util.BadRequest(c, "网盘类型和 Cookie 不能为空")
+		util.BadRequest(c, "缺少网盘类型")
 		return
 	}
 	if !adapter.IsSupported(adapter.DiskType(req.DiskType)) {
-		util.BadRequest(c, "不支持的网盘类型")
+		util.BadRequest(c, "不支持的接入类型")
+		return
+	}
+	req.Cookie = strings.TrimSpace(req.Cookie)
+
+	// 存储源（WebDAV / 本地硬盘）没有 cookie，靠 Extra 里的地址/路径；
+	// 网盘则必须有 cookie 或 token。分别校验，避免"填了空 cookie
+	// 也保存成功，之后每次转存都失败"这种延迟爆炸的坑。
+	if adapter.IsStorageType(adapter.DiskType(req.DiskType)) {
+		if err := validateStorageExtra(adapter.DiskType(req.DiskType), req.Extra, req.Cookie); err != nil {
+			util.BadRequest(c, err.Error())
+			return
+		}
+	} else if req.Cookie == "" {
+		util.BadRequest(c, "请填写 Cookie / Token")
 		return
 	}
 
-	// 校验 cookie 有效性
+	// 校验凭据有效性
 	a, _ := adapter.Get(adapter.DiskType(req.DiskType))
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
 	cred := &adapter.Credential{
 		DiskType: adapter.DiskType(req.DiskType),
-		Cookie:   strings.TrimSpace(req.Cookie),
+		Cookie:   req.Cookie,
 		Extra:    req.Extra,
 	}
 	info, err := a.ValidateCookie(ctx, cred)
 	if err != nil {
-		util.BadRequest(c, "Cookie 校验失败: "+err.Error())
+		util.BadRequest(c, "校验失败: "+err.Error())
 		return
 	}
 
@@ -255,6 +340,28 @@ func (h *DiskHandler) AddManual(c *gin.Context) {
 		return
 	}
 	util.OK(c, gin.H{"id": acc.ID, "nickname": acc.Nickname})
+}
+
+// validateStorageExtra 校验存储源的必填参数。
+func validateStorageExtra(t adapter.DiskType, extra map[string]string, cookieFallback string) error {
+	get := func(k string) string {
+		if extra == nil {
+			return ""
+		}
+		return strings.TrimSpace(extra[k])
+	}
+	switch t {
+	case adapter.DiskWebdav:
+		if get("url") == "" {
+			return fmt.Errorf("请填写 WebDAV 地址")
+		}
+	case adapter.DiskLocal:
+		// 兼容把路径填在 cookie 字段的老表单
+		if get("rootPath") == "" && cookieFallback == "" {
+			return fmt.Errorf("请填写服务器上的目录路径")
+		}
+	}
+	return nil
 }
 
 // Validate 校验账号
@@ -429,6 +536,140 @@ func (h *DiskHandler) MakeDir(c *gin.Context) {
 		return
 	}
 	util.OK(c, gin.H{"dirId": newID})
+}
+
+// RenameRemote 重命名接入源里的文件/目录（写操作直通远端）。
+func (h *DiskHandler) RenameRemote(c *gin.Context) {
+	id, ok := util.GetUintParam(c, "id")
+	if !ok {
+		util.BadRequest(c, "无效的账号 ID")
+		return
+	}
+	var req struct {
+		FileID  string `json:"fileId" binding:"required"`
+		NewName string `json:"newName" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		util.BadRequest(c, "缺少 fileId 或 newName")
+		return
+	}
+	acc, cred, err := h.loadAccount(id)
+	if err != nil {
+		util.NotFound(c, err.Error())
+		return
+	}
+	a, err := adapter.Get(adapter.DiskType(acc.DiskType))
+	if err != nil {
+		util.BadRequest(c, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	defer cancel()
+
+	if err := a.Rename(ctx, cred, req.FileID, req.NewName); err != nil {
+		util.ServerError(c, "重命名失败: "+err.Error())
+		return
+	}
+	util.OKWithMessage(c, "已重命名", nil)
+}
+
+// DeleteRemote 删除接入源里的文件/目录。
+//
+// 这是**不可逆**的远端删除，所以前端必须二次确认；这里只负责执行。
+func (h *DiskHandler) DeleteRemote(c *gin.Context) {
+	id, ok := util.GetUintParam(c, "id")
+	if !ok {
+		util.BadRequest(c, "无效的账号 ID")
+		return
+	}
+	var req struct {
+		FileIDs []string `json:"fileIds" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.FileIDs) == 0 {
+		util.BadRequest(c, "请选择要删除的文件")
+		return
+	}
+	acc, cred, err := h.loadAccount(id)
+	if err != nil {
+		util.NotFound(c, err.Error())
+		return
+	}
+	a, err := adapter.Get(adapter.DiskType(acc.DiskType))
+	if err != nil {
+		util.BadRequest(c, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
+	defer cancel()
+
+	if err := a.DeleteFile(ctx, cred, req.FileIDs); err != nil {
+		util.ServerError(c, "删除失败: "+err.Error())
+		return
+	}
+	util.OKWithMessage(c, "已删除", nil)
+}
+
+// UpdateAccount 更新接入源配置（昵称 / 凭据 / 配置参数）。
+//
+// 与 UpdateCookie 的分工：UpdateCookie 是"只换 cookie"的快捷入口（网盘扫码失效时用）；
+// 本接口是"通用编辑"，WebDAV 改地址、本地硬盘改根目录、网盘补充配置都走它。
+func (h *DiskHandler) UpdateAccount(c *gin.Context) {
+	id, ok := util.GetUintParam(c, "id")
+	if !ok {
+		util.BadRequest(c, "无效的账号 ID")
+		return
+	}
+	var acc model.DiskAccount
+	if err := h.db.First(&acc, id).Error; err != nil {
+		util.NotFound(c, "接入源不存在")
+		return
+	}
+	var req struct {
+		Nickname *string            `json:"nickname"`
+		Cookie   *string            `json:"cookie"`
+		Extra    *map[string]string `json:"extra"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		util.BadRequest(c, "参数错误")
+		return
+	}
+
+	updates := map[string]interface{}{}
+	if req.Nickname != nil && strings.TrimSpace(*req.Nickname) != "" {
+		updates["nickname"] = strings.TrimSpace(*req.Nickname)
+	}
+	if req.Cookie != nil {
+		cookie := strings.TrimSpace(*req.Cookie)
+		if cookie != "" {
+			encrypted, err := h.encryptor.Encrypt(cookie)
+			if err != nil {
+				util.ServerError(c, "凭据加密失败")
+				return
+			}
+			updates["cookie_encrypted"] = encrypted
+			updates["cookie_preview"] = util.MaskSecret(cookie)
+			updates["status"] = model.DiskAccountValid
+		}
+	}
+	if req.Extra != nil {
+		merged := model.JSONMap{}
+		for k, v := range acc.Extra {
+			merged[k] = v
+		}
+		for k, v := range *req.Extra {
+			merged[k] = v
+		}
+		updates["extra"] = merged
+	}
+	if len(updates) == 0 {
+		util.OKWithMessage(c, "没有需要更新的内容", nil)
+		return
+	}
+	if err := h.db.Model(&acc).Updates(updates).Error; err != nil {
+		util.ServerError(c, "保存失败")
+		return
+	}
+	util.OKWithMessage(c, "已保存", nil)
 }
 
 // loadAccount 加载账号并解密 cookie

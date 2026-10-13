@@ -18,10 +18,29 @@ const (
 	// 它不是"网盘"，但复用同一套账号/目录/播放抽象后，
 	// 转码链路（service.TranscodeService）无需任何改动即可复用。
 	DiskWebdav DiskType = "webdav"
+	// DiskLocal 服务器本地硬盘上的目录。
+	// 同样不是网盘，但"列目录 / 新建目录 / 取播放地址"与 WebDAV 同构，
+	// 复用 DiskAdapter 后资源映射、播放代理、转码全部零改动复用。
+	// 注意：它属于**存储源**而非**网盘**，UI 上要与网盘分开归类。
+	DiskLocal DiskType = "local"
 )
 
-// AllDiskTypes 全部支持的网盘
-var AllDiskTypes = []DiskType{DiskQuark, DiskBaidu, DiskUC, DiskTianyi, DiskAliyun, DiskWebdav}
+// AllDiskTypes 全部支持的存储类型
+var AllDiskTypes = []DiskType{DiskQuark, DiskBaidu, DiskUC, DiskTianyi, DiskAliyun, DiskWebdav, DiskLocal}
+
+// StorageTypes 属于"存储源"的类型：不是网盘，无需扫码，靠手动填参数接入。
+// 前端据此把它归到「WebDAV / 本地硬盘」分组，而不是「网盘接入」。
+var StorageTypes = []DiskType{DiskWebdav, DiskLocal}
+
+// IsStorageType 判断是否为存储源（WebDAV / 本地硬盘）。
+func IsStorageType(t DiskType) bool {
+	for _, s := range StorageTypes {
+		if s == t {
+			return true
+		}
+	}
+	return false
+}
 
 // DiskTypeNames 中文名
 var DiskTypeNames = map[DiskType]string{
@@ -31,6 +50,7 @@ var DiskTypeNames = map[DiskType]string{
 	DiskTianyi: "天翼网盘",
 	DiskAliyun: "阿里云盘",
 	DiskWebdav: "WebDAV",
+	DiskLocal:  "本地硬盘",
 }
 
 // 常见错误

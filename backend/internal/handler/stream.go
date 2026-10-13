@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -31,6 +34,14 @@ type StreamHandler struct {
 	encryptor *util.Encryptor
 	secret    string
 	client    *http.Client
+
+	// 外部加速代理配置的短缓存。
+	//
+	// 读系统配置要查库，而这里是每个媒体分片请求都会走的热路径，
+	// 所以缓存 10 秒 —— 管理员改完配置最多 10 秒生效，且不牺牲吞吐。
+	accelMu  sync.Mutex
+	accelURL string
+	accelAt  time.Time
 }
 
 func NewStreamHandler(db *gorm.DB, encryptor *util.Encryptor, secret string) *StreamHandler {
@@ -165,6 +176,28 @@ func (h *StreamHandler) Serve(c *gin.Context) {
 		return
 	}
 
+	// 本地硬盘接入源返回的是 file:// 地址（浏览器读不了本地文件），
+	// 这里直接读盘并用 http.ServeContent 转发 —— 它自带 Range /
+	// If-Range / If-Modified-Since 处理，等于免费拿到"可拖动进度"。
+	if path, ok := strings.CutPrefix(link.URL, "file://"); ok {
+		h.serveLocalFile(c, path)
+		return
+	}
+
+	// ============ 非会员加速 ============
+	//
+	// 网盘对非会员普遍做单连接限速，"多线程/分块并发"由外部加速代理
+	// （参考包里的 aliproxy 就是这样一个二进制）来承担。
+	// 这里不做重复实现，而是把上游直链改写到用户配置的代理上：
+	// 代理负责多连接拉流，我们仍负责补鉴权头、透传 Range、转发给浏览器。
+	//
+	// 支持两种配置写法：
+	//   1. 含 {url} 占位符 → 按模板替换（可对接任意网关，如 /proxy?url={url}）
+	//   2. 不含占位符      → 直接把直链拼在其后（适配 http://host:port/https://… 形式）
+	if accel := h.accelProxy(); accel != "" {
+		link.URL = applyAccel(accel, link.URL)
+	}
+
 	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, link.URL, nil)
 	if err != nil {
 		util.ServerError(c, "构造请求失败")
@@ -210,4 +243,60 @@ func (h *StreamHandler) Serve(c *gin.Context) {
 		// 不值得记成错误 —— 只中断拷贝即可。
 		return
 	}
+}
+
+// ============ 非会员加速：外部代理 ============
+
+// accelProxy 读取「外部加速代理」配置，带 10 秒缓存。
+func (h *StreamHandler) accelProxy() string {
+	h.accelMu.Lock()
+	defer h.accelMu.Unlock()
+	if !h.accelAt.IsZero() && time.Since(h.accelAt) < 10*time.Second {
+		return h.accelURL
+	}
+	h.accelAt = time.Now()
+	h.accelURL = ""
+	var row model.SystemConfig
+	if err := h.db.Where("key = ?", "accel_proxy").First(&row).Error; err == nil {
+		h.accelURL = strings.TrimSpace(row.Value)
+	}
+	return h.accelURL
+}
+
+// applyAccel 把上游直链改写到外部加速代理。
+func applyAccel(proxy, target string) string {
+	if strings.Contains(proxy, "{url}") {
+		return strings.ReplaceAll(proxy, "{url}", url.QueryEscape(target))
+	}
+	return strings.TrimRight(proxy, "/") + "/" + target
+}
+
+// serveLocalFile 把本地硬盘上的文件以支持 Range 的方式转发给客户端。
+//
+// 用 http.ServeContent 而不是手工处理 Range：
+// 它已经把单段/多段 Range、If-Range、If-Modified-Since、Content-Type
+// 推断全部处理好了，手写一遍只会引入等价性 bug。
+func (h *StreamHandler) serveLocalFile(c *gin.Context, path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			util.NotFound(c, "本地文件不存在")
+			return
+		}
+		util.ServerError(c, "打开本地文件失败: "+err.Error())
+		return
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		util.ServerError(c, "读取文件信息失败")
+		return
+	}
+	if st.IsDir() {
+		util.BadRequest(c, "该路径是目录，不能播放")
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	http.ServeContent(c.Writer, c.Request, st.Name(), st.ModTime(), f)
 }

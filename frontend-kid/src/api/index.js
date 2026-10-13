@@ -62,6 +62,16 @@ export const resourceApi = {
   detail: (id) => http.get(`/app/resources/${id}`),
 }
 
+export const searchApi = {
+  // 搜全网：聚合全网网盘分享（走 PanSou）
+  global: (data) => http.post('/app/search/global', data),
+}
+
+export const instantApi = {
+  // 即时转存播放：把搜到的分享转存到系统配置的网盘目录，并返回可播放资源
+  play: (data) => http.post('/app/instant/play', data),
+}
+
 export const playApi = {
   // 获取播放信息（含播放地址、断点位置）
   info: (id) => http.get(`/app/play/${id}`),

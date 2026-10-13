@@ -31,19 +31,12 @@ const routes = [
         meta: { title: '目录管理', icon: 'FolderOpened' },
       },
       {
+        // 「资源与映射」把"已收录的资源"和"从接入源映射进来的资源"放在一起：
+        // 两者是同一件事的前后两段，拆成两个菜单只会让人来回跳。
         path: 'resources',
         name: 'Resources',
         component: () => import('@/views/Resources.vue'),
-        meta: { title: '资源列表', icon: 'Files', group: '资源管理', groupIcon: 'Files' },
-      },
-      {
-        // WebDAV 与资源映射同属"资源管理"：它们解决的都是
-        // "把已有文件变成系统里的资源"，和网盘账号那种"凭证管理"
-        // 不是一回事，所以不放在「网盘账号」下。
-        path: 'resources/webdav',
-        name: 'WebdavResources',
-        component: () => import('@/views/WebdavResources.vue'),
-        meta: { title: 'WebDAV 与映射', icon: 'Connection', group: '资源管理', groupIcon: 'Files' },
+        meta: { title: '资源与映射', icon: 'Files', group: '资源管理', groupIcon: 'Files' },
       },
       {
         path: 'transfer',
@@ -67,7 +60,7 @@ const routes = [
         path: 'disk-accounts',
         name: 'DiskAccounts',
         component: () => import('@/views/DiskAccounts.vue'),
-        meta: { title: '网盘账号', icon: 'Cloudy' },
+        meta: { title: '资源接入', icon: 'Cloudy' },
       },
       {
         path: 'users',

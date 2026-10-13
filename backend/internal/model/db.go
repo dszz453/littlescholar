@@ -107,8 +107,18 @@ func SeedDefaultData(db *gorm.DB, adminUser, adminPassHash string) error {
 		"transcode_concurrency":  "2",
 		"download_accelerate":    "true",
 		"download_concurrency":   "16",
+		// 外部加速代理（对应参考包里的 aliproxy）：留空则不启用。
+		// 支持 http://host:port?url={url} 模板写法，也支持直接作为前缀拼接。
+		"accel_proxy":            "",
 		"play_mode_default":      "proxy",
 		"site_name":              "小书童学习系统",
+		// 「搜一搜 · 搜全网」即时转存播放：默认开启，但账号/目录留空，
+		// 由管理员在「系统设置」里指定（留空时会自动挑该网盘的默认账号）。
+		"instant_enabled":     "true",
+		"instant_disk_type":   "",
+		"instant_account_id":  "",
+		"instant_remote_dir":  "",
+		"instant_category_id": "",
 	}
 	for k, v := range defaults {
 		var existed int64

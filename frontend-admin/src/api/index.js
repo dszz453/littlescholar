@@ -84,17 +84,28 @@ export const searchApi = {
 
 export const diskApi = {
   types: () => http.get('/admin/disk/types'),
-  // diskType 可选：WebDAV 资源页只需要存储源账号
-  list: (diskType) => http.get('/admin/disk/accounts', { params: diskType ? { diskType } : {} }),
+  // 账号/接入源列表。
+  //  - list('webdav')         按类型过滤（旧用法，保留兼容）
+  //  - list({ group:'storage' }) 按分组过滤（网盘 / 存储源）
+  list: (params) => {
+    let query = {}
+    if (typeof params === 'string') query = { diskType: params }
+    else if (params) query = params
+    return http.get('/admin/disk/accounts', { params: query })
+  },
   getQR: (diskType) => http.post('/admin/disk/accounts/qr', { diskType }),
   pollQR: (sessionId) => http.get(`/admin/disk/accounts/qr/${sessionId}`),
   addManual: (data) => http.post('/admin/disk/accounts/manual', data),
+  update: (id, data) => http.put(`/admin/disk/accounts/${id}`, data),
   validate: (id) => http.post(`/admin/disk/accounts/${id}/validate`),
   updateCookie: (id, cookie) => http.put(`/admin/disk/accounts/${id}/cookie`, { cookie }),
   setDefault: (id) => http.post(`/admin/disk/accounts/${id}/default`),
   remove: (id) => http.delete(`/admin/disk/accounts/${id}`),
   browse: (id, dirId = '') => http.get(`/admin/disk/accounts/${id}/browse`, { params: { dirId } }),
   mkdir: (id, parentId, name) => http.post(`/admin/disk/accounts/${id}/mkdir`, { parentId, name }),
+  // 远端目录的重命名 / 删除（写操作直通网盘 / WebDAV / 本地硬盘）
+  rename: (id, fileId, newName) => http.put(`/admin/disk/accounts/${id}/rename`, { fileId, newName }),
+  deleteRemote: (id, fileIds) => http.post(`/admin/disk/accounts/${id}/delete`, { fileIds }),
 }
 
 // 资源映射：远端存储目录 → 系统目录，同步即批量登记资源

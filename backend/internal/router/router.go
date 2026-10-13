@@ -123,18 +123,21 @@ func Setup(deps *Deps) *gin.Engine {
 		admin.POST("/search", resourceH.Search)
 		admin.GET("/search/health", resourceH.SearchHealth)
 
-		// 网盘账号
+		// 资源接入（网盘 / WebDAV / 本地硬盘统一入口）
 		admin.GET("/disk/types", diskH.Types)
 		admin.GET("/disk/accounts", diskH.List)
 		admin.POST("/disk/accounts/qr", diskH.GetQRCode)
 		admin.GET("/disk/accounts/qr/:sessionId", diskH.PollQRCode)
 		admin.POST("/disk/accounts/manual", diskH.AddManual)
+		admin.PUT("/disk/accounts/:id", diskH.UpdateAccount)
 		admin.POST("/disk/accounts/:id/validate", diskH.Validate)
 		admin.PUT("/disk/accounts/:id/cookie", diskH.UpdateCookie)
 		admin.POST("/disk/accounts/:id/default", diskH.SetDefault)
 		admin.DELETE("/disk/accounts/:id", diskH.Delete)
 		admin.GET("/disk/accounts/:id/browse", diskH.Browse)
 		admin.POST("/disk/accounts/:id/mkdir", diskH.MakeDir)
+		admin.PUT("/disk/accounts/:id/rename", diskH.RenameRemote)
+		admin.POST("/disk/accounts/:id/delete", diskH.DeleteRemote)
 
 		// 转存
 		admin.POST("/transfer", transferH.Create)
@@ -209,6 +212,10 @@ func Setup(deps *Deps) *gin.Engine {
 
 		app.GET("/resources", resourceH.List) // 复用，权限在 AppTree 层面已过滤
 		app.GET("/resources/:id", resourceH.Detail)
+
+		// 搜一搜 · 搜全网 + 即时转存播放
+		app.POST("/search/global", resourceH.SearchGlobal)
+		app.POST("/instant/play", resourceH.InstantPlay)
 
 		app.GET("/play/:id", playH.Info)
 		app.POST("/play/:id/progress", playH.ReportProgress)

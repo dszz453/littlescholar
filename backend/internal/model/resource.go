@@ -45,6 +45,13 @@ type Resource struct {
 	TotalSize  int64   `json:"totalSize"`
 	Duration   int     `json:"duration"` // 秒
 
+	// DirectPlay 强制走直链播放，跳过转码。
+	//
+	// 用于「搜一搜 · 搜全网」的即时转存播放：用户点了就要看到画面，
+	// 而转码要跑几分钟。这类资源宁可先用网盘直链播着（后端代理转发、
+	// 支持 Range 拖动），也不该让用户对着"转码中"等。
+	DirectPlay bool `gorm:"default:false" json:"directPlay"`
+
 	// 状态
 	Status        string     `gorm:"size:20;default:'unknown';index" json:"status"`
 	LastCheckedAt *time.Time `json:"lastCheckedAt"`
