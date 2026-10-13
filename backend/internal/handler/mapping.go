@@ -151,6 +151,9 @@ func (h *MappingHandler) Update(c *gin.Context) {
 // 注意两条分支对映射都用软删除（与仓库里其他 Delete 一致）：带 withResources
 // 时若改成物理删除，会出现"删不删资源"决定了"映射是软删还是硬删"这种
 // 与语义无关的差异，日后排查问题时很难解释。
+//
+// 另有一条针对**历史资源**的兜底，见下面第 2 步：mapping_id 是后加的列，
+// 加列之前导入的资源全是 0，光按 mapping_id 清等于什么都没清。
 func (h *MappingHandler) Delete(c *gin.Context) {
 	id, ok := util.GetUintParam(c, "id")
 	if !ok {
@@ -177,24 +180,51 @@ func (h *MappingHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	var removed int64
+	var scoped, legacy int64
 	err := h.db.Transaction(func(tx *gorm.DB) error {
+		// 1) 精确归属：mapping_id 就是这条映射的那些。
+		//
 		// 资源走软删除（与「资源列表 → 批量删除」一致），
 		// 万一删错了还能从库里捞回来。
 		res := tx.Where("mapping_id = ?", m.ID).Delete(&model.Resource{})
 		if res.Error != nil {
 			return res.Error
 		}
-		removed = res.RowsAffected
+		scoped = res.RowsAffected
+
+		// 2) 遗留资源：mapping_id 是后加的列，加之前导入的资源全是 0。
+		//
+		// 这一条是整个修复能不能落地的关键。线上现状就是如此：资源 2454 条里
+		// 绝大多数 mapping_id=0，如果只按第 1 步清，用户依然会看到"删了映射
+		// 资源还在"—— 只不过这次连提示语都说着"已清理 0 条"，更让人费解。
+		//
+		// 判定依据是「这条映射的账号 + 目标目录」，对存量资源来说这就是它唯一的
+		// 来源信息。代价是可能连带清掉**同一账号同一目录下手动导入**的资源；
+		// 权衡后可以接受：真出现那种情况，说明这个目录已经被整条映射覆盖了，
+		// 手动导入的那份本来就是重复的。
+		lg := tx.Where("mapping_id = 0 AND disk_account_id = ? AND category_id = ?",
+			m.AccountID, m.CategoryID).Delete(&model.Resource{})
+		if lg.Error != nil {
+			return lg.Error
+		}
+		legacy = lg.RowsAffected
+
 		return tx.Delete(&model.ResourceMapping{}, m.ID).Error
 	})
 	if err != nil {
 		util.ServerError(c, "删除失败")
 		return
 	}
-	util.OKWithMessage(c,
-		fmt.Sprintf("已删除映射，并清理 %d 条已导入的资源", removed),
-		gin.H{"removedResources": removed})
+	removed := scoped + legacy
+	msg := fmt.Sprintf("已删除映射，并清理 %d 条已导入的资源", removed)
+	if legacy > 0 {
+		msg = fmt.Sprintf("已删除映射，并清理 %d 条已导入的资源（其中 %d 条为历史资源）", removed, legacy)
+	}
+	util.OKWithMessage(c, msg, gin.H{
+		"removedResources": removed,
+		"removedScoped":    scoped,
+		"removedLegacy":    legacy,
+	})
 }
 
 // Sync 立即同步一个映射

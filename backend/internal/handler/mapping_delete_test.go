@@ -111,6 +111,81 @@ func TestMappingDeleteResourcePolicy(t *testing.T) {
 	}
 }
 
+// 历史资源（mapping_id=0）的兜底清理。
+//
+// 这是整个修复的**关键路径**，不能只测新资源：mapping_id 是本次才加的列，
+// 加列之前导入的资源全是 0。线上现状就是这么来的 —— 2454 条资源几乎全是 0，
+// 如果级联删除只认 mapping_id，用户点完"同时删除已导入的资源"会看到
+// "已清理 0 条"，然后孩子端一切照旧，比不改还糟。
+//
+// 所以兜底按「这条映射的账号 + 目标目录」去认，同时必须守住边界：
+// 别的账号、别的目录、以及没有账号的手动导入，一条都不能碰。
+func TestMappingDeleteSweepsLegacyResources(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newMappingTestDB(t)
+	h := &MappingHandler{db: db}
+
+	// 待删的映射：账号 1 / 目录 17
+	target := model.ResourceMapping{Name: "牛津树-夸克", AccountID: 1, CategoryID: 17}
+	mustCreate(t, db, &target)
+	// 另一条映射占用了同样的目录，但账号不同 —— 它的历史资源不该被牵连
+	sibling := model.ResourceMapping{Name: "牛津树-WebDAV", AccountID: 2, CategoryID: 17}
+	mustCreate(t, db, &sibling)
+
+	acc := func(v uint64) *uint64 { return &v }
+
+	// 1 条新式资源：带 mapping_id
+	mustCreate(t, db, &model.Resource{Title: "新式", CategoryID: 17, DiskAccountID: acc(1), MappingID: target.ID})
+	// 2 条历史资源：mapping_id=0，账号+目录都对得上 → 应被兜底清掉
+	for i := 0; i < 2; i++ {
+		mustCreate(t, db, &model.Resource{
+			Title: fmt.Sprintf("历史%02d", i), CategoryID: 17, DiskAccountID: acc(1),
+		})
+	}
+	// 账号不同 → 保留（这是最容易被写错的一条：少了 disk_account_id 条件就会误删）
+	mustCreate(t, db, &model.Resource{Title: "别的账号", CategoryID: 17, DiskAccountID: acc(2)})
+	// 目录不同 → 保留
+	mustCreate(t, db, &model.Resource{Title: "别的目录", CategoryID: 99, DiskAccountID: acc(1)})
+	// 没有账号（手动导入/本地硬盘）→ 保留
+	mustCreate(t, db, &model.Resource{Title: "手动导入", CategoryID: 17, DiskType: "local"})
+
+	rec := callMappingDelete(t, h, fmt.Sprint(target.ID), true)
+	if rec.Code != 200 {
+		t.Fatalf("HTTP %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 响应里要能看出"清了几条、其中几条是历史资源"，否则线上排查只能靠猜
+	var body struct {
+		Code int `json:"code"`
+		Data struct {
+			RemovedResources int64 `json:"removedResources"`
+			RemovedScoped    int64 `json:"removedScoped"`
+			RemovedLegacy    int64 `json:"removedLegacy"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应解析失败: %v", err)
+	}
+	if body.Data.RemovedScoped != 1 || body.Data.RemovedLegacy != 2 || body.Data.RemovedResources != 3 {
+		t.Errorf("清理计数不对：scoped=%d legacy=%d total=%d，期望 1/2/3",
+			body.Data.RemovedScoped, body.Data.RemovedLegacy, body.Data.RemovedResources)
+	}
+
+	// 边界：只有"这条映射 + 对得上的历史资源"消失，其余 3 条必须还在
+	var alive int64
+	db.Model(&model.Resource{}).Count(&alive)
+	if alive != 3 {
+		t.Errorf("剩余资源 %d 条，期望 3（别的账号 / 别的目录 / 手动导入）", alive)
+	}
+	for _, title := range []string{"别的账号", "别的目录", "手动导入"} {
+		var n int64
+		db.Model(&model.Resource{}).Where("title = ?", title).Count(&n)
+		if n != 1 {
+			t.Errorf("「%s」被误删了", title)
+		}
+	}
+}
+
 // 不存在的 ID 不能被静默"成功"——否则前端会提示清理完成，实际什么都没发生。
 //
 // 注意本仓库的约定：HTTP 状态码恒为 200，业务码放在 body 的 code 字段

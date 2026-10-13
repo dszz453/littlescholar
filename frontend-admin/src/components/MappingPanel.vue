@@ -302,7 +302,16 @@ async function remove(row) {
     })
     const res = await mappingApi.remove(row.id, withResources.value)
     const n = Number(res?.removedResources) || 0
-    ElMessage.success(n > 0 ? `已删除映射，并清理 ${n} 条资源` : '已删除映射')
+    const legacy = Number(res?.removedLegacy) || 0
+    if (n === 0) {
+      ElMessage.success('已删除映射')
+    } else if (legacy > 0) {
+      // 区分开"这条映射导入的"和"加 mapping_id 之前的历史资源"，
+      // 免得用户看到比自己印象中更多的条数时以为是删错了。
+      ElMessage.success(`已删除映射，并清理 ${n} 条资源（含 ${legacy} 条历史资源）`)
+    } else {
+      ElMessage.success(`已删除映射，并清理 ${n} 条资源`)
+    }
     loadAll()
   } catch (e) {
     /* 取消 */
