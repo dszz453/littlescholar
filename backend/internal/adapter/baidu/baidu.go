@@ -87,9 +87,10 @@ func (b *Baidu) headers(cred *adapter.Credential) map[string]string {
 // GetQRCode 获取扫码登录二维码
 func (b *Baidu) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	var devResp struct {
-		Errno int    `json:"errno"`
-		Sign  string `json:"sign"`
-		Img   string `json:"img"`
+		Errno  int    `json:"errno"`
+		Sign   string `json:"sign"`
+		ImgURL string `json:"imgurl"`
+		Img    string `json:"img"`
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
@@ -118,13 +119,28 @@ func (b *Baidu) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 		channelID = channelID[:32]
 	}
 
+	// 官方二维码内容就是它给的 imgurl。
+	// 注意字段名是 imgurl 而不是 img，且返回值**不带协议头**
+	// （形如 passport.baidu.com/v2/api/qrcode?sign=…），要补 https://。
+	qrContent := devResp.ImgURL
+	if qrContent == "" {
+		qrContent = passport + "/v2/api/qrcode?sign=" + url.QueryEscape(devResp.Sign) +
+			"&lp=pc&qrloginfrom=pc"
+	} else if !strings.HasPrefix(qrContent, "http") {
+		qrContent = "https://" + qrContent
+	}
+
+	// 百度没有内联 base64 图，imgurl 本身就是一个"返回 PNG"的地址，
+	// 直接交给前端当 <img src> 用即可。
+	image := devResp.Img
+	if image == "" {
+		image = qrContent
+	}
+
 	return &adapter.QRCode{
 		SessionID: "baidu_" + channelID,
-		Content: passport + "/v2/api/qrcode?sign=" + url.QueryEscape(devResp.Sign) +
-			"&lp=pc&qrloginfrom=pc",
-		// img 已经是 data:image/png;base64,... 的完整 data URI，
-		// 前端拿到就能直接塞进 <img>，不必再自己画二维码。
-		Image:     devResp.Img,
+		Content:   qrContent,
+		Image:     image,
 		ExpiresIn: 180,
 	}, nil
 }

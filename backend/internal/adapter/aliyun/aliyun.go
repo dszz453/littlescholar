@@ -63,6 +63,14 @@ func (a *Aliyun) refreshToken(ctx context.Context, cred *adapter.Credential) (st
 
 // ============ 认证 ============
 
+// SupportsQR 阿里云盘不提供扫码登录。
+//
+// 官方扫码走的是 PKCE + OAuth，需要自行申请 client_id / client_secret，
+// 没有公开可用的固定凭证；社区通行做法是让用户粘贴 refresh_token。
+// 明确声明 false，前端就会直接收掉"扫码登录"页签、改引导手动填写，
+// 而不是给用户一个扫了也没用的二维码。
+func (a *Aliyun) SupportsQR() bool { return false }
+
 func (a *Aliyun) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	// 阿里云盘扫码流程较复杂（需 PKCE + OAuth），
 	// 推荐使用 refresh_token 方式，在后台「手动添加」中粘贴 refresh_token
@@ -120,11 +128,11 @@ func (a *Aliyun) ListDir(ctx context.Context, cred *adapter.Credential, dirID st
 	}
 	var resp struct {
 		Items []struct {
-			FileID   string `json:"file_id"`
-			Name     string `json:"name"`
-			Type     string `json:"type"`
-			Size     int64  `json:"size"`
-			UpdatedAt string `json:"updated_at"`
+			FileID        string `json:"file_id"`
+			Name          string `json:"name"`
+			Type          string `json:"type"`
+			Size          int64  `json:"size"`
+			UpdatedAt     string `json:"updated_at"`
 			FileExtension string `json:"file_extension"`
 		} `json:"items"`
 		Message string `json:"message"`
@@ -265,10 +273,10 @@ func (a *Aliyun) Transfer(ctx context.Context, cred *adapter.Credential, shareUR
 
 func (a *Aliyun) GetDirectLink(ctx context.Context, cred *adapter.Credential, fileID string) (*adapter.DirectLink, error) {
 	var resp struct {
-		URL     string `json:"url"`
-		Size    int64  `json:"size"`
+		URL        string `json:"url"`
+		Size       int64  `json:"size"`
 		Expiration string `json:"expiration"`
-		Message string `json:"message"`
+		Message    string `json:"message"`
 	}
 	if err := a.doAuth(ctx, cred, "POST", "/v2/file/get_download_url", map[string]interface{}{
 		"drive_id": "", "file_id": fileID,

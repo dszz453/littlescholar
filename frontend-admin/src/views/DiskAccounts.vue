@@ -12,7 +12,9 @@
       <template #title>
         这里统一管理所有<b>内容来源</b>：网盘接入（夸克/百度/UC/天翼/阿里云盘）、
         WebDAV 存储、服务器<b>本地硬盘</b>目录。
-        网盘推荐用<b>扫码登录</b>自动获取 Cookie；阿里云盘请粘贴 refresh_token；
+        <b>夸克 / UC / 百度</b>支持扫码登录自动获取 Cookie；
+        <b>天翼</b>与<b>阿里云盘</b>官方未开放网页扫码，请在「手动填写」里录入
+        （阿里云盘填 refresh_token，天翼填浏览器里的完整 Cookie）。
         凭据会以 AES-256-GCM 加密后存储，不会明文落库。
       </template>
     </el-alert>

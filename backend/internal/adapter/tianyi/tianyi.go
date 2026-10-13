@@ -48,16 +48,27 @@ func (t *Tianyi) headers(cookie string) map[string]string {
 
 // ============ 扫码登录 ============
 //
-// 天翼扫码也是三段式，之前只做了前两段且第二段的判定写反了：
+// ⚠️ 天翼**不提供扫码登录**，SupportsQR 返回 false。
 //
-//	1. getLoginQrCode      取 uuid + 二维码
-//	2. getLoginQrCodeInfo  轮询，res_code=0 且带 redirectUrl 才算"已确认"
-//	3. redirectUrl         拿它换 cookie（COOKIE_LOGIN_USER 等）
+// 实测（在服务器上直连验证）：cloud.189.cn/api/logbox/* 这一组接口
+// 在未持有有效会话时一律返回
 //
-// 之前 getLoginQrCodeInfo 只回了个"已扫码"就结束了，cookie 一步没走，
-// 用户扫完等于白扫。
+//	{"errorCode":"InvalidSessionKey",
+//	 "errorMsg":"cookieUserSession is null or invalid"}
+//
+// 而天翼网页版的登录入口会 302 到
+// open.e.189.cn/api/logbox/oauth2/separate/auth/unifyAccountLogin.do
+// —— 也就是统一账号平台，扫码要在那套 OAuth 体系里做，
+// 拿 cloud.189.cn 的接口引导不出来。
+//
+// 参考包（影视播放器）对天翼用的也是**账号密码 + captchaToken**，
+// 不是扫码。所以这里如实声明"不支持"，让前端引导用户去粘 Cookie。
+//
+// 下面的 GetQRCode / PollQRCode 保留实现，是为了将来天翼放开接口时
+// 能直接接上，不代表当前可用。
+func (t *Tianyi) SupportsQR() bool { return false }
 
-// GetQRCode 获取扫码登录二维码
+// GetQRCode 获取扫码登录二维码（当前不可用，见上方说明）
 func (t *Tianyi) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	var resp struct {
 		ResCode    int    `json:"res_code"`
