@@ -136,11 +136,20 @@ func TestMappingDeleteSweepsLegacyResources(t *testing.T) {
 
 	// 1 条新式资源：带 mapping_id
 	mustCreate(t, db, &model.Resource{Title: "新式", CategoryID: 17, DiskAccountID: acc(1), MappingID: target.ID})
-	// 2 条历史资源：mapping_id=0，账号+目录都对得上 → 应被兜底清掉
+	// 2 条历史资源：无归属，账号+目录都对得上 → 应被兜底清掉
 	for i := 0; i < 2; i++ {
 		mustCreate(t, db, &model.Resource{
 			Title: fmt.Sprintf("历史%02d", i), CategoryID: 17, DiskAccountID: acc(1),
 		})
+	}
+	// 关键：把它们的 mapping_id 置成 **NULL** 而不是留着 GORM 写进去的 0。
+	//
+	// 线上就是这么来的 —— AutoMigrate 给已存在的行补列走 ALTER TABLE ADD COLUMN，
+	// 不回填默认值，历史行因此是 NULL。单测里如果只留 0，就会得出
+	// "sqlite 过、postgres 死"的假绿灯（已实际踩过一次）。
+	tx := db.Exec("UPDATE resources SET mapping_id = NULL WHERE mapping_id = 0 AND title LIKE '历史%'")
+	if tx.Error != nil {
+		t.Fatalf("置 NULL 失败: %v", tx.Error)
 	}
 	// 账号不同 → 保留（这是最容易被写错的一条：少了 disk_account_id 条件就会误删）
 	mustCreate(t, db, &model.Resource{Title: "别的账号", CategoryID: 17, DiskAccountID: acc(2)})

@@ -192,17 +192,22 @@ func (h *MappingHandler) Delete(c *gin.Context) {
 		}
 		scoped = res.RowsAffected
 
-		// 2) 遗留资源：mapping_id 是后加的列，加之前导入的资源全是 0。
+		// 2) 遗留资源：mapping_id 是后加的列，加之前导入的资源没有归属信息。
 		//
-		// 这一条是整个修复能不能落地的关键。线上现状就是如此：资源 2454 条里
-		// 绝大多数 mapping_id=0，如果只按第 1 步清，用户依然会看到"删了映射
-		// 资源还在"—— 只不过这次连提示语都说着"已清理 0 条"，更让人费解。
+		// 这一条是整个修复能不能落地的关键。线上现状就是如此：76 条资源里
+		// 全部是历史资源，如果只按第 1 步清，用户依然会看到"删了映射资源还在"
+		// —— 只不过这次连提示语都说着"已清理 0 条"，更让人费解。
 		//
 		// 判定依据是「这条映射的账号 + 目标目录」，对存量资源来说这就是它唯一的
 		// 来源信息。代价是可能连带清掉**同一账号同一目录下手动导入**的资源；
 		// 权衡后可以接受：真出现那种情况，说明这个目录已经被整条映射覆盖了，
 		// 手动导入的那份本来就是重复的。
-		lg := tx.Where("mapping_id = 0 AND disk_account_id = ? AND category_id = ?",
+		//
+		// 必须同时兼容 NULL 和 0：AutoMigrate 给已存在的行补列时用的是
+		// ALTER TABLE ADD COLUMN，**不回填默认值**，所以历史行是 NULL 而不是 0。
+		// 只写 `mapping_id = 0` 在 sqlite（单测）上能过、在 postgres（线上）上
+		// 一条都匹配不到 —— 这个坑已经实际踩过一次，别再改回去。
+		lg := tx.Where("(mapping_id IS NULL OR mapping_id = 0) AND disk_account_id = ? AND category_id = ?",
 			m.AccountID, m.CategoryID).Delete(&model.Resource{})
 		if lg.Error != nil {
 			return lg.Error
