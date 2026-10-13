@@ -567,8 +567,12 @@ func (u *UC) SaveToDir(ctx context.Context, cred *adapter.Credential, share *ada
 //
 // UC 与夸克同协议：data.status 2=成功、3=失败、其余表示仍在跑。
 // 不轮询就等于"发完请求就说成功"——转存实际失败也看不出来。
+//
+// 与夸克同样的两个坑：端点必须是 GET /task?task_id=<id>（写成
+// /task/<id> 恒 404，会一路轮询到 deadline 误报"超时"）；失败原因在
+// **顶层** code/message，必须读，否则会吞掉"空间不足"这类真实原因。
 func (u *UC) waitTask(ctx context.Context, cred *adapter.Credential, taskID string) error {
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
 	var lastMsg string
 	for time.Now().Before(deadline) {
 		select {
@@ -577,30 +581,44 @@ func (u *UC) waitTask(ctx context.Context, cred *adapter.Credential, taskID stri
 		case <-time.After(1200 * time.Millisecond):
 		}
 		var resp struct {
-			Status int `json:"status"`
-			Code   int `json:"code"`
-			Data   struct {
+			Status  int    `json:"status"`
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Data    struct {
 				Status  int    `json:"status"`
 				Message string `json:"message"`
+				SaveAs  struct {
+					RemainCapacity int64 `json:"remain_capacity"`
+				} `json:"save_as"`
 			} `json:"data"`
+			Metadata struct {
+				MissingCapacity int64 `json:"missing_capacity"`
+			} `json:"metadata"`
 		}
 		_, err := u.http.DoJSON(ctx, &adapter.Request{
 			Method:  "GET",
-			URL:     apiBase + "/task/" + taskID,
+			URL:     apiBase + "/task",
 			Headers: u.headers(cred.Cookie),
-			Query:   map[string]string{"pr": "UCBrowser", "fr": "pc", "retry_index": "1"},
+			Query: map[string]string{
+				"pr": "UCBrowser", "fr": "pc",
+				"task_id": taskID, "retry_index": "0",
+			},
 		}, &resp)
 		if err != nil {
 			continue
 		}
-		switch resp.Data.Status {
-		case 2:
+		if resp.Data.Status == 2 {
 			return nil
-		case 3:
-			return fmt.Errorf("UC 转存任务失败: %s", resp.Data.Message)
-		default:
-			lastMsg = resp.Data.Message
 		}
+		if resp.Data.Status == 3 || resp.Code != 0 {
+			msg := resp.Data.Message
+			if msg == "" {
+				msg = resp.Message
+			}
+			return fmt.Errorf("%s", adapter.TaskErrorText("UC 网盘", resp.Code, msg,
+				resp.Metadata.MissingCapacity, resp.Data.SaveAs.RemainCapacity))
+		}
+		lastMsg = resp.Data.Message
 	}
 	if lastMsg == "" {
 		lastMsg = "任务超时"

@@ -626,8 +626,16 @@ func (q *Quark) SaveToDir(ctx context.Context, cred *adapter.Credential, share *
 }
 
 // waitTask 轮询转存任务完成
+//
+// 两个必须点（都踩过）：
+//
+//  1. 端点形式是 GET /task?task_id=<id>（task_id 走 query），
+//     写成 /task/<id> 会**恒返回 404** —— 于是每次轮询都解析不出状态，
+//     一直循环到 deadline，最后误报"任务超时"。
+//  2. 失败原因在**顶层** code/message，不在 data 里。只认 data.status
+//     会把 code=32003 "capacity limit"（空间不足）这种真实原因吞掉。
 func (q *Quark) waitTask(ctx context.Context, cred *adapter.Credential, taskID string) error {
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
 	var lastMsg string
 	for time.Now().Before(deadline) {
 		select {
@@ -637,32 +645,47 @@ func (q *Quark) waitTask(ctx context.Context, cred *adapter.Credential, taskID s
 		}
 
 		var resp struct {
-			Status int `json:"status"`
-			Code   int `json:"code"`
-			Data   struct {
+			Status  int    `json:"status"`
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Data    struct {
 				Status    int    `json:"status"`
 				TaskTitle string `json:"task_title"`
 				Message   string `json:"message"`
+				SaveAs    struct {
+					RemainCapacity int64 `json:"remain_capacity"`
+				} `json:"save_as"`
 			} `json:"data"`
+			Metadata struct {
+				MissingCapacity int64 `json:"missing_capacity"`
+			} `json:"metadata"`
 		}
 		_, err := q.http.DoJSON(ctx, &adapter.Request{
 			Method:  "GET",
-			URL:     baseURL + "/task/" + taskID,
+			URL:     baseURL + "/task",
 			Headers: q.headers(cred.Cookie),
-			Query:   map[string]string{"pr": "ucpro", "fr": "pc", "retry_index": "1"},
+			Query: map[string]string{
+				"pr": "ucpro", "fr": "pc",
+				"task_id": taskID, "retry_index": "0",
+			},
 		}, &resp)
 		if err != nil {
 			continue
 		}
-		// status 2 = 成功, 3 = 失败
-		switch resp.Data.Status {
-		case 2:
+		// data.status：2=成功，3=失败
+		if resp.Data.Status == 2 {
 			return nil
-		case 3:
-			return fmt.Errorf("转存任务失败: %s", resp.Data.Message)
-		default:
-			lastMsg = resp.Data.Message
 		}
+		// 顶层 code 非 0 也是终态失败（任务在跑时 code=0）。
+		if resp.Data.Status == 3 || resp.Code != 0 {
+			msg := resp.Data.Message
+			if msg == "" {
+				msg = resp.Message
+			}
+			return fmt.Errorf("%s", adapter.TaskErrorText("夸克网盘", resp.Code, msg,
+				resp.Metadata.MissingCapacity, resp.Data.SaveAs.RemainCapacity))
+		}
+		lastMsg = resp.Data.Message
 	}
 	if lastMsg == "" {
 		lastMsg = "任务超时"

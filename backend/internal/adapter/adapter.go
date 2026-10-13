@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 // DiskType 网盘类型
@@ -237,4 +238,54 @@ func SplitChunks(size, chunkSize int64) []Chunk {
 		idx++
 	}
 	return chunks
+}
+
+// TaskErrorText 把网盘异步任务的失败码翻译成用户能看懂的一句话。
+//
+// 为什么需要它：夸克/UC 的转存是异步任务，提交接口一律返回 code=0，
+// 真正的结果只能靠轮询任务接口拿。任务失败时失败原因放在**顶层**
+// code/message（例如 code=32003 message="capacity limit"），而不是
+// data 里 —— 如果只解析 data.status，就会把这个信息丢掉，
+// 最终给用户报一个语焉不详的"任务超时"。
+//
+// 参数：
+//
+//	prefix         网盘名（"夸克网盘" / "UC 网盘"）
+//	code, msg      任务接口返回的顶层 code 与 message
+//	missing, remain 容量类错误附带的"还缺多少 / 还剩多少"（字节，可能为 0）
+func TaskErrorText(prefix string, code int, msg string, missing, remain int64) string {
+	switch code {
+	case 32003, 32004: // capacity limit —— 空间不足
+		if missing > 0 {
+			return fmt.Sprintf("%s空间不足：当前剩余约 %s，本资源还需 %s，请清理空间或开通会员后重试",
+				prefix, humanSize(remain), humanSize(missing))
+		}
+		return prefix + "空间不足，请清理空间或开通会员后重试"
+	case 41013, 41012: // 需要提取码
+		return prefix + "分享需要提取码，请填写提取码后重试"
+	case -6, 31001: // 登录态失效
+		return prefix + "登录已失效，请重新接入该账号"
+	}
+	if msg != "" {
+		return fmt.Sprintf("%s转存失败: code=%d %s", prefix, code, msg)
+	}
+	return fmt.Sprintf("%s转存失败: code=%d", prefix, code)
+}
+
+// humanSize 把字节数格式化成人类可读的大小（按 1024 进制）。
+func humanSize(n int64) string {
+	if n <= 0 {
+		return "0 B"
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB", "PB"}
+	f := float64(n)
+	i := 0
+	for f >= 1024 && i < len(units)-1 {
+		f /= 1024
+		i++
+	}
+	if i == 0 {
+		return fmt.Sprintf("%d B", n)
+	}
+	return fmt.Sprintf("%.1f %s", f, units[i])
 }
