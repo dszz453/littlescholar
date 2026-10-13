@@ -292,6 +292,33 @@ func (b *Baidu) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*
 	if resp.Errno != 0 {
 		return nil, fmt.Errorf("百度账号校验失败: errno=%d", resp.Errno)
 	}
+
+	// 补一道 STOKEN 可用性探测（否则会出现"界面显示有效、一转存就失败"）。
+	//
+	// uinfo 与 /quota 只认 BDUSS，STOKEN 过期时它们照样返回 errno=0，
+	// 于是界面显示"有效"。但真正要用的时候全挂：实测 STOKEN 失效时
+	// gettemplatevariable 返回 errno=-6、share/verify 对所有分享一律
+	// 返回 errno=-12（8/8 条不同分享全部如此，与分享本身无关）。
+	// bdstoken 只有 STOKEN 有效才拿得到，所以拿它作为"这个 cookie 还能写"
+	// 的判据：拿不到就如实报失效，提示用户重新接入，而不是让用户
+	// 在转存时面对一个语焉不详的错误。
+	var tpl struct {
+		Errno  int `json:"errno"`
+		Result struct {
+			Bdstoken string `json:"bdstoken"`
+		} `json:"result"`
+	}
+	if _, e := b.http.DoJSON(ctx, &adapter.Request{
+		Method:  "GET",
+		URL:     basePanAPI + "/gettemplatevariable",
+		Headers: b.headers(cred),
+		Query: map[string]string{
+			"fields": `["bdstoken"]`, "clienttype": "0", "app_id": "250528", "web": "1",
+		},
+	}, &tpl); e == nil && (tpl.Errno != 0 || tpl.Result.Bdstoken == "") {
+		return nil, adapter.ErrCookieInvalid
+	}
+
 	return &adapter.AccountInfo{
 		Nickname:      orDefault(resp.NetdiskName, resp.Username, "百度网盘"),
 		CapacityUsed:  resp.Quota.Used,
