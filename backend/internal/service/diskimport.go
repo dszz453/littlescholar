@@ -47,6 +47,71 @@ func ExtOfName(name string) string {
 	return strings.ToLower(name[i+1:])
 }
 
+// needsTranscodeExts 浏览器**原生放不出来**的容器格式。
+//
+// 这张表是"要不要转码"的判据核心：命中就必须转码，否则 <video>
+// 只会抛 MediaError(code=4) 然后前端弹一句毫无信息量的提示。
+//
+// 有意不包含的：
+//   - mp4 / m4v / webm / m3u8 —— 浏览器原生支持，转码纯属浪费 CPU；
+//   - mp3 / m4a / flac / wav —— 音频同理；
+//   - mov —— 部分情况是 h264 可以直接播，但线上实测有大量 mov 用的是
+//     非浏览器编码，保险起见仍走转码（与改动前的行为保持一致）。
+var needsTranscodeExts = map[string]bool{
+	"mkv": true, "avi": true, "rmvb": true, "rm": true, "flv": true,
+	"wmv": true, "mov": true, "ts": true, "mpg": true, "mpeg": true,
+	"3gp": true, "vob": true, "f4v": true, "asf": true, "m2ts": true,
+	"mts": true, "divx": true, "xv": true, "ogm": true, "mxf": true,
+}
+
+// knownExts 我们"认得出来"的格式集合 = 可导入白名单 ∪ 需转码容器表。
+//
+// 它的作用是给"从文本里猜后缀"这件事加一道闸：标题里出现小数点太常见了
+// （"神奇之钥 第2季.13"、"Biff and Chip (1.2)"），盲猜会得到一个
+// 毫无意义的"扩展名"，更糟的是它会**把 FileID 里真正正确的后缀挡在后面**。
+// 只在认得出来时才采信，才是安全的。
+var knownExts = func() map[string]bool {
+	m := make(map[string]bool, len(mediaFileExts)+len(needsTranscodeExts))
+	for k := range mediaFileExts {
+		m[k] = true
+	}
+	for k := range needsTranscodeExts {
+		m[k] = true
+	}
+	return m
+}()
+
+// NeedsTranscodeExt 判断该扩展名是否必须转码才能给浏览器播。
+func NeedsTranscodeExt(ext string) bool { return needsTranscodeExts[ext] }
+
+// ResourceExt 推断资源的真实文件扩展名（小写、不含点）。
+//
+// 三级取值，缺一不可：
+//
+//  1. res.Ext —— 新数据。入库时显式写入，最可靠（自己写的，直接采信）。
+//  2. res.Title —— 老数据兜底。有些来源（手工建资源、老的分享导入）
+//     没有剥后缀，标题本身就是带扩展名的。
+//  3. res.FileID —— 老数据的最后一道。WebDAV / 本地硬盘的 FileID 就是
+//     **带扩展名的相对路径**，是唯一还留着格式信息的地方；
+//     网盘（夸克/UC/百度）的 FileID 是不含点的短 ID，自然取不到后缀。
+//
+// 第 2、3 步都要求候选值在 knownExts 里，理由见 knownExts 的注释。
+func ResourceExt(res *model.Resource) string {
+	if res == nil {
+		return ""
+	}
+	if e := strings.ToLower(strings.TrimSpace(res.Ext)); e != "" {
+		return e
+	}
+	if e := ExtOfName(res.Title); knownExts[e] {
+		return e
+	}
+	if e := ExtOfName(res.FileID); knownExts[e] {
+		return e
+	}
+	return ""
+}
+
 // IsMediaFile 判断是否属于要导入的媒体类型。
 func IsMediaFile(name string) bool { return mediaFileExts[ExtOfName(name)] }
 
@@ -223,6 +288,8 @@ func (s *ImportService) Register(acc *model.DiskAccount, categoryID uint64, targ
 			continue
 		}
 		// 标题去掉扩展名，列表更干净；全空了才退回原名。
+		// 扩展名本身不能丢 —— 单独存进 Ext，转码判定全靠它。
+		ext := ExtOfName(t.Title)
 		title := strings.TrimSuffix(t.Title, path.Ext(t.Title))
 		if strings.TrimSpace(title) == "" {
 			title = t.Title
@@ -235,6 +302,7 @@ func (s *ImportService) Register(acc *model.DiskAccount, categoryID uint64, targ
 			FileID:        t.FileID,
 			OwnerDirID:    path.Dir(t.FileID),
 			MediaType:     GuessMediaType(t.Title),
+			Ext:           ext,
 			FileCount:     1,
 			TotalSize:     t.Size,
 			// 文件是刚从存储源列出来的，存在性是确定的，

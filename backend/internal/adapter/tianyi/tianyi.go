@@ -431,8 +431,9 @@ func (t *Tianyi) GetDirectLink(ctx context.Context, cred *adapter.Credential, fi
 	return &adapter.DirectLink{
 		URL:          resp.FileInfo.DownloadURL,
 		Size:         resp.FileInfo.Size,
-		ExpiresAt:    time.Now().Add(2 * time.Hour).Unix(),
-		Headers:      map[string]string{"User-Agent": tyUA, "Referer": "https://cloud.189.cn/"},
+		ExpiresAt: time.Now().Add(2 * time.Hour).Unix(),
+		// 天翼云盘的下载域名同样会校验登录态，带上 Cookie 保持一致。
+		Headers:      adapter.MediaHeaders(tyUA, "https://cloud.189.cn/", cred.Cookie),
 		AcceptRanges: true,
 	}, nil
 }

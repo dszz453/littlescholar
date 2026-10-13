@@ -773,8 +773,10 @@ func (q *Quark) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 	return &adapter.DirectLink{
 		URL:          resp.Data[0].DownloadURL,
 		Size:         resp.Data[0].Size,
-		ExpiresAt:    time.Now().Add(30 * time.Minute).Unix(),
-		Headers:      map[string]string{"User-Agent": userAgent, "Referer": "https://pan.quark.cn/"},
+		ExpiresAt: time.Now().Add(30 * time.Minute).Unix(),
+		// Cookie 是必需的：夸克 CDN 靠它做准入，只带 UA/Referer 会被
+		// 判 412（实测，见 adapter.MediaHeaders 的注释）。
+		Headers:      adapter.MediaHeaders(userAgent, "https://pan.quark.cn/", cred.Cookie),
 		AcceptRanges: true, // 夸克直链支持 Range
 	}, nil
 }

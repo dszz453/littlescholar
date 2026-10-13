@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/littlescholar/core/internal/adapter"
 	"github.com/littlescholar/core/internal/model"
+	"github.com/littlescholar/core/internal/service"
 	"github.com/littlescholar/core/internal/task"
 	"github.com/littlescholar/core/internal/util"
 	"gorm.io/gorm"
@@ -211,6 +212,9 @@ func (h *TransferHandler) processTransfer(ctx context.Context, taskID uint64) er
 			TotalSize:     share.TotalSize,
 			Status:        model.ResourceStatusAlive,
 			MediaType:     model.MediaTypeVideo,
+			// 整份转存的分享，标题就是分享名；能取到后缀就记下来，
+			// 取不到也不影响（ResourceExt 还有 FileID 兜底）。
+			Ext: service.ExtOfName(orDefaultStr(share.Title, t.Title)),
 		}
 		if err := h.db.Create(res).Error; err == nil {
 			resourceID = &res.ID

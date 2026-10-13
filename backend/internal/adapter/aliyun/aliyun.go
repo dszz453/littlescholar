@@ -289,8 +289,10 @@ func (a *Aliyun) GetDirectLink(ctx context.Context, cred *adapter.Credential, fi
 	return &adapter.DirectLink{
 		URL:          resp.URL,
 		Size:         resp.Size,
-		ExpiresAt:    time.Now().Add(15 * time.Minute).Unix(),
-		Headers:      map[string]string{"User-Agent": ua, "Referer": "https://www.aliyundrive.com/"},
+		ExpiresAt: time.Now().Add(15 * time.Minute).Unix(),
+		// 阿里云盘直链本身是签名 URL，但带上 Cookie 无副作用，
+		// 且能覆盖"签名校验之外还有登录态校验"的边缘节点。
+		Headers:      adapter.MediaHeaders(ua, "https://www.aliyundrive.com/", cred.Cookie),
 		AcceptRanges: true,
 	}, nil
 }

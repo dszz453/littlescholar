@@ -395,7 +395,9 @@ func (h *ResourceHandler) InstantPlay(c *gin.Context) {
 		OwnerDirID:    targetDirID,
 		FileID:        best.FileID,
 		MediaType:     service.GuessMediaType(best.Title),
-		TotalSize:     best.Size,
+		// Ext 必须落在库里：标题是去掉后缀的，转码判定只能靠它。
+		Ext:       service.ExtOfName(best.Title),
+		TotalSize: best.Size,
 		Status:        model.ResourceStatusAlive,
 		DirectPlay:    true, // 立即播放优先，跳过转码
 	}

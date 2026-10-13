@@ -705,8 +705,9 @@ func (u *UC) GetDirectLink(ctx context.Context, cred *adapter.Credential, fileID
 	return &adapter.DirectLink{
 		URL:          resp.Data[0].DownloadURL,
 		Size:         resp.Data[0].Size,
-		ExpiresAt:    time.Now().Add(30 * time.Minute).Unix(),
-		Headers:      map[string]string{"User-Agent": ucUA, "Referer": "https://drive.uc.cn/"},
+		ExpiresAt: time.Now().Add(30 * time.Minute).Unix(),
+		// UC 与夸克同属阿里系 CDN，准入同样看 Cookie。
+		Headers:      adapter.MediaHeaders(ucUA, "https://drive.uc.cn/", cred.Cookie),
 		AcceptRanges: true,
 	}, nil
 }

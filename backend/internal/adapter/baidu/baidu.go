@@ -821,8 +821,10 @@ func (b *Baidu) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 	return &adapter.DirectLink{
 		URL:          link,
 		Size:         resp.List[0].Size,
-		ExpiresAt:    time.Now().Add(8 * time.Hour).Unix(),
-		Headers:      map[string]string{"User-Agent": ua, "Referer": "https://pan.baidu.com/"},
+		ExpiresAt: time.Now().Add(8 * time.Hour).Unix(),
+		// 百度 PCS 的下载域名（d.pcs.baidu.com）对部分文件会校验 BDUSS，
+		// 与其它网盘保持一致带上 Cookie，避免"换个文件就 403"。
+		Headers:      adapter.MediaHeaders(ua, "https://pan.baidu.com/", cred.Cookie),
 		AcceptRanges: true,
 	}, nil
 }

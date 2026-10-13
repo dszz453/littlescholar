@@ -223,6 +223,8 @@ func (h *ResourceHandler) Create(c *gin.Context) {
 		Passcode:    req.Passcode,
 		Cover:       req.Cover,
 		MediaType:   orDefaultMedia(req.MediaType),
+		// 手工建的资源也要记扩展名：转码判定靠它，不能只在导入链路上写。
+		Ext:         service.ExtOfName(req.Title),
 		Tags:        model.StringArray(req.Tags),
 		Status:      model.ResourceStatusUnknown,
 	}
@@ -523,6 +525,7 @@ func (h *ResourceHandler) Import(c *gin.Context) {
 			ShareURL:   it.ShareURL,
 			Passcode:   it.Passcode,
 			MediaType:  model.MediaTypeVideo,
+			Ext:        service.ExtOfName(title),
 			Status:     model.ResourceStatusUnknown,
 		}
 		if err := h.db.Create(res).Error; err == nil {

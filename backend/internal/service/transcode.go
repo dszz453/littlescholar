@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -548,30 +547,46 @@ func (s *TranscodeService) DiskUsage() int64 {
 	return size
 }
 
-// NeedsTranscode 判断某资源是否值得转码
+// NeedsTranscode 判断某资源是否必须转码才能播
 //
 // 判定逻辑（保守，宁可不转也不要白转）：
 //   - 非视频不转
 //   - 已是 HLS（.m3u8）不转，它本来就是流
-//   - 常见 MP4 + H.264 组合且时长较短，直链即可播，不转
-//   - 其他容器（mkv/avi/rmvb/flv/ts/wmv/mov）或时长很长、体积很大 → 转
+//   - 体积很大或时长很长 → 转（直链拖动体验差，转码收益明显）
+//   - 其余按**容器格式**判断：mkv/avi/rmvb/flv/ts/wmv/mov 等浏览器原生
+//     放不出来的一律转，mp4/m4v/webm 直链即可
+//
+// ⚠️ 这里曾经有一个隐蔽 bug，值得记一笔：
+// 老实现拿 `res.Title` 去判后缀，但资源入库时 Title **已经被剥掉扩展名**
+// （见 diskimport.Register，为了让列表干净）。于是 `.rmvb` 这类判断
+// 永远不成立 —— 线上表现就是"NAS 上的 rmvb 动画点开只有一句
+// 播放地址可能已过期"，而转码开关明明是打开的。
+// 现在改成读 model.Resource.Ext（新数据）并带 Title/FileID 兜底
+// （老数据），FileID 兜底尤其关键：WebDAV 的 FileID 就是带后缀的路径。
 func NeedsTranscode(res *model.Resource) bool {
 	if res == nil || res.MediaType != model.MediaTypeVideo {
 		return false
 	}
-	title := strings.ToLower(res.Title)
-	if strings.HasSuffix(title, ".m3u8") {
+	ext := ResourceExt(res)
+	// 已经是 HLS 清单，本身就是流，再转没有意义
+	if ext == "m3u8" {
 		return false
 	}
 	// 体积超过 300MB 或时长超过 10 分钟，直链拖动体验差，转码收益明显
 	if res.TotalSize > 300*1024*1024 || res.Duration > 600 {
 		return true
 	}
-	// 容器格式明确的，按扩展名判断
-	for _, ext := range []string{".mkv", ".avi", ".rmvb", ".rm", ".flv", ".wmv", ".mov", ".ts", ".mpg", ".mpeg", ".3gp"} {
-		if strings.HasSuffix(title, ext) {
-			return true
-		}
+	// 容器格式浏览器原生不支持 → 必须转
+	return NeedsTranscodeExt(ext)
+}
+
+// ContainerUnsupported 资源当前会不会因为"容器格式浏览器放不出来"而播不了。
+//
+// 用途是给前端一个**能解释得通**的错误提示：直链播放失败时，
+// 到底是"地址过期"还是"格式不支持"，两者给用户的操作完全不同。
+func ContainerUnsupported(res *model.Resource) bool {
+	if res == nil || res.MediaType != model.MediaTypeVideo {
+		return false
 	}
-	return false
+	return NeedsTranscodeExt(ResourceExt(res))
 }

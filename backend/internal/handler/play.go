@@ -133,7 +133,14 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	var transcodeTaskID uint64
 	var transcodeProgress int
 
-	if h.transcode != nil && h.transcode.Enabled() && !res.DirectPlay && service.NeedsTranscode(&res) {
+	// DirectPlay（搜全网的即时转存）默认跳过转码，保证"点了就播"。
+	//
+	// 但仅限于**浏览器原生放得出来**的容器。如果是一个 rmvb/mkv，
+	// 跳过转码换来的不是"秒播"，而是 <video> 抛 MediaError 加一句
+	// 让人摸不着头脑的"播放地址可能已过期"。这时候宁可贵几分钟。
+	skipTranscode := res.DirectPlay && !service.ContainerUnsupported(&res)
+
+	if h.transcode != nil && h.transcode.Enabled() && !skipTranscode && service.NeedsTranscode(&res) {
 		// EnsureHLS 会：已就绪→直接返回；未开始→入队并返回；进行中→返回进度
 		masterURL, ready, taskID, err := h.transcode.EnsureHLS(c.Request.Context(), &res)
 		switch {
@@ -150,11 +157,19 @@ func (h *PlayHandler) Info(c *gin.Context) {
 			transcodeTaskID = taskID
 			transcodeProgress = h.transcodeProgress(taskID)
 			// 转码期间先给出可播地址，前端可降级先播着，转好后再切 HLS。
-			// 这里同样要区分需不需要代理 —— WebDAV 直链不能直接给浏览器。
-			if link := h.directURL(&res); link != "" {
-				playURL = link
+			//
+			// 但**只对浏览器放得出来的容器**这么做。给一个 rmvb/mkv 的
+			// 直链不是"先播着"，而是必然抛 MediaError(4) —— 画面全黑，
+			// 还会把"正在转码中"的进度提示挤掉，用户看到的是莫名其妙的
+			// 播放失败。这种时候宁可让前端展示一个干净的"转码中"。
+			if !service.ContainerUnsupported(&res) {
+				if link := h.directURL(&res); link != "" {
+					playURL = link
+				} else {
+					playURL = res.ShareURL
+				}
 			} else {
-				playURL = res.ShareURL
+				playURL = ""
 			}
 		default:
 			// 转码不可用（引擎忙、ffmpeg 缺失等）→ 回退可播地址
@@ -187,6 +202,7 @@ func (h *PlayHandler) Info(c *gin.Context) {
 		"resourceId":        res.ID,
 		"title":             res.Title,
 		"mediaType":         mediaType,
+		"ext":               service.ResourceExt(&res),
 		"playMode":          playMode,
 		"url":               playURL,
 		"poster":            res.Cover,
@@ -196,6 +212,10 @@ func (h *PlayHandler) Info(c *gin.Context) {
 		"categoryName":      categoryNameOf(res.Category),
 		"transcodeTaskId":   transcodeTaskID,
 		"transcodeProgress": transcodeProgress,
+		// 浏览器放不出来的容器：前端据此给出「格式需要转码」而不是
+		// 含糊的「地址可能已过期」。转码成功进入 hls 模式后即为 false。
+		"containerUnsupported": service.ContainerUnsupported(&res) &&
+			playMode != "hls" && playMode != "transcoding",
 	})
 }
 

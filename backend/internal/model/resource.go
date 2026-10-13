@@ -39,7 +39,14 @@ type Resource struct {
 	FileID     string `gorm:"size:500" json:"fileId"`     // 网盘内文件ID
 
 	// 元信息
-	MediaType  string  `gorm:"size:20;index" json:"mediaType"`
+	MediaType string `gorm:"size:20;index" json:"mediaType"`
+	// Ext 文件扩展名（小写、不含点，如 "rmvb" / "mp4"）。
+	//
+	// 为什么必须单独存一列：Title 在入库时被刻意去掉了扩展名（列表更干净），
+	// 而"能不能直接交给浏览器播"完全取决于**容器格式** —— 拿 Title 判后缀
+	// 永远判不出来，结果 RMVB/AVI/MKV 这类浏览器原生不支持的资源从不触发
+	// 转码，一路直链送到 <video> 必然报错，前端只能提示"播放地址可能已过期"。
+	Ext        string  `gorm:"size:20" json:"ext"`
 	Cover      string  `gorm:"size:800" json:"cover"`
 	FileCount  int     `json:"fileCount"`
 	TotalSize  int64   `json:"totalSize"`

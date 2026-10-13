@@ -314,6 +314,40 @@ func TaskErrorText(prefix string, code int, msg string, missing, remain int64) s
 	return fmt.Sprintf("%s转存失败: code=%d", prefix, code)
 }
 
+// MediaHeaders 构造"向网盘 CDN 取流"时要带的请求头。
+//
+// 为什么统一在这里构造：这几个头不是可选的装饰，而是 **CDN 的准入凭证**，
+// 少一个就返回 4xx —— 而且是"接口能调通、资源能列出、一播就失败"的
+// 隐蔽故障。此前五个适配器各写各的 map，结果**全都漏了 Cookie**：
+// 夸克 CDN 直接回 412 Precondition Failed，用户看到的前端提示是
+// 「播放地址可能已过期」，与真实原因（缺鉴权头）完全不沾边。
+//
+// 实测证据（同一份签名直链、同样带 Range: bytes=0-1023）：
+//
+//	UA + Referer          -> 412 Precondition Failed
+//	UA                    -> 412
+//	不带任何头             -> 412
+//	UA + Cookie           -> 206 Content-Range: bytes 0-1023/111361619  video/mp4
+//	UA + Referer + Cookie -> 206 video/mp4
+//
+// 结论：Cookie 是必需项，UA/Referer 是兜底项，三个都带上最稳。
+//
+// 注意 cookie 为空时**不要写入该键**：部分 CDN 见到空 Cookie 头会
+// 判成非法请求，不如干脆不带。
+func MediaHeaders(userAgent, referer, cookie string) map[string]string {
+	h := make(map[string]string, 3)
+	if userAgent != "" {
+		h["User-Agent"] = userAgent
+	}
+	if referer != "" {
+		h["Referer"] = referer
+	}
+	if cookie != "" {
+		h["Cookie"] = cookie
+	}
+	return h
+}
+
 // humanSize 把字节数格式化成人类可读的大小（按 1024 进制）。
 func humanSize(n int64) string {
 	if n <= 0 {

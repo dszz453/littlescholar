@@ -38,6 +38,7 @@
         </div>
 
         <audio
+          v-if="info.url"
           ref="audioEl"
           :src="info.url"
           preload="metadata"
@@ -49,11 +50,19 @@
           @ended="onEnded"
           @error="onMediaError"
         />
+        <div v-else class="video-wait">
+          <div class="spinner big"></div>
+          <p class="prep-title">正在把这段音频转成能播的版本…</p>
+        </div>
       </section>
 
       <!-- 视频：原生 video，支持全屏与画中画 -->
       <section v-else-if="isVideo" class="media-area video-area">
+        <!-- 转码中且容器浏览器不支持时，后端不会给预览地址（给了也是黑屏）。
+             这里必须用 v-if 挡住 —— 渲染出 src="" 的 <video> 会被浏览器
+             当成"加载当前页面"，反而立刻触发一次 error。 -->
         <video
+          v-if="info.url"
           ref="videoEl"
           class="video"
           :src="info.url"
@@ -70,6 +79,10 @@
           @ended="onEnded"
           @error="onMediaError"
         />
+        <div v-else class="video-wait">
+          <div class="spinner big"></div>
+          <p class="prep-title">正在把这集转成能播的版本…</p>
+        </div>
         <p class="tip-lock">
           <span class="lock-emoji">🔒</span>
           播放中直接锁屏也不会停，把手机翻过来听也行
@@ -220,7 +233,7 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { playApi } from '@/api'
 import { tint } from '@/assets/icons'
@@ -236,6 +249,9 @@ const resourceId = computed(() => Number(route.params.id))
 const info = ref({})
 const loading = ref(true)
 const error = ref('')
+// errorRetried 防止"媒体报错 → 重取直链 → 又报错"打成死循环。
+// 一次播放生命周期内只自动重取一次，之后交给用户手动重试。
+let errorRetried = false
 
 const audioEl = ref(null)
 const videoEl = ref(null)
@@ -301,6 +317,7 @@ function fmtClock(sec) {
 async function load() {
   loading.value = true
   error.value = ''
+  errorRetried = false
   cleanupMedia()
   stopTranscodePolling()
 
@@ -371,13 +388,23 @@ function startTranscodePolling(taskId) {
         stopTranscodePolling()
         transcoding.value = false
         info.value = { ...info.value, ...st }
+        // 等 <video> 渲染出来再换源：容器不支持格式时元素本来不存在
+        // （被 v-if 挡住了），这一步不做的话 mediaEl() 会是 null。
+        await nextTick()
         await switchToHls(st.url, pos)
       } else if (mode === 'transcoding') {
         transcodeProgress.value = Number(st?.transcodeProgress) || 0
       } else {
-        // 回退到直链/外部：停止轮询，不再打扰
+        // 转码没能继续（失败/被关）：合并最新状态再决定怎么收场。
+        // 若依旧没有可播地址，说明格式浏览器放不出来且转码没成功，
+        // 这时候必须明确告诉用户，而不是留一个转圈的空页面。
         stopTranscodePolling()
         transcoding.value = false
+        info.value = { ...info.value, ...st }
+        if (!st?.url) {
+          const ext = String(st?.ext || '').toUpperCase()
+          error.value = `${ext ? '「' + ext + '」格式' : '这个格式'}需要转码才能播，但转码没有成功。请让家长检查后台的转码设置`
+        }
       }
     } catch {
       // 轮询失败不打断播放，下一轮再试
@@ -475,8 +502,63 @@ function onEnded() {
 }
 
 function onMediaError() {
-  // 直链过期是很常见的情况，给出可操作的提示而不是空白
-  error.value = '播放地址可能已过期，请返回重新进入'
+  const el = mediaEl()
+  const code = el && el.error ? el.error.code : 0
+
+  // —— 情况一：容器格式浏览器根本不支持（rmvb / avi / mkv …）——
+  //
+  // 这类资源后端本应转码后再给 HLS；能走到这里说明转码没排上
+  // （引擎正忙、转码被关、或这是绕过转码的即时播放）。
+  // 此时"播放地址可能已过期"是完全错误的引导 —— 用户会一直刷新重试，
+  // 而问题根本不在地址上。所以要说清楚是什么格式、该怎么办。
+  if (info.value?.containerUnsupported) {
+    const ext = String(info.value.ext || '').toUpperCase()
+    error.value = `${ext ? '「' + ext + '」格式' : '这个格式'}手机浏览器直接放不出来，需要转码。请让家长在后台开启转码，转好后再来看`
+    return
+  }
+
+  // —— 情况二：源不支持（网盘直链过期是真实且常见的情况）——
+  //
+  // 直链有效期通常只有几十分钟，孩子把页面挂在那儿过一会儿再点播放，
+  // 拿到的大概率已经是个死链。这种错误重取一次直链就能自愈，
+  // 所以先静默重试一次，别一上来就让用户去手动点。
+  if (code === 4 /* MEDIA_ERR_SRC_NOT_SUPPORTED */ && !errorRetried) {
+    errorRetried = true
+    // 稍微延迟一下：立刻重入会和此刻正在进行的错误处理抢媒体元素
+    setTimeout(() => reloadInfo(), 600)
+    return
+  }
+
+  error.value = code === 4
+    ? '这个视频暂时播不了，可能是地址过期或格式不支持，点下面重试一下'
+    : '播放地址可能已过期，请返回重新进入'
+}
+
+// reloadInfo 只重取播放信息并换源，不重置断点/播放列表。
+//
+// 和 load() 的区别：load() 会把整页打回 loading 态、清掉续播位置，
+// 对"直链过期"这种小故障来说太重了。
+async function reloadInfo() {
+  try {
+    const data = await playApi.info(resourceId.value)
+    if (!data?.url) throw new Error('no url')
+    // 地址没变说明重取也没用，直接给提示，别让孩子对着黑屏等
+    if (data.url === info.value.url) {
+      error.value = '这个视频暂时播不了，可能是地址过期或格式不支持，点下面重试一下'
+      return
+    }
+    info.value = { ...info.value, ...data }
+    error.value = ''
+    const pos = Number(data.lastPosition) || 0
+    await nextTick()
+    const el = mediaEl()
+    if (el && pos > 0) {
+      pendingSeek = pos
+    }
+    el?.load()
+  } catch {
+    error.value = '播放地址可能已过期，请返回重新进入'
+  }
 }
 
 /* ---------- 播放控制 ---------- */
@@ -860,6 +942,31 @@ watch(isPlaying, (v) => {
   background: #000;
   display: block;
   border-radius: 0;
+}
+/* 转码等待区：此时还没有可播地址，用一个安静的黑底占位替代 <video>，
+   避免出现"黑屏 + 报错"这种既没信息也没进展的中间态。 */
+.video-wait {
+  width: 100%;
+  min-height: 190px;
+  max-height: 62vh;
+  background: #000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+.video-wait .prep-title {
+  color: #fff;
+  font-size: 14px;
+  margin: 0;
+}
+/* 黑底上要把转圈的环改成亮色，否则默认的浅灰环几乎看不见 */
+.video-wait .spinner {
+  width: 40px;
+  height: 40px;
+  border-color: rgba(255, 255, 255, 0.22);
+  border-top-color: #fff;
 }
 .tip-lock {
   display: flex;
