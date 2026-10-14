@@ -1054,15 +1054,35 @@ func (b *Baidu) Transfer(ctx context.Context, cred *adapter.Credential, shareURL
 
 // ============ 播放 / 下载 ============
 
+// baiduDLItem /api/filemetas 的单条结果。
+//
+// ⚠️ 字段名与类型都踩过坑，逐条说明（2026-10-14 实测真实响应）：
+//
+//	{"errno":0,
+//	 "info":[{"dlink":"https://d.pcs.baidu.com/file/…?fid=…",
+//	          "size":"751828992","fs_id":"1114395303765791", …}],
+//	 "request_id":…}
+//
+//  1. 数组的键是 **info**，不是 list —— 旧代码写 `json:"list"`，于是
+//     `len(resp.List)==0` 恒成立，取直链**从来没成功过**，报错还很有迷惑性：
+//     `百度获取直链失败: errno=0`（errno 明明是 0，看起来"接口是好的"）。
+//  2. `dlink` 是**字符串**，不是 `{"dlink":"…"}` 那种嵌套对象 —— 旧代码按
+//     嵌套解析，即使键名改对了也还是空。
+//  3. `size` 是**字符串**（"751828992"），要用 flexInt64 兼容。
+//
+// 为兼容起见两种键名都接：Info 优先，回落 List。
+type baiduDLItem struct {
+	Dlink string    `json:"dlink"`
+	Size  flexInt64 `json:"size"`
+	FsID  flexInt64 `json:"fs_id"`
+}
+
+// GetDirectLink 获取直链
 func (b *Baidu) GetDirectLink(ctx context.Context, cred *adapter.Credential, fileID string) (*adapter.DirectLink, error) {
 	var resp struct {
-		Errno int `json:"errno"`
-		List  []struct {
-			Dlink struct {
-				Dlink string `json:"dlink"`
-			} `json:"dlink"`
-			Size flexInt64 `json:"size"`
-		} `json:"list"`
+		Errno int            `json:"errno"`
+		Info  []baiduDLItem  `json:"info"`
+		List  []baiduDLItem  `json:"list"`
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
@@ -1076,7 +1096,11 @@ func (b *Baidu) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 	if err != nil {
 		return nil, err
 	}
-	if len(resp.List) == 0 || resp.List[0].Dlink.Dlink == "" {
+	items := resp.Info
+	if len(items) == 0 {
+		items = resp.List
+	}
+	if len(items) == 0 || items[0].Dlink == "" {
 		return nil, fmt.Errorf("百度获取直链失败: errno=%d", resp.Errno)
 	}
 	// ⚠️ access_token 只能填**真正的 OAuth 令牌**，绝不能拿 BDUSS 去顶。
@@ -1103,7 +1127,7 @@ func (b *Baidu) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 	//     ">20MB 要改 UA"的传闻影响，故沿用客户端 UA。
 	//
 	// 账号若确实配了 OAuth（Extra 里有 access_token），那就用它。
-	link := resp.List[0].Dlink.Dlink
+	link := items[0].Dlink
 	if cred.Extra != nil {
 		if tok := cred.Extra["access_token"]; tok != "" {
 			link += "&access_token=" + tok
@@ -1111,7 +1135,7 @@ func (b *Baidu) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 	}
 	return &adapter.DirectLink{
 		URL:       link,
-		Size:      resp.List[0].Size.Int64(),
+		Size:      items[0].Size.Int64(),
 		ExpiresAt: time.Now().Add(8 * time.Hour).Unix(),
 		// d.pcs.baidu.com 会校验 BDUSS（不带就是 403 user not exists），
 		// 而 STOKEN 存在 Extra 里，所以这里要用 cookieOf 拼全，别直接给 cred.Cookie。
