@@ -1079,20 +1079,43 @@ func (b *Baidu) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 	if len(resp.List) == 0 || resp.List[0].Dlink.Dlink == "" {
 		return nil, fmt.Errorf("百度获取直链失败: errno=%d", resp.Errno)
 	}
-	// 百度直链需要追加 access_token（如果使用 OAuth），这里直接用 dlink + cookie 访问
+	// ⚠️ access_token 只能填**真正的 OAuth 令牌**，绝不能拿 BDUSS 去顶。
+	//
+	// 这里曾经写的是无条件 `link += "?access_token=" + extractBDUSS(cookie)`，
+	// 即把 BDUSS 当 access_token 拼上去。百度在 dlink 上先校验 access_token 再
+	// 看 Cookie，于是拿着一个格式合法的伪令牌直接被判死，**每一个百度资源都放不了**：
+	//
+	//	http=401 {"error_code":110,"error_msg":"Access token invalid or no longer valid"}
+	//
+	// 实测对照（同一个 717MB 的 mp4、同一条 dlink，见 .workbuddy/tmp/probe_baidu_dl.py）：
+	//
+	//	UA=netdisk;P2SP;…  +access_token=BDUSS  Cookie=有 → 401 error_code=110  ← 旧行为
+	//	UA=netdisk;P2SP;…  +access_token=BDUSS  Cookie=无 → 401 error_code=110
+	//	UA=netdisk;P2SP;…  不带 token            Cookie=有 → 206 video/mp4     ← 现在
+	//	UA=pan.baidu.com   不带 token            Cookie=有 → 206 video/mp4
+	//	UA=任意            不带 token            Cookie=无 → 403 error_code=31045 user not exists
+	//
+	// 两条结论：
+	//  1. 走 Cookie 鉴权时**必须不带 access_token**；反过来，只带 UA 不带 Cookie 也活不了，
+	//     所以 Cookie 是这条路的命根子（AList 那种"只带 UA"是因为它用的是真 OAuth 令牌、
+	//     走 /xpan/multimedia —— 我们试过该端点，Cookie 鉴权下恒 404）。
+	//  2. UA 不是关键：netdisk;P2SP;… 与 pan.baidu.com 都 206，717MB 也不受
+	//     ">20MB 要改 UA"的传闻影响，故沿用客户端 UA。
+	//
+	// 账号若确实配了 OAuth（Extra 里有 access_token），那就用它。
 	link := resp.List[0].Dlink.Dlink
-	if strings.Contains(link, "?") {
-		link += "&access_token=" + extractBDUSS(cred.Cookie)
-	} else {
-		link += "?access_token=" + extractBDUSS(cred.Cookie)
+	if cred.Extra != nil {
+		if tok := cred.Extra["access_token"]; tok != "" {
+			link += "&access_token=" + tok
+		}
 	}
 	return &adapter.DirectLink{
-		URL:          link,
-		Size:         resp.List[0].Size.Int64(),
-		ExpiresAt:    time.Now().Add(8 * time.Hour).Unix(),
-		// 百度 PCS 的下载域名（d.pcs.baidu.com）对部分文件会校验 BDUSS，
-		// 与其它网盘保持一致带上 Cookie，避免"换个文件就 403"。
-		Headers:      adapter.MediaHeaders(ua, "https://pan.baidu.com/", cred.Cookie),
+		URL:       link,
+		Size:      resp.List[0].Size.Int64(),
+		ExpiresAt: time.Now().Add(8 * time.Hour).Unix(),
+		// d.pcs.baidu.com 会校验 BDUSS（不带就是 403 user not exists），
+		// 而 STOKEN 存在 Extra 里，所以这里要用 cookieOf 拼全，别直接给 cred.Cookie。
+		Headers:      adapter.MediaHeaders(ua, "https://pan.baidu.com/", cookieOf(cred)),
 		AcceptRanges: true,
 	}, nil
 }
