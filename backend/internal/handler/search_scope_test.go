@@ -284,7 +284,72 @@ func TestSearchAllHitsCategoriesAndResources(t *testing.T) {
 	}
 }
 
-// TestSearchAllScopedByPermission 搜私有目录的名字也不能泄露。
+// TestSearchAllIgnoresSoftDeletedResources 目录资源数必须排除软删资源。
+//
+// 线上真实故障：资源表 963 行里 517 行是软删的，而统计走的是
+// Table("resources") —— 它绕过 gorm 的软删除条件，于是「牛津树英语」
+// 显示 465 个资源、孩子点进去一条都没有。数量与内容对不上比不显示更糟，
+// 孩子会以为"没了/坏了"。
+//
+// 这条测试守的是：聚合查询也必须继承 gorm 的软删语义。
+func TestSearchAllIgnoresSoftDeletedResources(t *testing.T) {
+	db := newSearchTestDB(t)
+	pubCat, _, pubRes, _ := seedSearchFixture(t, db)
+	kid := seedKid(t, db)
+	h := newScopedResourceHandler(db)
+
+	// 再挂两个同关键词的资源，然后软删掉
+	for _, title := range []string{"英语儿歌A", "英语儿歌B"} {
+		r := model.Resource{CategoryID: pubCat.ID, Title: title, MediaType: model.MediaTypeAudio}
+		mustCreate(t, db, &r)
+		if err := db.Delete(&model.Resource{}, r.ID).Error; err != nil {
+			t.Fatalf("软删资源失败: %v", err)
+		}
+	}
+
+	rec := callResourceGet(t, kid, "/api/app/search?keyword=%E8%8B%B1%E8%AF%AD", h.SearchAll)
+	data := decodeSearch(t, rec)
+
+	if len(data.Categories) != 1 {
+		t.Fatalf("命中目录 %d 个，期望 1 个：%+v", len(data.Categories), data.Categories)
+	}
+	if got := data.Categories[0].ResourceCount; got != 1 {
+		t.Errorf("目录 resourceCount=%d，期望 1（软删资源不应计入）", got)
+	}
+	if data.Resources.Total != 1 || len(data.Resources.List) != 1 {
+		t.Errorf("资源命中 total=%d list=%d，期望各为 1（软删资源不应出现）",
+			data.Resources.Total, len(data.Resources.List))
+	}
+	if len(data.Resources.List) == 1 && data.Resources.List[0].ID != pubRes.ID {
+		t.Errorf("命中资源 id=%d，期望 %d", data.Resources.List[0].ID, pubRes.ID)
+	}
+}
+
+// TestResourceListIgnoresSoftDeleted 列表同理：软删资源不能被列出来。
+func TestResourceListIgnoresSoftDeleted(t *testing.T) {
+	db := newSearchTestDB(t)
+	pubCat, _, pubRes, _ := seedSearchFixture(t, db)
+	kid := seedKid(t, db)
+	h := newScopedResourceHandler(db)
+
+	gone := model.Resource{CategoryID: pubCat.ID, Title: "已下架的视频", MediaType: model.MediaTypeVideo}
+	mustCreate(t, db, &gone)
+	if err := db.Delete(&model.Resource{}, gone.ID).Error; err != nil {
+		t.Fatalf("软删资源失败: %v", err)
+	}
+
+	rec := callResourceGet(t, kid, fmt.Sprintf("/api/app/resources?categoryId=%d", pubCat.ID), h.List)
+	page := decodeList(t, rec)
+
+	if page.Total != 1 {
+		t.Errorf("total=%d，期望 1（软删资源不应计入）", page.Total)
+	}
+	if len(page.List) != 1 || page.List[0].ID != pubRes.ID {
+		t.Errorf("列表=%+v，期望只有 id=%d", page.List, pubRes.ID)
+	}
+}
+
+
 func TestSearchAllScopedByPermission(t *testing.T) {
 	db := newSearchTestDB(t)
 	seedSearchFixture(t, db)

@@ -634,8 +634,15 @@ func (h *ResourceHandler) categoryMeta(scopeIDs []uint64, unrestricted bool) (ma
 
 	// 各目录的直接资源数。用 Rows() 手工扫描 —— Model().Scan(&自定义结构)
 	// 会按模型 schema 静默丢弃聚合别名列（详见笔记"GORM 聚合查询的静默丢列"）。
+	//
+	// ⚠️ 必须用 Model(&model.Resource{}) 而不是 Table("resources")：
+	// Table() 绕过 gorm 的软删除条件，会把已删资源一并算进来。
+	// 线上真实踩到：资源表 963 行里 517 行是软删的，"牛津树英语"在这种
+	// 口径下显示 465 个资源，孩子点进去一条都没有 —— 数量与内容对不上，
+	// 比不显示更让人困惑。Model() 让 gorm 自动补 `deleted_at IS NULL`，
+	// 与 List/Facets 走同一套口径。
 	direct := map[uint64]int64{}
-	q := h.db.Table("resources").Select("category_id, count(*) as total")
+	q := h.db.Model(&model.Resource{}).Select("category_id, count(*) as total")
 	if !unrestricted {
 		q = q.Where("category_id IN ?", scopeIDs)
 	}

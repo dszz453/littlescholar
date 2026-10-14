@@ -455,7 +455,9 @@ func (h *PlanHandler) weekStatOf(userID uint64, weekStart, weekEnd string) weekS
 // 用 Rows() 手工扫描而不是 Pluck：这里带了 GROUP BY + 聚合排序键，
 // Pluck 会自作主张重写 SELECT 列表（本项目已被 gorm 的"静默丢列"坑过一次）。
 func (h *PlanHandler) distinctRecentColumn(column string, userID uint64, from, to string, limit int) []string {
-	rows, err := h.db.Table("study_records").
+	// 用 Model 而不是 Table：Table("study_records") 会绕过 gorm 的软删除
+	// 条件，把已删记录也算进奖状文案里（孩子会看到自己没学过的内容）。
+	rows, err := h.db.Model(&model.StudyRecord{}).
 		Select(column).
 		Where("user_id = ? AND study_date >= ? AND study_date <= ?", userID, from, to).
 		Where(column + " <> ''").

@@ -263,10 +263,13 @@ func (h *StudyHandler) Records(c *gin.Context) {
 // （实测 `COUNT(*) AS times`、`MAX(happened_at) AS happened_at` 都扫不进来，
 // 不报错、直接给零值），踩过一次不想再踩。手工 Scan 按 SELECT 顺序取，稳。
 func (h *StudyHandler) recordsGroupedByResource(c *gin.Context, page, pageSize int, userID uint64) {
-	where := ""
+	// deleted_at IS NULL 必须显式写：裸 SQL 没有 gorm 的软删除兜底，
+	// 漏掉就会把已删学习记录算进来 —— 而同页其它统计走的是 Model()，
+	// 两边口径不一致时会出现"总时长 45 分钟、按资源加起来 30 分钟"。
+	where := " WHERE deleted_at IS NULL"
 	countArgs := []interface{}{}
 	if userID > 0 {
-		where = " WHERE user_id = ?"
+		where = " WHERE user_id = ? AND deleted_at IS NULL"
 		countArgs = append(countArgs, userID)
 	}
 

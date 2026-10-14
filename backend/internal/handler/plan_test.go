@@ -75,6 +75,40 @@ func seedPlayRecord(t *testing.T, db *gorm.DB, userID, catID uint64, catName, da
 	})
 }
 
+// TestDistinctRecentColumnIgnoresSoftDeleted 奖状文案不能引用已删的学习记录。
+//
+// 守的是 Table("study_records") 会绕过 gorm 软删条件这个问题：
+// 漏掉的话孩子会在奖状上看到自己其实已经删掉的内容，比不写更奇怪。
+func TestDistinctRecentColumnIgnoresSoftDeleted(t *testing.T) {
+	db := newPlanTestDB(t)
+	parent, _ := newPlanTree(t, db)
+	kid := seedPlanKid(t, db)
+	h := &PlanHandler{db: db}
+
+	today := "2026-10-14"
+	seedPlayRecord(t, db, kid.ID, parent.ID, parent.Name, today, 600)
+
+	gone := model.StudyRecord{
+		UserID: kid.ID, ResourceID: 2, CategoryID: parent.ID, CategoryName: "已删除的目录",
+		ResourceTitle: "不存在的课", Action: "play_progress", Duration: 600,
+		HappenedAt: parseDate(today).Add(11 * time.Hour), StudyDate: today, StudyHour: 11,
+	}
+	mustCreate(t, db, &gone)
+	if err := db.Delete(&model.StudyRecord{}, gone.ID).Error; err != nil {
+		t.Fatalf("软删记录失败: %v", err)
+	}
+
+	titles := h.distinctRecentColumn("resource_title", kid.ID, today, today, 10)
+	if len(titles) != 1 || titles[0] != "第一课" {
+		t.Errorf("去重标题=%v，期望只有 [第一课]（软删记录不应计入）", titles)
+	}
+	for _, n := range h.distinctRecentColumn("category_name", kid.ID, today, today, 10) {
+		if n == "已删除的目录" {
+			t.Errorf("奖状文案引用了已软删记录：%s", n)
+		}
+	}
+}
+
 // TestCheckInRequiresMinMinutes 未达最低时长不算打卡，达标后落一条记录。
 func TestCheckInRequiresMinMinutes(t *testing.T) {
 	db := newPlanTestDB(t)
