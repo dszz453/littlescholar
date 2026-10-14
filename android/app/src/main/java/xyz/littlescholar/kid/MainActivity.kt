@@ -24,8 +24,10 @@ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
  * 设计取舍说明：
  *  1. 采用 WebView 壳而非原生重写 —— 前端已是完整的 PWA，壳只需解决三件事：
  *     息屏播放、返回键、下载/外链。
- *  2. 服务器地址通过 BuildConfig.SITE_URL 注入，不在代码里写死，
- *     便于同一份代码打不同环境的包（家庭内网 / 公网域名）。
+ *  2. 服务器地址由**家长在应用内填写**并存在本地（见 ServerConfig）：
+ *     首次打开进设置页，之后长按屏幕即可改。BuildConfig.SITE_URL 只作为
+ *     首次的预填建议 —— 地址会变（内网 IP、公网端口都可能换），
+ *     写死就意味着每次都要重新打包分发。
  *  3. 不做离线缓存 —— 学习内容强依赖服务端鉴权与直链，离线包意义有限，
  *     且 PWA 自身的 Service Worker 已覆盖壳静态资源。
  */
@@ -33,6 +35,13 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private lateinit var swipe: SwipeRefreshLayout
+    private lateinit var root: FrameLayout
+
+    /** 当前生效的服务器地址（来自本地存储，家长可改）。 */
+    private var siteUrl: String = ""
+
+    /** 设置页；为 null 表示未显示。 */
+    private var setupView: ServerSetupView? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -49,8 +58,8 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         )
-        // 全屏视频播放的占位容器
-        val root = FrameLayout(this).apply {
+        // 全屏视频播放的占位容器（设置页也挂在它上面）
+        root = FrameLayout(this).apply {
             addView(
                 swipe,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -68,7 +77,10 @@ class MainActivity : AppCompatActivity() {
         // --- 系统返回键：优先让网页处理，否则退栈，最后才退出 App ---
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (webView.canGoBack()) {
+                // 设置页开着时，返回 = 关掉设置页（别把 App 退出）
+                if (setupView != null) {
+                    hideSetup()
+                } else if (webView.canGoBack()) {
                     webView.goBack()
                 } else {
                     isEnabled = false
@@ -77,7 +89,57 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        webView.loadUrl(BuildConfig.SITE_URL)
+        // 家长入口：长按屏幕任意处打开设置页（孩子不会误触长按）
+        swipe.setOnLongClickListener {
+            showSetup(null)
+            true
+        }
+
+        siteUrl = ServerConfig.get(this)
+        if (siteUrl.isEmpty()) {
+            // 首次使用：先让家长填地址，别直接白屏
+            showSetup(null)
+        } else {
+            loadSite()
+        }
+    }
+
+    /** 加载已配置的地址。 */
+    private fun loadSite() {
+        if (siteUrl.isEmpty()) return
+        swipe.isRefreshing = false
+        webView.loadUrl(siteUrl)
+    }
+
+    /** 显示「填写服务器地址」设置页。msg 非空时作为错误提示展示。 */
+    private fun showSetup(msg: String?) {
+        val existing = setupView
+        if (existing != null) {
+            existing.showError(msg)
+            existing.focusInput()
+            return
+        }
+        val view = ServerSetupView(this) { url ->
+            siteUrl = ServerConfig.set(this, url)
+            hideSetup()
+            loadSite()
+        }
+        view.showError(msg)
+        setupView = view
+        root.addView(
+            view,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        view.focusInput()
+    }
+
+    private fun hideSetup() {
+        val v = setupView ?: return
+        root.removeView(v)
+        setupView = null
     }
 
     private fun setupWebView(root: FrameLayout) {
@@ -121,8 +183,9 @@ class MainActivity : AppCompatActivity() {
                 request: WebResourceRequest
             ): Boolean {
                 val url = request.url.toString()
-                // 站内导航留在 WebView，外部链接交给系统浏览器
-                return if (url.startsWith(BuildConfig.SITE_URL)) {
+                // 站内导航留在 WebView，外部链接交给系统浏览器。
+                // 必须用**当前配置的**地址，不是 BuildConfig 里那个预填值。
+                return if (siteUrl.isNotEmpty() && url.startsWith(siteUrl)) {
                     false
                 } else {
                     startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
@@ -132,6 +195,25 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 swipe.isRefreshing = false
+            }
+
+            /**
+             * 主文档加载失败（地址填错 / 服务器没起 / 不在同一网络）时回到设置页。
+             *
+             * 没有这条兜底，孩子看到的是一片白屏，家长也不知道该改什么 ——
+             * "填错了能自己走回来"是这个页面的核心价值。
+             * 只对**主文档**且**当前配置地址下的**失败生效，
+             * 免得页面内某个子资源失败（比如某张封面图）也弹设置页。
+             */
+            override fun onReceivedError(
+                view: WebView,
+                request: WebResourceRequest,
+                error: android.webkit.WebResourceError
+            ) {
+                if (!request.isForMainFrame) return
+                val failed = request.url.toString()
+                if (siteUrl.isEmpty() || !failed.startsWith(siteUrl)) return
+                showSetup("连不上 $siteUrl\n请检查：设备是否和服务器在同一网络、地址和端口是否写对、服务是否在运行。")
             }
         }
 

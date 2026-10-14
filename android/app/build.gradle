@@ -3,11 +3,11 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-// ============ 服务器地址 ============
-// 通过 -PsiteUrl=xxx 覆盖；不传则用下面的默认值。
-// 打包示例：
-//   ./gradlew assembleRelease -PsiteUrl=https://kid.example.com
-def siteUrl = project.hasProperty('siteUrl') ? project.siteUrl : 'http://192.168.1.100:8091'
+// ============ 服务器地址（只是"首次预填建议"）============
+// 真正的地址由家长在 App 内填写并存在本地（见 ServerConfig.kt），
+// 这里注入的 BuildConfig.SITE_URL 仅作为首次打开时的预填值，
+// 所以换个地址**不需要重新打包**。想改预填值用 -PsiteUrl=xxx。
+def siteUrl = project.hasProperty('siteUrl') ? project.siteUrl : 'http://fn.19860819.xyz:8093'
 
 android {
     namespace 'xyz.littlescholar.kid'

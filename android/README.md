@@ -9,6 +9,7 @@ WebView 套壳工程。把已经做好的孩子端 PWA 包成 APK，额外解决
 | 后台播放 | 依赖浏览器策略 | 不调 `WebView.onPause()` |
 | 系统返回键 | 无 | 接管为页面后退 |
 | 全屏视频 | 有 | 有（`onShowCustomView`） |
+| 服务器地址 | 只能是书签里那一个 | **应用内填写**，换地址不用重装（长按屏幕即可改） |
 
 ---
 
@@ -25,6 +26,29 @@ WebView 套壳工程。把已经做好的孩子端 PWA 包成 APK，额外解决
 
 ---
 
+## 首次使用：填服务器地址
+
+装好打开 App，**第一次进入的是设置页**，让家长填服务器地址（例如
+`http://192.168.31.220:8093` 或 `http://fn.19860819.xyz:8093`）。
+不用带 `http://`，程序会自动补；地址保存在本地，之后每次直接进孩子端。
+
+设置页有三个入口：
+
+| 入口 | 场景 |
+|---|---|
+| 首次打开（没存过地址） | 装完第一次用 |
+| **长按屏幕任意处** | 家长要换地址（孩子不会误触长按） |
+| **页面加载失败时自动弹出** | 地址填错 / 服务器没起 / 不在同一网络 |
+
+第三条是关键：没有它，填错地址就是一片白屏，家长也不知道该改什么。
+错误提示里会带上"当前尝试的地址"，方便对着改。
+
+> 为什么不做成打包时写死：内网 IP 会随路由器分配变，公网端口也可能换。
+> 写死意味着每换一次地址就要重新打包、重新分发、重新安装。
+> 现在 `-PsiteUrl=` 注入的 `BuildConfig.SITE_URL` **只作为首次的预填建议**。
+
+---
+
 ## 目录结构
 
 ```
@@ -36,6 +60,8 @@ android/
 │       ├── AndroidManifest.xml          # 权限 + 前台服务声明
 │       ├── java/xyz/littlescholar/kid/
 │       │   ├── MainActivity.kt          # WebView 宿主
+│       │   ├── ServerConfig.kt          # 服务器地址的本地存储与归一化
+│       │   ├── ServerSetupView.kt       # 「填写服务器地址」设置页
 │       │   └── MediaPlaybackService.kt  # 息屏播放保障
 │       └── res/
 │           ├── drawable/                # 通知图标 + 自适应图标前景
@@ -97,12 +123,15 @@ clone 下来直接跑 `./gradlew` 即可，本机不需要预装 Gradle。
 ```bash
 cd android
 
-# 指定服务器地址（必填，否则用默认内网地址）
-./gradlew assembleDebug -PsiteUrl=http://192.168.1.100:8091
+# debug 包（地址在 App 内填，这里不传也能直接打）
+./gradlew assembleDebug
 
-# Release（需自行配置签名）
+# 想换"首次预填的地址"（不是必须的）：
+./gradlew assembleDebug -PsiteUrl=http://192.168.31.220:8093
 ./gradlew assembleRelease -PsiteUrl=https://kid.example.com
 ```
+
+Windows 下若 `./gradlew` 不可执行，用 `sh gradlew assembleDebug`。
 
 产物位置：`app/build/outputs/apk/debug/app-debug.apk`
 
@@ -184,14 +213,24 @@ keytool -genkey -v -keystore keystore.jks -keyalg RSA \
 
 ---
 
-## 未验证部分
+## 构建环境（本机已跑通的那一套）
 
-⚠️ 本文档所述构建流程**未在本机执行**（本机无 Android SDK / JDK 环境）。
-代码基于 Android 官方文档与 WebView 媒体播放的通行实践编写，
-但以下环节需要实际构建后才能确认：
+| 组件 | 版本 | 位置 |
+|---|---|---|
+| JDK | Temurin **17.0.20.1** | `~/.workbuddy/toolchains/jdk17/jdk-17.0.20.1+1` |
+| Android SDK | Platform **34** + Build-Tools **34.0.0** + platform-tools | `~/.workbuddy/toolchains/sdk` |
+| Gradle | **8.9**（wrapper 自带，从阿里云镜像拉） | 无需预装 |
+
+`android/local.properties` 里的 `sdk.dir` 指向上面的 SDK（该文件已被 `.gitignore` 忽略）。
+
+---
+
+## 还没验证的部分
+
+`assembleDebug` 已在本机跑通并产出 APK，**静态构建层面没有未知数**。
+但以下只能在真机上确认：
 
 - 前台服务的 `foregroundServiceType="mediaPlayback"` 在 Android 14 上的行为
-- `Proxy` 无关，但 `onShowCustomView` 的全屏切换在国产 ROM 上的表现
-- 各厂商 WebView 对 `MediaSession` 的支持完整度
-
-建议先打 `assembleDebug` 在真机上跑通，再处理签名与发布。
+- `onShowCustomView` 的全屏切换在国产 ROM 上的表现
+- 各厂商 WebView 对 `MediaSession` 的支持完整度（旧内核可能不支持 `seekto`，代码里已 try/catch 降级）
+- 国产 ROM 的电池策略仍需家长手动设为「无限制」，否则息屏播一会儿仍可能被系统杀掉

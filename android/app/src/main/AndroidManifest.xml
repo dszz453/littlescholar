@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="xyz.littlescholar.kid">
+<!-- 不要在这里写 package=：AGP 8 起已忽略该属性（改用 build.gradle 的 namespace），
+     留着只会得到一条 "Setting the namespace via the package attribute ... is no longer
+     supported" 警告。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
