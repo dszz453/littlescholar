@@ -31,6 +31,14 @@ type Deps struct {
 	Pool      *task.WorkerPool
 	Transcode *service.TranscodeService
 	StartedAt time.Time
+
+	// AI / Plan 由 main 预先构造后传入。
+	//
+	// 为什么不在这里 new：周奖状的定时生成是在 main 里挂到优雅退出链上的
+	// （`defer stopAward()`），main 必须拿得到同一个 PlanHandler 实例。
+	// 留空时下面会兜底自建，保证单独调用 Setup 的场景（测试）仍可用。
+	AI   *handler.AIHandler
+	Plan *handler.PlanHandler
 }
 
 // Setup 装配路由
@@ -56,7 +64,14 @@ func Setup(deps *Deps) *gin.Engine {
 	userH := handler.NewUserHandler(deps.DB, deps.Perm)
 	diskH := handler.NewDiskHandler(deps.DB, deps.Encryptor)
 	transferH := handler.NewTransferHandler(deps.DB, deps.Encryptor, deps.Pool)
-	aiH := handler.NewAIHandler(deps.DB, deps.Encryptor)
+	aiH := deps.AI
+	if aiH == nil {
+		aiH = handler.NewAIHandler(deps.DB, deps.Encryptor)
+	}
+	planH := deps.Plan
+	if planH == nil {
+		planH = handler.NewPlanHandler(deps.DB, deps.Perm, aiH)
+	}
 	studyH := handler.NewStudyHandler(deps.DB, aiH)
 	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret)
 	streamH := handler.NewStreamHandler(deps.DB, deps.Encryptor, deps.Cfg.JWT.Secret)
@@ -211,7 +226,15 @@ func Setup(deps *Deps) *gin.Engine {
 
 		app.GET("/categories/tree", categoryH.AppTree)
 
-		app.GET("/resources", resourceH.List) // 复用，权限在 AppTree 层面已过滤
+		// 「找一找」：系统内全文检索，一次返回命中的目录 + 资源。
+		// 与 admin 的 /search（PanSou 全网搜）不是一回事。
+		app.GET("/search", resourceH.SearchAll)
+
+		// 注意：下面三条**在 handler 内部**做权限收口
+		// （scopedCategoryIDs → PermissionService.AccessibleCategoryIDs）。
+		// 早先这里写着"权限在 AppTree 层面已过滤"，那只对目录树成立，
+		// 资源接口本身可以被孩子用越权的 categoryId 直接读。
+		app.GET("/resources", resourceH.List)
 		// facets 必须注册在 /:id 之前，否则会被当成资源 ID
 		app.GET("/resources/facets", resourceH.Facets)
 		app.GET("/resources/:id", resourceH.Detail)
@@ -226,6 +249,18 @@ func Setup(deps *Deps) *gin.Engine {
 		// 学习记录明细。孩子端「我的 → 学习记录」用 groupBy=resource
 		// 拿按资源聚合后的列表（否则 15 秒一条的心跳会把同一个资源刷屏）。
 		app.GET("/study/records", studyH.Records)
+
+		// 学习计划 / 每日打卡 / 每周 AI 奖状
+		app.GET("/study/plans", planH.List)
+		app.POST("/study/plans", planH.Create)
+		app.PUT("/study/plans/:id", planH.Update)
+		app.DELETE("/study/plans/:id", planH.Delete)
+		// 今日总览：孩子一进计划页就据此决定提示「今天还没打卡」还是「已完成」。
+		// 刻意不写成 /study/plans/today —— 那会和上面的 /study/plans/:id
+		// 落在同一层，靠"静态段优先于通配符"的隐含规则才不出错，太脆。
+		app.GET("/study/today", planH.Today)
+		app.GET("/study/awards", planH.Awards)
+		app.POST("/study/awards/refresh", planH.RefreshAward)
 	}
 
 	// ============ 播放（后台 + C端通用，需登录）============

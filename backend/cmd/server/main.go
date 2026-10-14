@@ -14,6 +14,7 @@ import (
 	"github.com/littlescholar/core/internal/adapter"
 	"github.com/littlescholar/core/internal/cache"
 	"github.com/littlescholar/core/internal/config"
+	"github.com/littlescholar/core/internal/handler"
 	"github.com/littlescholar/core/internal/model"
 	"github.com/littlescholar/core/internal/router"
 	"github.com/littlescholar/core/internal/service"
@@ -257,6 +258,12 @@ func main() {
 	}
 
 	// 8. 装配路由
+	//
+	// AI / Plan 两个 handler 先在这里建好再交给路由：PlanHandler 的
+	// 周奖状定时任务要在下面挂到优雅退出链上，main 必须持有同一实例。
+	aiHandler := handler.NewAIHandler(db, encryptor)
+	planHandler := handler.NewPlanHandler(db, permService, aiHandler)
+
 	engine := router.Setup(&router.Deps{
 		DB:        db,
 		Cfg:       cfg,
@@ -270,7 +277,17 @@ func main() {
 		Pool:      pool,
 		Transcode: transcodeSvc,
 		StartedAt: startedAt,
+		AI:        aiHandler,
+		Plan:      planHandler,
 	})
+
+	// 8.1 每周 AI 奖状
+	//
+	// 每天扫一次：打卡在任意时刻发生，每天检查能保证"本周达标"最迟第二天
+	// 就有奖状。首次延迟 5 分钟，避开启动高峰（此刻还在跑首次转码自检等）。
+	// 生成是幂等的（同一用户同一周只发一张），重复跑不会重复颁奖。
+	stopAward := planHandler.StartAwardScheduler(logger, 24*time.Hour, 5*time.Minute)
+	defer stopAward()
 
 	// 9. 启动 HTTP 服务
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)

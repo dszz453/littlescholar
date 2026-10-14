@@ -30,6 +30,16 @@
     </header>
 
     <div class="page-pad">
+      <!-- 学习计划入口 -->
+      <div class="entry pressable" @click="goPlan">
+        <span class="e-ico">🎯</span>
+        <div class="e-body">
+          <div class="e-title">学习计划</div>
+          <div class="e-sub">{{ planHint }}</div>
+        </div>
+        <span class="e-arrow">›</span>
+      </div>
+
       <!-- 标签切换 -->
       <div class="tabs">
         <button
@@ -98,7 +108,7 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ResourceCard from '@/components/ResourceCard.vue'
 import { useUserStore } from '@/stores/user'
-import { playApi, studyApi } from '@/api'
+import { playApi, studyApi, planApi } from '@/api'
 
 const route = useRoute()
 const router = useRouter()
@@ -109,6 +119,8 @@ const loading = ref(false)
 const history = ref([])
 const records = ref([])
 const stats = ref(null)
+// 计划入口副标题：让「我的」页一眼看出今天有没有任务
+const planHint = ref('看看我的学习计划')
 
 const tabs = [
   { key: 'history', label: '最近听过' },
@@ -191,6 +203,28 @@ async function doLogout() {
   router.replace({ name: 'login' })
 }
 
+function goPlan() {
+  router.push({ name: 'plan' })
+}
+
+// loadPlanHint 取今日计划状态，作为入口卡片的一句提示。
+// 这里只做展示，真正的打卡判定与恭喜弹窗都在计划页里。
+async function loadPlanHint() {
+  try {
+    const d = await planApi.today()
+    if (!d?.hasPlan) {
+      planHint.value = '给自己定个小目标吧'
+    } else if (d.completed) {
+      planHint.value = '今天已完成，真棒 ✅'
+    } else {
+      const left = (d.plans || []).filter((p) => !p.todayCompleted).length
+      planHint.value = `今天还有 ${left} 个计划没完成`
+    }
+  } catch {
+    planHint.value = '看看我的学习计划'
+  }
+}
+
 function goPlay(r) {
   // 播放历史用 r.id（资源 ID），学习记录是聚合行，用 r.resourceId
   const id = r.id || r.resourceId
@@ -202,6 +236,7 @@ onMounted(() => {
   // 支持从首页"全部"跳过来直接定位到历史 tab
   if (route.query.tab === 'history') tab.value = 'history'
   loadStats()
+  loadPlanHint()
   load()
 })
 
@@ -271,6 +306,41 @@ watch(tab, load)
   width: 1px;
   height: 28px;
   background: var(--c-border);
+}
+
+/* ===== 学习计划入口 ===== */
+
+.entry {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 14px 15px;
+  background: #fff;
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+}
+.e-ico {
+  font-size: 26px;
+  line-height: 1;
+}
+.e-body {
+  flex: 1;
+  min-width: 0;
+}
+.e-title {
+  font-size: 16px;
+  font-weight: 700;
+}
+.e-sub {
+  margin-top: 2px;
+  font-size: 12.5px;
+  color: var(--c-text-sub);
+}
+.e-arrow {
+  color: #b9c4d2;
+  font-size: 20px;
+  line-height: 1;
 }
 
 /* ===== 标签 ===== */

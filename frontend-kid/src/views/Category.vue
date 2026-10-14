@@ -114,8 +114,12 @@ async function fetchResources(reset = true) {
       categoryId: nodeId.value,
       page: page.value,
       pageSize,
-      // 直接列出该目录（含子目录）的资源
-      includeChildren: true,
+      // 只列**本层直属**资源，不递归子目录 —— 子目录已经在上面「分类」
+      // 里单独列成卡片了，再带上它们的资源会重复、页面长一倍。
+      //
+      // 这里原先传的是 includeChildren（后端只认 includeSub），从来就没
+      // 生效过。不生效恰好就是想要的行为，所以直接把参数删掉，
+      // 别留一个看着像"功能没开"的悬空参数。
     })
     const list = data?.list || []
     total.value = data?.total ?? list.length

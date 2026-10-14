@@ -38,6 +38,12 @@ const routes = [
     meta: { title: '我的' },
   },
   {
+    path: '/plan',
+    name: 'plan',
+    component: () => import('@/views/Plan.vue'),
+    meta: { title: '学习计划' },
+  },
+  {
     path: '/play/:id',
     name: 'play',
     component: () => import('@/views/Play.vue'),

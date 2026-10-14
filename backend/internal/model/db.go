@@ -49,7 +49,46 @@ func InitDB(driver, dsn string, debug bool) (*gorm.DB, error) {
 	if err := AutoMigrate(db); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
+
+	// 全文检索基础设施（仅 PostgreSQL）。
+	//
+	// 失败只警告不返回错误：索引纯粹是性能优化，没有它「找一找」的结果
+	// 依然正确，只是 `ILIKE '%kw%'` 会退化成全表扫。为了一个可选优化
+	// 让整个服务起不来，代价不对等。
+	if driver == "postgres" {
+		if err := ensureSearchIndexes(db); err != nil {
+			log.Printf("[db] 警告: 全文检索索引创建失败（搜索仍可用，但会变慢）: %v", err)
+		}
+	}
 	return db, nil
+}
+
+// ensureSearchIndexes 为「找一找」准备 pg_trgm 全文检索索引。
+//
+// 为什么是 pg_trgm 而不是 tsvector：
+//   - tsvector 依赖分词，而中文没有内置分词器（zhparser / pg_jieba 都要
+//     自己编译 PostgreSQL 镜像），成本高、收益不确定。
+//   - pg_trgm 用三元组做相似匹配，`ILIKE '%关键词%'` 能直接命中 GIN 索引，
+//     中英文都有效，且**不需要改表结构**。
+//
+// 注意这是原生 DDL —— GORM 的 struct tag 表达不了 `USING gin (...)` 这种
+// 表达式索引，只能手工执行。sqlite（单测环境）没有 pg_trgm，故只对
+// postgres 调用。
+func ensureSearchIndexes(db *gorm.DB) error {
+	stmts := []string{
+		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_title_trgm ON resources USING gin (title gin_trgm_ops)`,
+		`CREATE INDEX IF NOT EXISTS idx_resources_desc_trgm ON resources USING gin (description gin_trgm_ops)`,
+		`CREATE INDEX IF NOT EXISTS idx_categories_name_trgm ON categories USING gin (name gin_trgm_ops)`,
+		`CREATE INDEX IF NOT EXISTS idx_categories_desc_trgm ON categories USING gin (description gin_trgm_ops)`,
+	}
+	for _, s := range stmts {
+		if err := db.Exec(s).Error; err != nil {
+			return fmt.Errorf("%s: %w", s, err)
+		}
+	}
+	log.Printf("[db] 全文检索索引已就绪（pg_trgm + GIN）")
+	return nil
 }
 
 // AllModels 所有需要迁移的模型
@@ -67,6 +106,9 @@ func AllModels() []interface{} {
 		&TranscodeTask{},
 		&PlayRecord{},
 		&StudyRecord{},
+		&StudyPlan{},
+		&StudyCheckIn{},
+		&StudyAward{},
 		&AIConfig{},
 		&AIReport{},
 		&AIChatSession{},

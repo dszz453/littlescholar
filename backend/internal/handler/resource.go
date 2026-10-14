@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -11,6 +12,60 @@ import (
 	"github.com/littlescholar/core/internal/util"
 	"gorm.io/gorm"
 )
+
+// likeOp 返回当前方言下"大小写不敏感的模糊匹配"操作符。
+//
+// 为什么要区分，而不是统一写 ILIKE：
+//   - PostgreSQL 的 LIKE 区分大小写，ILIKE 不区分；且只有 ILIKE 能命中
+//     `gin (title gin_trgm_ops)` 索引（配合 InitDB 里建的 pg_trgm 扩展）。
+//   - SQLite（单测环境）**根本没有 ILIKE**，写了会直接报语法错。
+//     它的 LIKE 对 ASCII 本就大小写不敏感，行为上与 ILIKE 等价。
+func likeOp(db *gorm.DB) string {
+	if db != nil && db.Dialector != nil && db.Dialector.Name() == "postgres" {
+		return "ILIKE"
+	}
+	return "LIKE"
+}
+
+// scopedCategoryIDs 求当前请求可见的目录 ID 集合。
+//
+// 返回 unrestricted=true 表示不受限（管理员，可见全部）。
+//
+// 背景：`/app/resources`、`/app/resources/facets`、`/app/resources/:id`
+// 三条路由此前**完全没有权限过滤** —— router 里的注释「权限在 AppTree
+// 层面已过滤」只对目录树成立，资源接口本身可以被孩子用任意 categoryId
+// 直接读。收口必须复用 AppTree 用的同一个 PermissionService，否则
+// 目录树看得见/看不见与资源读得到/读不到会两套口径。
+func (h *ResourceHandler) scopedCategoryIDs(c *gin.Context) (ids []uint64, unrestricted bool, err error) {
+	if util.IsAdmin(c) {
+		return nil, true, nil
+	}
+	user := currentUser(c)
+	if user == nil {
+		// 理论上 app 组必经 RequireActiveUser、user 一定存在。
+		// 真走到这里说明中间件链被改动过 —— 按"什么都看不到"处理，
+		// 安全优先，不因为配置疏漏而泄露数据。
+		return []uint64{}, false, nil
+	}
+	ids, all, err := h.perm.AccessibleCategoryIDs(user)
+	if err != nil {
+		return nil, false, err
+	}
+	return ids, all, nil
+}
+
+// allowCategoryID 判断目录是否在可见集合内
+func allowCategoryID(ids []uint64, unrestricted bool, categoryID uint64) bool {
+	if unrestricted {
+		return true
+	}
+	for _, id := range ids {
+		if id == categoryID {
+			return true
+		}
+	}
+	return false
+}
 
 // ResourceHandler 资源管理
 type ResourceHandler struct {
@@ -99,6 +154,22 @@ func (h *ResourceHandler) List(c *gin.Context) {
 	includeSub := c.Query("includeSub") == "true"
 
 	q := h.db.Model(&model.Resource{})
+
+	// 权限收口：孩子只应看到自己有权限的目录下的资源。
+	// 管理员 unrestricted=true，不加任何限制。
+	scopeIDs, unrestricted, err := h.scopedCategoryIDs(c)
+	if err != nil {
+		util.ServerError(c, "权限校验失败")
+		return
+	}
+	if !unrestricted {
+		if len(scopeIDs) == 0 {
+			util.Page(c, 0, page, pageSize, []model.Resource{})
+			return
+		}
+		q = q.Where("category_id IN ?", scopeIDs)
+	}
+
 	if categoryID > 0 {
 		if includeSub {
 			var cat model.Category
@@ -113,7 +184,7 @@ func (h *ResourceHandler) List(c *gin.Context) {
 		}
 	}
 	if keyword != "" {
-		q = q.Where("title LIKE ?", "%"+keyword+"%")
+		q = q.Where("title "+likeOp(h.db)+" ?", "%"+keyword+"%")
 	}
 	if diskType != "" {
 		q = q.Where("disk_type = ?", diskType)
@@ -146,36 +217,62 @@ func (h *ResourceHandler) Facets(c *gin.Context) {
 	categoryID := util.GetUintQuery(c, "categoryId", 0)
 
 	q := h.db.Model(&model.Resource{})
+
+	// 与 List 同一套权限收口：facets 会泄露"某个目录下有多少资源"，
+	// 不做过滤的话越权用户能靠数量推断出隐藏目录的内容规模。
+	scopeIDs, unrestricted, err := h.scopedCategoryIDs(c)
+	if err != nil {
+		util.ServerError(c, "权限校验失败")
+		return
+	}
+	if !unrestricted {
+		if len(scopeIDs) == 0 {
+			util.OK(c, gin.H{"total": 0, "diskTypes": []gin.H{}})
+			return
+		}
+		q = q.Where("category_id IN ?", scopeIDs)
+	}
+
 	if keyword != "" {
-		q = q.Where("title LIKE ?", "%"+keyword+"%")
+		q = q.Where("title "+likeOp(h.db)+" ?", "%"+keyword+"%")
 	}
 	if categoryID > 0 {
 		q = q.Where("category_id = ?", categoryID)
 	}
 
-	var rows []struct {
-		DiskType string `json:"diskType"`
-		Total    int64  `json:"total"`
-	}
-	if err := q.Select("disk_type, count(*) as total").Group("disk_type").Scan(&rows).Error; err != nil {
+	// ⚠️ 不用 Model().Select("... AS total").Scan(&自定义结构)：
+	// gorm 会拿 Model 的 schema 核对返回列，别名 total 不在 Resource
+	// 字段里就被静默丢弃（Total 恒为 0、不报错，SQLite 上还看不出来）。
+	// 用 Rows() 手工按序扫描，只认 SELECT 顺序，与驱动无关。
+	rows, err := q.Select("disk_type, count(*) as total").Group("disk_type").Rows()
+	if err != nil {
 		util.ServerError(c, "统计失败")
 		return
 	}
+	defer rows.Close()
 
-	list := make([]gin.H, 0, len(rows)+1)
+	list := make([]gin.H, 0, 8)
 	var total int64
-	for _, r := range rows {
-		total += r.Total
-		if r.DiskType == "" {
+	for rows.Next() {
+		var (
+			diskType string
+			cnt      int64
+		)
+		if err := rows.Scan(&diskType, &cnt); err != nil {
+			util.ServerError(c, "统计失败")
+			return
+		}
+		total += cnt
+		if diskType == "" {
 			// 手工创建、没有绑定网盘的资源归到"系统资源"
-			list = append(list, gin.H{"diskType": "", "name": "系统资源", "total": r.Total})
+			list = append(list, gin.H{"diskType": "", "name": "系统资源", "total": cnt})
 			continue
 		}
-		name := adapter.DiskTypeNames[adapter.DiskType(r.DiskType)]
+		name := adapter.DiskTypeNames[adapter.DiskType(diskType)]
 		if name == "" {
-			name = r.DiskType
+			name = diskType
 		}
-		list = append(list, gin.H{"diskType": r.DiskType, "name": name, "total": r.Total})
+		list = append(list, gin.H{"diskType": diskType, "name": name, "total": cnt})
 	}
 	util.OK(c, gin.H{"total": total, "diskTypes": list})
 }
@@ -192,6 +289,19 @@ func (h *ResourceHandler) Detail(c *gin.Context) {
 		util.NotFound(c, "资源不存在")
 		return
 	}
+
+	// 权限收口：资源详情会带出 ShareURL/FileID 等可直接取流的信息，
+	// 比列表更敏感，必须逐条校验所属目录的可见性。
+	scopeIDs, unrestricted, err := h.scopedCategoryIDs(c)
+	if err != nil {
+		util.ServerError(c, "权限校验失败")
+		return
+	}
+	if !allowCategoryID(scopeIDs, unrestricted, res.CategoryID) {
+		util.NotFound(c, "资源不存在")
+		return
+	}
+
 	util.OK(c, res)
 }
 
@@ -389,6 +499,207 @@ func orDefaultMedia(m string) string {
 		return model.MediaTypeVideo
 	}
 	return m
+}
+
+// ============ 找一找（系统内全文检索）============
+
+// searchCategoryLimit 目录命中上限。
+// 目录是"往里走"的入口，没必要翻页；50 条足够覆盖任何合理的关键词。
+const searchCategoryLimit = 50
+
+// searchCategoryItem 目录搜索结果项
+type searchCategoryItem struct {
+	ID            uint64 `json:"id"`
+	Name          string `json:"name"`
+	Icon          string `json:"icon"`
+	Color         string `json:"color"`
+	Level         int    `json:"level"`
+	Path          string `json:"path"`
+	Breadcrumb    string `json:"breadcrumb"`    // 祖先名 / 自身名
+	ResourceCount int64  `json:"resourceCount"` // 含子孙
+}
+
+// SearchAll 「找一找」：一次请求同时返回命中的**目录**与**资源**。
+//
+// 与下面 admin 的 Search（PanSou 全网搜）毫无关系 —— 这里只搜系统内
+// 已收录的内容，数据边界严格等于孩子的可见目录集合。
+// 需求里的"全文检索"在中文场景下的落地方式：
+//   - PostgreSQL 走 `ILIKE '%kw%'`，由 InitDB 建的 pg_trgm GIN 索引支撑。
+//     不建索引的话前置 `%` 会让 btree 彻底失效、退化成全表扫。
+//   - 表结构不变（不引入 tsvector —— 中文没有内置分词，tsvector 用不了）。
+//
+// 资源匹配 title 或 description；目录匹配 name 或 description。
+func (h *ResourceHandler) SearchAll(c *gin.Context) {
+	keyword := strings.TrimSpace(c.Query("keyword"))
+	diskType := c.Query("diskType")
+	page, pageSize := util.GetPage(c)
+
+	empty := gin.H{
+		"keyword":    keyword,
+		"categories": []searchCategoryItem{},
+		"resources": util.PageData{
+			Total: 0, Page: page, PageSize: pageSize, List: []model.Resource{},
+		},
+	}
+	if keyword == "" {
+		util.OK(c, empty)
+		return
+	}
+
+	scopeIDs, unrestricted, err := h.scopedCategoryIDs(c)
+	if err != nil {
+		util.ServerError(c, "权限校验失败")
+		return
+	}
+	if !unrestricted && len(scopeIDs) == 0 {
+		util.OK(c, empty)
+		return
+	}
+
+	op := likeOp(h.db)
+	like := "%" + keyword + "%"
+
+	// ---- 目录命中 ----
+	catQuery := h.db.Model(&model.Category{}).
+		Where("name "+op+" ? OR description "+op+" ?", like, like)
+	if !unrestricted {
+		catQuery = catQuery.Where("id IN ?", scopeIDs)
+	}
+	var cats []model.Category
+	if err := catQuery.Order("level asc, sort_order asc, id asc").
+		Limit(searchCategoryLimit).Find(&cats).Error; err != nil {
+		util.ServerError(c, "搜索失败")
+		return
+	}
+
+	// ---- 资源命中 ----
+	// 用闭包重复构造，避免 Count 与 Find 互相污染 Statement。
+	resBase := func() *gorm.DB {
+		q := h.db.Model(&model.Resource{}).
+			Where("title "+op+" ? OR description "+op+" ?", like, like)
+		if !unrestricted {
+			q = q.Where("category_id IN ?", scopeIDs)
+		}
+		if diskType != "" {
+			q = q.Where("disk_type = ?", diskType)
+		}
+		return q
+	}
+	var total int64
+	resBase().Count(&total)
+
+	list := make([]model.Resource, 0, pageSize)
+	if err := resBase().Preload("Category").
+		Order("sort_order asc, id desc").
+		Offset((page - 1) * pageSize).Limit(pageSize).
+		Find(&list).Error; err != nil {
+		util.ServerError(c, "搜索失败")
+		return
+	}
+
+	// ---- 目录展示所需的资源数与面包屑 ----
+	names, counts := h.categoryMeta(scopeIDs, unrestricted)
+	items := make([]searchCategoryItem, 0, len(cats))
+	for i := range cats {
+		cat := cats[i]
+		items = append(items, searchCategoryItem{
+			ID: cat.ID, Name: cat.Name, Icon: cat.Icon, Color: cat.Color,
+			Level: cat.Level, Path: cat.Path,
+			Breadcrumb:    breadcrumbOf(cat.Path, names),
+			ResourceCount: counts[cat.ID],
+		})
+	}
+
+	util.OK(c, gin.H{
+		"keyword":    keyword,
+		"categories": items,
+		"resources": util.PageData{
+			Total: total, Page: page, PageSize: pageSize, List: list,
+		},
+	})
+}
+
+// categoryMeta 返回 (id→名称, id→资源数) 两张表，供搜索结果渲染。
+//
+// 资源数按「直接挂载 + 子孙累加」口径 —— 孩子搜到一个大类时，
+// 关心的是它底下总共有多少内容，而不是只有直接挂在它上面的那几个。
+func (h *ResourceHandler) categoryMeta(scopeIDs []uint64, unrestricted bool) (map[uint64]string, map[uint64]int64) {
+	var cats []model.Category
+	h.db.Select("id, name, path").Find(&cats)
+
+	names := make(map[uint64]string, len(cats))
+	for _, cat := range cats {
+		names[cat.ID] = cat.Name
+	}
+
+	// 各目录的直接资源数。用 Rows() 手工扫描 —— Model().Scan(&自定义结构)
+	// 会按模型 schema 静默丢弃聚合别名列（详见笔记"GORM 聚合查询的静默丢列"）。
+	direct := map[uint64]int64{}
+	q := h.db.Table("resources").Select("category_id, count(*) as total")
+	if !unrestricted {
+		q = q.Where("category_id IN ?", scopeIDs)
+	}
+	if rows, err := q.Group("category_id").Rows(); err == nil {
+		for rows.Next() {
+			var (
+				cid uint64
+				n   int64
+			)
+			if err := rows.Scan(&cid, &n); err == nil {
+				direct[cid] = n
+			}
+		}
+		rows.Close()
+	}
+
+	counts := make(map[uint64]int64, len(cats))
+	for _, cat := range cats {
+		counts[cat.ID] = direct[cat.ID]
+	}
+	// 子孙累加到祖先：按物化路径前缀判定。目录表只有几十~几百行，
+	// O(n²) 完全够用，且不依赖 ParentID 链是否完整。
+	for _, child := range cats {
+		n := direct[child.ID]
+		if n == 0 || child.Path == "" {
+			continue
+		}
+		for _, anc := range cats {
+			if anc.ID == child.ID || anc.Path == "" {
+				continue
+			}
+			if strings.HasPrefix(child.Path, anc.Path) {
+				counts[anc.ID] += n
+			}
+		}
+	}
+	return names, counts
+}
+
+// breadcrumbOf 由物化路径（/1/12/35/）拼出「乐学英语 / 新概念英语」。
+// 路径里查不到的 ID（目录已删但路径未更新）直接跳过，不产空洞。
+func breadcrumbOf(path string, names map[uint64]string) string {
+	parts := make([]string, 0, 4)
+	var cur uint64
+	inNum := false
+	for i := 0; i <= len(path); i++ {
+		var ch byte
+		if i < len(path) {
+			ch = path[i]
+		}
+		if i < len(path) && ch >= '0' && ch <= '9' {
+			cur = cur*10 + uint64(ch-'0')
+			inNum = true
+			continue
+		}
+		if inNum {
+			if n, ok := names[cur]; ok && n != "" {
+				parts = append(parts, n)
+			}
+			cur = 0
+			inNum = false
+		}
+	}
+	return strings.Join(parts, " / ")
 }
 
 // ============ 搜索 ============

@@ -4,12 +4,12 @@
       <SearchBar
         ref="sb"
         v-model="keyword"
-        placeholder="搜成语故事、英语儿歌…"
+        placeholder="搜文件夹、成语故事、英语儿歌…"
         @search="doSearch"
       />
 
       <!-- 网盘筛选：只列出结果里真实存在的网盘 -->
-      <div v-if="diskFacets.length > 1" class="disk-filter">
+      <div v-if="searched && diskFacets.length > 1" class="disk-filter">
         <span
           class="df-chip pressable"
           :class="{ on: activeDisk === '' }"
@@ -45,16 +45,52 @@
 
       <div v-else-if="loading" class="loading"><div class="spinner"></div></div>
 
-      <template v-else-if="results.length">
-        <div class="section-title"><h2>找到 {{ total }} 个</h2></div>
-        <ResourceCard
-          v-for="(r, i) in results"
-          :key="r.id"
-          :node="r"
-          class="pop-in"
-          :style="{ animationDelay: i * 35 + 'ms' }"
-          @click="goPlay(r)"
-        />
+      <template v-else-if="categories.length || results.length">
+        <!-- 命中的「文件夹」——可以点进去，这是这次搜索最大的变化：
+             以前只能搜到具体的文件，孩子想"看看这个专题里都有啥"是做不到的。 -->
+        <template v-if="categories.length">
+          <div class="section-title">
+            <h2>文件夹 · {{ categories.length }}</h2>
+          </div>
+          <div
+            v-for="(c, i) in categories"
+            :key="'c' + c.id"
+            class="dir-card pressable pop-in"
+            :style="{ animationDelay: i * 30 + 'ms' }"
+            @click="goCategory(c)"
+          >
+            <span class="dir-ico" :style="{ background: tint(dirColor(c), 0.18) }">
+              {{ dirEmoji(c) }}
+            </span>
+            <div class="dir-body">
+              <div class="dir-name ellipsis">{{ c.name }}</div>
+              <div v-if="c.breadcrumb" class="dir-crumb ellipsis">{{ c.breadcrumb }}</div>
+            </div>
+            <span class="dir-count">{{ c.resourceCount }} 个</span>
+            <span class="dir-arrow">›</span>
+          </div>
+        </template>
+
+        <!-- 命中的「内容」 -->
+        <template v-if="results.length">
+          <div class="section-title">
+            <h2>内容 · {{ total }}</h2>
+          </div>
+          <ResourceCard
+            v-for="(r, i) in results"
+            :key="r.id"
+            :node="r"
+            show-category
+            class="pop-in"
+            :style="{ animationDelay: i * 30 + 'ms' }"
+            @click="goPlay(r)"
+          />
+          <div v-if="results.length < total" class="more">
+            <span class="more-btn pressable" :class="{ dim: loadingMore }" @click="loadMore">
+              {{ loadingMore ? '正在加载…' : '加载更多' }}
+            </span>
+          </div>
+        </template>
       </template>
 
       <div v-else class="empty">
@@ -73,7 +109,11 @@ import { ref, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import SearchBar from '@/components/SearchBar.vue'
 import ResourceCard from '@/components/ResourceCard.vue'
-import { resourceApi } from '@/api'
+import { resourceApi, searchApi } from '@/api'
+import { resolveIcon, tint } from '@/assets/icons'
+
+// 一页资源条数。目录不限页（后端给 50 上限），孩子要的是"往里走"的入口。
+const PAGE_SIZE = 20
 
 const route = useRoute()
 const router = useRouter()
@@ -83,9 +123,13 @@ const keyword = ref('')
 
 const searched = ref(false)
 const loading = ref(false)
+const loadingMore = ref(false)
+const categories = ref([])
 const results = ref([])
 const total = ref(0)
+const page = ref(1)
 const allResources = ref([])
+
 // 网盘筛选：activeDisk 为空 = 全部；diskFacets 是"当前结果里真实存在的网盘"
 const activeDisk = ref('')
 const diskFacets = ref([])
@@ -94,6 +138,13 @@ const hotWords = ['英语儿歌', '成语故事', '唐诗', '睡前故事', '奥
 
 const barStyle = ref({ paddingTop: 'calc(12px + var(--safe-top))' })
 
+function dirEmoji(c) {
+  return resolveIcon(c.icon, c.color).emoji
+}
+function dirColor(c) {
+  return c.color || resolveIcon(c.icon).color
+}
+
 async function doSearch(v = keyword.value) {
   keyword.value = v
   await doSystemSearch((v || '').trim())
@@ -101,28 +152,62 @@ async function doSearch(v = keyword.value) {
 
 async function doSystemSearch(q) {
   if (!q) {
-    searched.value = false
-    results.value = []
-    diskFacets.value = []
+    reset()
     return
   }
   searched.value = true
   loading.value = true
+  page.value = 1
   try {
-    const params = { keyword: q, page: 1, pageSize: 30 }
-    if (activeDisk.value) params.diskType = activeDisk.value
-    const data = await resourceApi.list(params)
-    const list = data?.list || []
-    results.value = list
-    total.value = data?.total ?? list.length
-    // 筛选标签跟搜索结果同步刷新：没有结果的网盘不该继续占位置
+    const data = await searchApi.all(searchParams(q, 1))
+    categories.value = data?.categories || []
+    results.value = data?.resources?.list || []
+    total.value = data?.resources?.total ?? results.value.length
+    // 筛选标签跟结果同步刷新：没有结果的网盘不该继续占位置
     refreshFacets(q)
   } catch {
+    categories.value = []
     results.value = []
     total.value = 0
   } finally {
     loading.value = false
   }
+}
+
+function searchParams(q, p) {
+  const params = { keyword: q, page: p, pageSize: PAGE_SIZE }
+  if (activeDisk.value) params.diskType = activeDisk.value
+  return params
+}
+
+// loadMore 只追加资源 —— 目录是一次性给全的（上限 50），翻页没意义。
+async function loadMore() {
+  const q = keyword.value.trim()
+  if (!q || loadingMore.value) return
+  if (results.value.length >= total.value) return
+  loadingMore.value = true
+  try {
+    const next = page.value + 1
+    const data = await searchApi.all(searchParams(q, next))
+    const list = data?.resources?.list || []
+    if (list.length) {
+      results.value = results.value.concat(list)
+      page.value = next
+    }
+    total.value = data?.resources?.total ?? total.value
+  } catch {
+    /* 加载更多失败不打断已有结果，保持页面不动 */
+  } finally {
+    loadingMore.value = false
+  }
+}
+
+function reset() {
+  searched.value = false
+  categories.value = []
+  results.value = []
+  total.value = 0
+  diskFacets.value = []
 }
 
 // refreshFacets 拉一次"结果里有哪些网盘"。
@@ -155,6 +240,10 @@ function quickSearch(t) {
 
 function goPlay(r) {
   router.push({ name: 'play', params: { id: r.id } })
+}
+
+function goCategory(c) {
+  router.push({ name: 'category', params: { id: c.id } })
 }
 
 onMounted(async () => {
@@ -227,5 +316,75 @@ onMounted(async () => {
   font-size: 14px;
   color: var(--c-text);
   box-shadow: var(--shadow-sm);
+}
+
+/* ---- 目录结果卡片 ---- */
+.dir-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: var(--c-card);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-sm);
+}
+.dir-ico {
+  flex: 0 0 auto;
+  width: 46px;
+  height: 46px;
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  line-height: 1;
+}
+.dir-body {
+  flex: 1;
+  min-width: 0;
+}
+.dir-name {
+  font-size: 15.5px;
+  font-weight: 600;
+  color: var(--c-text);
+}
+.dir-crumb {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--c-text-sub);
+}
+.dir-count {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--c-text-sub);
+  background: #f3f6fa;
+  padding: 3px 9px;
+  border-radius: 999px;
+}
+.dir-arrow {
+  flex: 0 0 auto;
+  color: #b9c4d2;
+  font-size: 20px;
+  line-height: 1;
+}
+
+/* ---- 加载更多 ---- */
+.more {
+  display: flex;
+  justify-content: center;
+  padding: 6px 0 18px;
+}
+.more-btn {
+  padding: 9px 26px;
+  border-radius: 999px;
+  background: #fff;
+  color: #4a7ef0;
+  font-size: 14px;
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+.more-btn.dim {
+  opacity: 0.6;
 }
 </style>

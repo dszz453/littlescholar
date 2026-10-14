@@ -60,8 +60,14 @@ export const categoryApi = {
 export const resourceApi = {
   list: (params) => http.get('/app/resources', { params }),
   detail: (id) => http.get(`/app/resources/${id}`),
-  // 资源分布：孩子端「搜系统」按网盘筛选用
+  // 资源分布：孩子端「找一找」按网盘筛选用
   facets: (params) => http.get('/app/resources/facets', { params }),
+}
+
+export const searchApi = {
+  // 「找一找」：系统内全文检索，一次请求同时返回命中的**目录**与**资源**。
+  // 后端会自动按孩子可见目录过滤，这里不需要也不能传权限参数。
+  all: (params) => http.get('/app/search', { params }),
 }
 
 export const playApi = {
@@ -88,4 +94,17 @@ export const studyApi = {
   // 学习记录明细。groupBy=resource 时按资源聚合（一次播放每 15 秒一条心跳，
   // 不聚合的话同一个资源会把列表刷屏）。
   records: (params) => http.get('/app/study/records', { params }),
+}
+
+export const planApi = {
+  list: (params) => http.get('/app/study/plans', { params }),
+  create: (data) => http.post('/app/study/plans', data),
+  update: (id, data) => http.put(`/app/study/plans/${id}`, data),
+  remove: (id) => http.delete(`/app/study/plans/${id}`),
+  // 今日总览：返回 { date, hasPlan, completed, plans[] }。
+  // 是否"达标"由后端按当天学习时长实时算，前端只负责据此提示。
+  today: () => http.get('/app/study/today'),
+  awards: (params) => http.get('/app/study/awards', { params }),
+  // 立刻尝试为本周期生成奖状（达标才生成）
+  refreshAward: () => http.post('/app/study/awards/refresh'),
 }

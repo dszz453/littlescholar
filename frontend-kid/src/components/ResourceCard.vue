@@ -14,6 +14,9 @@
     <div class="body">
       <div class="title ellipsis-2">{{ node.title }}</div>
       <div class="meta">
+        <!-- 所属目录：只在搜索页打开。孩子从"找一找"看到内容时，
+             最需要知道的是"它在哪个文件夹里" —— 否则只能点进去才知道。 -->
+        <span v-if="showCategory && categoryName" class="chip cat">📁 {{ categoryName }}</span>
         <span v-if="durationText" class="chip">⏱ {{ durationText }}</span>
         <span v-if="node.fileCount > 1" class="chip">📄 {{ node.fileCount }}</span>
       </div>
@@ -27,9 +30,12 @@ import { tint } from '@/assets/icons'
 
 const props = defineProps({
   node: { type: Object, required: true },
+  showCategory: { type: Boolean, default: false },
 })
 
 defineEmits(['click'])
+
+const categoryName = computed(() => props.node?.category?.name || '')
 
 const TYPE_META = {
   audio: { emoji: '🎧', label: '音频', color: '#269A99' },
@@ -131,5 +137,15 @@ const durationText = computed(() => {
   background: #f3f6fa;
   padding: 2px 8px;
   border-radius: 999px;
+}
+
+/* 所属目录：蓝色系与"时长/文件数"的灰区分开，且超长时省略 */
+.chip.cat {
+  color: #4a7ef0;
+  background: rgba(91, 143, 249, 0.12);
+  max-width: 52%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>
