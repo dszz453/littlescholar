@@ -561,7 +561,7 @@ func baiduFileItems(list []baiduListItem) []adapter.FileItem {
 			Ext:       extOf(f.ServerName),
 		})
 	}
-	return items, nil
+	return items
 }
 
 func (b *Baidu) MakeDir(ctx context.Context, cred *adapter.Credential, parentID, name string) (string, error) {
