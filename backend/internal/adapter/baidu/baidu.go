@@ -60,13 +60,19 @@ func (b *Baidu) pan() string {
 	return b.panBase
 }
 
+// api 网盘 **API 接口**（/api/…）的基地址，与 pan 同源。
+//
+// 单测把 panBase 指向 httptest 之后，API 调用也要一起被接住 ——
+// 如果这里另外写死 panURL，测试会悄悄打到真实的 pan.baidu.com 上，
+// 既慢又会让"测试通过"变得没有意义。
+func (b *Baidu) api() string { return b.pan() + "/api" }
+
 func (b *Baidu) Type() adapter.DiskType { return adapter.DiskBaidu }
 func (b *Baidu) Name() string           { return "百度网盘" }
 
 const (
-	panURL     = "https://pan.baidu.com"
-	basePanAPI = "https://pan.baidu.com/api"
-	passport   = "https://passport.baidu.com"
+	panURL   = "https://pan.baidu.com"
+	passport = "https://passport.baidu.com"
 )
 
 const ua = "netdisk;P2SP;2.2.60.26"
@@ -316,7 +322,7 @@ func (b *Baidu) fetchStoken(ctx context.Context, bduss, userAgent string) (strin
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method: "GET",
-		URL:    basePanAPI + "/gettemplatevariable",
+		URL:    b.api() + "/gettemplatevariable",
 		Headers: map[string]string{
 			"User-Agent": userAgent,
 			"Cookie":     "BDUSS=" + bduss,
@@ -352,7 +358,7 @@ func (b *Baidu) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     basePanAPI + "/quota",
+		URL:     b.api() + "/quota",
 		Headers: b.headers(cred),
 		Query:   map[string]string{"checkexpire": "1", "checkfree": "1", "clienttype": "0", "app_id": "250528", "web": "1"},
 	}, &resp)
@@ -383,7 +389,7 @@ func (b *Baidu) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*
 	}
 	if _, e := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     basePanAPI + "/gettemplatevariable",
+		URL:     b.api() + "/gettemplatevariable",
 		Headers: b.headers(cred),
 		Query: map[string]string{
 			"fields": `["bdstoken"]`, "clienttype": "0", "app_id": "250528", "web": "1",
@@ -418,7 +424,7 @@ func (b *Baidu) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     basePanAPI + "/list",
+		URL:     b.api() + "/list",
 		Headers: b.headers(cred),
 		Query: map[string]string{
 			"dir": dirID, "order": "time", "desc": "1",
@@ -467,7 +473,7 @@ func (b *Baidu) MakeDir(ctx context.Context, cred *adapter.Credential, parentID,
 	}
 	_, err = b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     basePanAPI + "/create",
+		URL:     b.api() + "/create",
 		Headers: b.headers(cred),
 		Query:   map[string]string{"a": "commit", "bdstoken": token, "web": "1", "app_id": "250528", "clienttype": "0"},
 		Body:    map[string]interface{}{"path": path, "isdir": 1, "block_list": []string{}},
@@ -497,7 +503,7 @@ func (b *Baidu) DeleteFile(ctx context.Context, cred *adapter.Credential, fileID
 	}
 	_, err = b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     basePanAPI + "/filemanager",
+		URL:     b.api() + "/filemanager",
 		Headers: b.headers(cred),
 		Query:   map[string]string{"opera": "delete", "bdstoken": token, "web": "1", "app_id": "250528", "clienttype": "0"},
 		RawBody: mustRead(body),
@@ -521,7 +527,7 @@ func (b *Baidu) Rename(ctx context.Context, cred *adapter.Credential, fileID, ne
 	}
 	_, err = b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     basePanAPI + "/filemanager",
+		URL:     b.api() + "/filemanager",
 		Headers: b.headers(cred),
 		Query:   map[string]string{"opera": "rename", "bdstoken": token, "web": "1", "app_id": "250528", "clienttype": "0"},
 		Body:    map[string]interface{}{"filelist": []map[string]string{{"path": fileID, "newname": newName}}},
@@ -539,21 +545,57 @@ func (b *Baidu) Rename(ctx context.Context, cred *adapter.Credential, fileID, ne
 
 var baiduShareRe = regexp.MustCompile(`/s/([0-9a-zA-Z_-]+)`)
 
+// normalizeShareCode 去掉 /s/1xxxxxxxx 里的**前导 1**。
+//
+// 那个 1 只是百度短链的格式标记，不属于 surl。实测（同一个分享、同一时刻、
+// 都没带任何登录态）：
+//
+//	/share/verify?surl=1Q-XtaKc_...  -> errno=105  所访问的页面不存在
+//	/share/verify?surl=Q-XtaKc_...   -> errno=0    + randsk
+//
+// 两组请求唯一的差别就是那一个字符。105 太容易被读成"分享过期/没登录"，
+// 于是排查方向会被带到账号和分享上去 —— 实际只是 URL 多打了一个字符。
+func normalizeShareCode(code string) string {
+	if len(code) > 1 && code[0] == '1' {
+		return code[1:]
+	}
+	return code
+}
+
+// shareTicket 「解锁一个分享」之后，后续所有调用需要的东西。
+//
+// 拆成结构体是因为这几个值来源不同、编码要求也不同，散着传必然传错：
+// Code/BDCLND 用**去前导 1 / URL 编码**的形态，SeKey 用**解码后**的形态。
+type shareTicket struct {
+	Code    string // 去掉前导 1 的短链码：/share/verify 与 /share/list 都用它
+	ShareID string // 真实 shareid —— 转存的 shareid 参数
+	UK      string // 分享者 uk —— 转存的 from 参数
+	SeKey   string // **URL 解码后**的 randsk —— 转存的 sekey 参数
+	BDCLND  string // 原样（URL 编码）的 randsk —— 必须放进 Cookie
+}
+
+func firstSubmatch(re, s string) string {
+	m := regexp.MustCompile(re).FindStringSubmatch(s)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
 func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareURL, passcode string) (*adapter.ShareInfo, error) {
 	m := baiduShareRe.FindStringSubmatch(shareURL)
 	if len(m) < 2 {
 		return nil, fmt.Errorf("无法提取百度分享 ID: %s", shareURL)
 	}
-	shareID := m[1]
 
-	// 1. 验证提取码并获取 shareid / uk
-	realShareID, uk, randsk, err := b.shareVerify(ctx, cred, shareID, passcode)
+	// 1. 解锁分享：拿到 shareid / 分享者 uk / randsk
+	t, err := b.unlockShare(ctx, cred, m[1], passcode)
 	if err != nil {
 		return nil, err
 	}
 
 	// 2. 列出分享内容
-	files, err := b.listShareDir(ctx, cred, shareID, "")
+	files, err := b.listShareDir(ctx, cred, t, "")
 	if err != nil {
 		return nil, err
 	}
@@ -561,13 +603,13 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 	info := &adapter.ShareInfo{
 		ShareURL: shareURL,
 		Passcode: passcode,
-		RootID:   fmt.Sprintf("%d", realShareID),
+		RootID:   t.ShareID,
 		// from 参数要的是**分享者的 uk**，不是自己的 uid。
 		// 旧代码把它丢掉了，转存只能传 from=""，服务端直接判参数错误。
-		OwnerID: fmt.Sprintf("%d", uk),
-		// randsk 转存时要作为 sekey 原样回传。
-		SeKey: randsk,
-		Title: fmt.Sprintf("百度分享_%s", shareID),
+		OwnerID: t.UK,
+		// randsk 转存时要作为 sekey 回传，注意这里存的是**解码后**的值。
+		SeKey: t.SeKey,
+		Title: fmt.Sprintf("百度分享_%s", t.Code),
 		Files: files,
 	}
 	for _, f := range files {
@@ -579,21 +621,21 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 	return info, nil
 }
 
-// shareVerify 验证百度分享的提取码，返回 shareid / 分享者 uk / randsk。
+// unlockShare 解锁一个百度分享：提交提取码，拿到后续所有调用需要的票据。
 //
 // 抽出来给「解析整个分享」和「一层层打开文件夹」共用 —— 两者都要先过
 // 这一关，复制一份迟早会两边改漏。
-func (b *Baidu) shareVerify(ctx context.Context, cred *adapter.Credential, surl, passcode string) (int64, int64, string, error) {
+func (b *Baidu) unlockShare(ctx context.Context, cred *adapter.Credential, code, passcode string) (*shareTicket, error) {
+	t := &shareTicket{Code: normalizeShareCode(code)}
+
 	var verifyResp struct {
 		Errno    int    `json:"errno"`
 		ErrMsg   string `json:"err_msg"`
 		ShowMsg  string `json:"show_msg"`
 		RandSkey string `json:"randsk"`
-		ShareID  int64  `json:"shareid"`
-		UK       int64  `json:"uk"`
 	}
 
-	// ⚠️ body 必须是 **form 编码**，这是本项目踩得最贵的一个坑。
+	// ⚠️ body 必须是 **form 编码**，这是本项目踩得最贵的坑之一。
 	//
 	// 原先用 Body（会被 JSON 序列化）提交 {"pwd":…}，服务端解析不到提取码，
 	// 对**任何**分享一律回 errno=-12；而下面又把"非 0"统统映射成
@@ -603,7 +645,7 @@ func (b *Baidu) shareVerify(ctx context.Context, cred *adapter.Credential, surl,
 	// 实测对照（同一个分享、同一天）：
 	//
 	//	JSON body -> errno=-12   （参数压根没被解析）
-	//	form body -> errno=105   （未登录，属于另一个层面的错）
+	//	form body -> errno=105   （那时 surl 还多带着前导 1）
 	//
 	// 两种 body 的响应截然不同，足以确认服务端按 form 解析。
 	form := url.Values{}
@@ -614,18 +656,18 @@ func (b *Baidu) shareVerify(ctx context.Context, cred *adapter.Credential, surl,
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
 		URL:     b.pan() + "/share/verify",
-		Headers: b.webHeaders(cred, b.pan()+"/s/"+surl, true),
+		Headers: b.webHeaders(cred, b.pan()+"/s/"+t.Code, true),
 		Query: map[string]string{
-			"surl": surl, "bdstoken": "", "t": fmt.Sprint(time.Now().UnixMilli()),
+			"surl": t.Code, "bdstoken": "", "t": fmt.Sprint(time.Now().UnixMilli()),
 			"channel": "chunlei", "web": "1", "app_id": "250528", "clienttype": "0",
 		},
 		RawBody: []byte(form.Encode()),
 	}, &verifyResp)
 	if err != nil {
-		return 0, 0, "", err
+		return nil, err
 	}
 	if verifyResp.Errno == -9 {
-		return 0, 0, "", adapter.ErrNeedPassword
+		return nil, adapter.ErrNeedPassword
 	}
 	if verifyResp.Errno != 0 {
 		// 不要把 errno 吞掉：以前只回一句"分享已失效"，用户和排查的人都
@@ -634,10 +676,77 @@ func (b *Baidu) shareVerify(ctx context.Context, cred *adapter.Credential, surl,
 		if detail == "" {
 			detail = fmt.Sprintf("errno=%d", verifyResp.Errno)
 		}
-		return 0, 0, "", fmt.Errorf("%w（%s；若每个分享都如此，多半是账号登录态不完整，请重新接入）",
-			adapter.ErrShareExpired, detail)
+		hint := ""
+		if verifyResp.Errno == 105 {
+			// 105 = 所访问的页面不存在。绝大多数情况下这不是分享的问题，
+			// 而是 surl 拼错（带上了前导 1）。把话说明白，免得又去怪账号。
+			hint = "；105 通常是短链码多带了前导 1，请核对分享链接"
+		}
+		return nil, fmt.Errorf("%w（%s%s）", adapter.ErrShareExpired, detail, hint)
 	}
-	return verifyResp.ShareID, verifyResp.UK, verifyResp.RandSkey, nil
+
+	t.BDCLND = verifyResp.RandSkey
+	// randsk 是 **URL 编码**过的（base64 里的 / 和 = 都被转义）。
+	// sekey 会再被 url.Values 编码一次，不解码就变成双重编码，
+	// 服务端回 errno=200025「提取码输入错误，请重试」。实测解码后立刻 errno=0。
+	if dec, derr := url.QueryUnescape(t.BDCLND); derr == nil {
+		t.SeKey = dec
+	} else {
+		t.SeKey = t.BDCLND
+	}
+
+	t.ShareID, t.UK = b.shareMeta(ctx, cred, code)
+	if t.ShareID == "" || t.UK == "" {
+		return nil, fmt.Errorf("%w（解锁成功但取不到 shareid/uk，转存无法进行）", adapter.ErrShareExpired)
+	}
+	return t, nil
+}
+
+// shareMeta 取真实 shareid 与分享者 uk。
+//
+// ⚠️ /share/verify 的响应里**没有**这两个字段（实测只有 randsk）。
+// 旧代码直接读 verifyResp.ShareID/UK，拿到的恒是 0，于是转存时
+// shareid=""、from="0"，服务端只能判参数错误 —— 这是"参数都对还是失败"
+// 的最后一块拼图。
+//
+// 官方取法是 /api/shorturlinfo，注意它的 shorturl 要**带前导 1**，
+// 与 /share/verify 的要求正好相反（这对兄弟接口的差异是实测出来的）。
+func (b *Baidu) shareMeta(ctx context.Context, cred *adapter.Credential, code string) (string, string) {
+	var info struct {
+		ShareID int64 `json:"shareid"`
+		UK      int64 `json:"uk"`
+	}
+	candidates := []string{code, normalizeShareCode(code)}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if _, err := b.http.DoJSON(ctx, &adapter.Request{
+			Method:  "GET",
+			URL:     b.api() + "/shorturlinfo",
+			Headers: b.webHeaders(cred, b.pan()+"/s/"+c, false),
+			Query: map[string]string{
+				"shorturl": c, "web": "1", "app_id": "250528", "clienttype": "0",
+			},
+		}, &info); err == nil && info.ShareID != 0 {
+			// 这个接口即使带提取码保护也会回 errno=-9，但 shareid/uk 是照给的，
+			// 所以只认字段有没有值，不看 errno。
+			return fmt.Sprint(info.ShareID), fmt.Sprint(info.UK)
+		}
+	}
+
+	// 兜底：分享页 HTML 里也带着 shareid / share_uk。
+	resp, err := b.http.Do(ctx, &adapter.Request{
+		Method:  "GET",
+		URL:     b.pan() + "/s/" + normalizeShareCode(code),
+		Headers: b.webHeaders(cred, b.pan()+"/s/"+normalizeShareCode(code), false),
+	})
+	if err != nil || resp == nil {
+		return "", ""
+	}
+	html := string(resp.Body)
+	return firstSubmatch(`"shareid"\s*:\s*(\d+)`, html),
+		firstSubmatch(`"share_uk"\s*:\s*"?(\d+)`, html)
 }
 
 // listShareDir 列出百度分享内某一层目录。
@@ -647,22 +756,33 @@ func (b *Baidu) shareVerify(ctx context.Context, cred *adapter.Credential, surl,
 //	root=1            列分享根目录
 //	root=0&dir=<路径> 列分享内的子目录（dir 是分享内的**相对路径**）
 //
+// 参数侧实测确认的两件事：
+//
+//  1. shorturl 要**去掉前导 1**（与 /share/verify 一致），且必须走
+//     **网页 UA** —— 换成客户端 UA 直接 errno=-9。
+//  2. **必须带 BDCLND cookie**。把 randsk 当 query 参数 sekey 传过去
+//     会回 errno=-9（"还需要提取码"），只有塞进 Cookie 才认。同一请求
+//     只差这一处，结果从 -9 变成 0 并列出内容。
+//
 // 目录项同时带 fs_id 和 path：转存要前者、下钻要后者，
 // 所以目录项把 path 一起放进 SharePath。
-//
-// ⚠️ 本函数与 ListShareDir 未经线上验证：线上百度账号的 STOKEN 已失效
-// （share/verify 对所有分享一律 errno=-12），拿不到有效数据。
-// 实现与 ParseShare 走同一套调用，账号恢复后即可生效。
-func (b *Baidu) listShareDir(ctx context.Context, cred *adapter.Credential, surl, pdir string) ([]adapter.FileItem, error) {
+// ⚠️ 分享内**子目录**列举目前仍是 errno=2（参数错误），各种 dir 形态都试过，
+// 属已知限制；不影响转存（转存整个根目录再由本地递归找媒体）。
+func (b *Baidu) listShareDir(ctx context.Context, cred *adapter.Credential, t *shareTicket, pdir string) ([]adapter.FileItem, error) {
 	q := map[string]string{
-		"shorturl": surl, "web": "1", "app_id": "250528",
-		"channel": "chunlei", "clienttype": "0",
+		"shorturl": t.Code, "web": "1", "app_id": "250528",
+		"channel": "chunlei", "clienttype": "0", "page": "1", "num": "100",
 	}
 	if pdir == "" || pdir == "/" {
 		q["root"] = "1"
 	} else {
 		q["root"] = "0"
 		q["dir"] = pdir
+	}
+
+	headers := b.webHeaders(cred, b.pan()+"/s/"+t.Code, false)
+	if t.BDCLND != "" {
+		headers["Cookie"] = headers["Cookie"] + "; BDCLND=" + t.BDCLND
 	}
 
 	var listResp struct {
@@ -678,7 +798,7 @@ func (b *Baidu) listShareDir(ctx context.Context, cred *adapter.Credential, surl
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
 		URL:     b.pan() + "/share/list",
-		Headers: b.webHeaders(cred, b.pan()+"/s/"+surl, false),
+		Headers: headers,
 		Query:   q,
 	}, &listResp)
 	if err != nil {
@@ -709,12 +829,11 @@ func (b *Baidu) ListShareDir(ctx context.Context, cred *adapter.Credential, shar
 	if len(m) < 2 {
 		return nil, fmt.Errorf("无法提取百度分享 ID: %s", shareURL)
 	}
-	surl := m[1]
-	realShareID, uk, randsk, err := b.shareVerify(ctx, cred, surl, passcode)
+	t, err := b.unlockShare(ctx, cred, m[1], passcode)
 	if err != nil {
 		return nil, err
 	}
-	files, err := b.listShareDir(ctx, cred, surl, pdirFid)
+	files, err := b.listShareDir(ctx, cred, t, pdirFid)
 	if err != nil {
 		return nil, err
 	}
@@ -723,12 +842,12 @@ func (b *Baidu) ListShareDir(ctx context.Context, cred *adapter.Credential, shar
 	}
 	return &adapter.ShareEntry{
 		Fid:   pdirFid,
-		Title: fmt.Sprintf("百度分享_%s", surl),
+		Title: fmt.Sprintf("百度分享_%s", t.Code),
 		Files: files,
 		// 百度转存要 shareid + 分享者 uk + randsk 三件套，缺一转存必失败。
-		RootID:  fmt.Sprintf("%d", realShareID),
-		OwnerID: fmt.Sprintf("%d", uk),
-		SeKey:   randsk,
+		RootID:  t.ShareID,
+		OwnerID: t.UK,
+		SeKey:   t.SeKey,
 	}, nil
 }
 
@@ -757,7 +876,7 @@ func (b *Baidu) bdstoken(ctx context.Context, cred *adapter.Credential) (string,
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     basePanAPI + "/gettemplatevariable",
+		URL:     b.api() + "/gettemplatevariable",
 		Headers: b.headers(cred),
 		Query: map[string]string{
 			"fields": `["bdstoken"]`, "clienttype": "0", "app_id": "250528", "web": "1",
@@ -847,10 +966,16 @@ func (b *Baidu) SaveToDir(ctx context.Context, cred *adapter.Credential, share *
 	if referer == "" {
 		referer = b.pan() + "/disk/home"
 	}
+	headers := b.webHeaders(cred, referer, true)
+	// 与 /share/list 同理：randsk 还要以 BDCLND 的身份出现在 Cookie 里。
+	// share.SeKey 是**解码后**的值，Cookie 侧要编码形态，所以这里再编回去。
+	if share.SeKey != "" {
+		headers["Cookie"] = headers["Cookie"] + "; BDCLND=" + url.QueryEscape(share.SeKey)
+	}
 	_, err = b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
 		URL:     b.pan() + "/share/transfer?" + q.Encode(),
-		Headers: b.webHeaders(cred, referer, true),
+		Headers: headers,
 		RawBody: []byte(form.Encode()),
 	}, &resp)
 	if err != nil {
@@ -861,9 +986,13 @@ func (b *Baidu) SaveToDir(ctx context.Context, cred *adapter.Credential, share *
 	//   0          成功
 	//   12         同名文件已存在 —— 视作成功，用户要的就是"有这份文件"
 	//   -6         cookie 失效
+	//   200025     提取码不对 —— 几乎总是 sekey 被双重编码了
 	//   2 / 其它   参数错误、分享被取消等
 	switch resp.Errno {
 	case 0, 12:
+	case 200025:
+		return nil, fmt.Errorf("百度转存失败: 提取码不被接受（errno=200025）。" +
+			"通常是 sekey 被重复 URL 编码，请反馈该问题")
 	default:
 		if resp.Errno == -6 {
 			return nil, adapter.ErrCookieInvalid
@@ -908,7 +1037,7 @@ func (b *Baidu) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     basePanAPI + "/filemetas",
+		URL:     b.api() + "/filemetas",
 		Headers: b.headers(cred),
 		Query: map[string]string{
 			"fsids": "[" + fileID + "]", "dlink": "1", "thumb": "1",

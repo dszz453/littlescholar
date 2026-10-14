@@ -283,6 +283,9 @@ const qrStatusType = ref('info')
 const qrSessionId = ref('')
 const qrCanvas = ref()
 let pollTimer = null
+// 串行轮询的"该停了"标记：stopPolling 之后在途的那一次响应回来时，
+// 靠它阻止再排下一轮（clearTimeout 管不到已经发出的请求）。
+let pollStopped = false
 
 const editDialog = ref(false)
 const editForm = ref({})
@@ -413,9 +416,23 @@ async function startQR() {
   }
 }
 
+// ⚠️ 必须写成「收到响应再排下一次」的串行循环，不能用 setInterval。
+//
+// 百度的 unicast 是**长轮询**：没人扫码时服务端会把请求挂住（后端内部
+// 压到 8 秒才返回 waiting）。用 setInterval(2000) 的话，每 2 秒发一个新请求、
+// 每个都要挂 8 秒，于是一个对话框里同时飞着 4 个请求：
+//   · 用户扫完码，拿到 confirmed 的那个会触发 stopPolling，可另外 3 个还在路上，
+//     回来后各自再弹一次提示、再拉一次列表；
+//   · 它们还会和已失效的通道交叉，把状态在「等待扫码 / 已扫码 / 失败」之间来回翻。
+// 表现出来就是"扫了码没反应" —— 与后端无关，是前端把长轮询当成短轮询用了。
+// 串行化之后任何时刻只有一个请求在飞，扫码结果一到就能立刻拿到。
+const POLL_GAP_MS = 300
+
 function startPolling() {
-  pollTimer = setInterval(async () => {
-    if (!qrSessionId.value) return
+  stopPolling()
+  pollStopped = false
+  const tick = async () => {
+    if (pollStopped || !qrSessionId.value) return
     try {
       const res = await diskApi.pollQR(qrSessionId.value)
       if (res.status === 'scanned') {
@@ -442,16 +459,23 @@ function startPolling() {
         qrStatusText.value = '二维码已过期，请重新获取'
         qrStatusType.value = 'danger'
         stopPolling()
+      } else if (res.status === 'failed') {
+        qrStatusText.value = res.message || '扫码失败，请重新获取二维码'
+        qrStatusType.value = 'danger'
+        stopPolling()
       }
     } catch (e) {
-      /* 继续轮询 */
+      /* 网络抖动不算失败，下一轮继续 */
     }
-  }, 2000)
+    if (!pollStopped) pollTimer = setTimeout(tick, POLL_GAP_MS)
+  }
+  pollTimer = setTimeout(tick, 0)
 }
 
 function stopPolling() {
+  pollStopped = true
   if (pollTimer) {
-    clearInterval(pollTimer)
+    clearTimeout(pollTimer)
     pollTimer = null
   }
 }
