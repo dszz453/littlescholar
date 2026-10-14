@@ -26,16 +26,19 @@ const items = [
   { name: 'me', path: '/me', label: '我的', emoji: '🐻' },
 ]
 
+// 高亮：首页 tab 在「目录页」也保持点亮，让层级感连续。
 function isActive(item) {
   if (item.name === 'home') {
-    // 首页与目录页都算"首页"tab
     return route.name === 'home' || route.name === 'category'
   }
   return route.name === item.name
 }
 
+// 跳转：**不能**复用 isActive —— 高亮把 category 也算作首页，
+// 一旦复用，「在目录页点首页」会被判为"已激活"而直接 return，
+// 表现就是点了没反应（历史 bug）。这里只认精确的路由名。
 function go(item) {
-  if (isActive(item)) return
+  if (route.name === item.name) return
   router.push(item.path)
 }
 </script>

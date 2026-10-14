@@ -216,12 +216,6 @@ func Setup(deps *Deps) *gin.Engine {
 		app.GET("/resources/facets", resourceH.Facets)
 		app.GET("/resources/:id", resourceH.Detail)
 
-		// 搜一搜 · 搜全网 + 即时转存播放
-		app.POST("/search/global", resourceH.SearchGlobal)
-		app.POST("/instant/play", resourceH.InstantPlay)
-		// 分享目录浏览：搜全网里"一层文件夹一层打开"。
-		app.POST("/instant/browse", resourceH.BrowseShare)
-
 		app.GET("/play/:id", playH.Info)
 		app.POST("/play/:id/progress", playH.ReportProgress)
 		app.GET("/play/:id/playlist", playH.Playlist)
@@ -229,6 +223,9 @@ func Setup(deps *Deps) *gin.Engine {
 
 		app.POST("/ai/chat", aiH.Chat)
 		app.GET("/study/overview", studyH.Overview)
+		// 学习记录明细。孩子端「我的 → 学习记录」用 groupBy=resource
+		// 拿按资源聚合后的列表（否则 15 秒一条的心跳会把同一个资源刷屏）。
+		app.GET("/study/records", studyH.Records)
 	}
 
 	// ============ 播放（后台 + C端通用，需登录）============

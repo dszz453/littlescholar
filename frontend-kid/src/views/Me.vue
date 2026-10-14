@@ -64,13 +64,19 @@
       <!-- 学习记录 -->
       <template v-else>
         <template v-if="records.length">
-          <div v-for="r in records" :key="r.id" class="rec-item">
+          <div
+            v-for="r in records"
+            :key="r.resourceId || r.id"
+            class="rec-item pressable"
+            @click="goPlay(r)"
+          >
             <span class="r-ico">{{ recEmoji(r) }}</span>
             <div class="r-body">
-              <div class="r-title ellipsis">{{ r.title || r.resourceTitle }}</div>
+              <div class="r-title ellipsis">{{ r.resourceTitle || r.title }}</div>
               <div class="r-meta">
                 <span>{{ fmtTime(r.happenedAt || r.createdAt) }}</span>
-                <span v-if="r.duration">· {{ Math.round(r.duration / 60) }} 分钟</span>
+                <span v-if="r.duration">· {{ fmtDuration(r.duration) }}</span>
+                <span v-if="r.times > 1">· 学 {{ r.times }} 次</span>
               </div>
             </div>
           </div>
@@ -113,9 +119,23 @@ const headerStyle = computed(() => ({
   paddingTop: 'calc(24px + var(--safe-top))',
 }))
 
-const todayMinutes = computed(() => stats.value?.todayMinutes ?? 0)
-const weekMinutes = computed(() => stats.value?.weekMinutes ?? 0)
+const todayMinutes = computed(() => toMinutes(stats.value?.todaySeconds))
+const weekMinutes = computed(() => toMinutes(stats.value?.weekSeconds))
 const finishedCount = computed(() => stats.value?.finishedCount ?? 0)
+
+// 学了但不足一分钟时显示「<1」而不是 0 —— 显示 0 会让人以为压根没记上。
+// （时长由播放页每 15 秒一次心跳累加，刚开始学的前几十秒本来就不满一分钟。）
+function toMinutes(sec) {
+  if (!sec) return '0'
+  if (sec < 60) return '<1'
+  return String(Math.floor(sec / 60))
+}
+
+function fmtDuration(sec) {
+  if (!sec) return ''
+  if (sec < 60) return `${sec} 秒`
+  return `${Math.floor(sec / 60)} 分钟`
+}
 
 function recEmoji(r) {
   const map = { audio: '🎧', video: '🎬', pdf: '📄', image: '🖼️' }
@@ -141,8 +161,9 @@ async function load() {
       const data = await playApi.history({ page: 1, pageSize: 30 })
       history.value = data?.list || data || []
     } else {
-      const data = await studyApi.overview({ page: 1, pageSize: 30 })
-      records.value = data?.records || data?.list || []
+      // 按资源聚合：一次播放每 15 秒落一条心跳，拉明细会被同一个资源刷屏
+      const data = await studyApi.records({ groupBy: 'resource', page: 1, pageSize: 50 })
+      records.value = data?.list || []
     }
   } catch {
     if (tab.value === 'history') history.value = []
@@ -156,9 +177,9 @@ async function loadStats() {
   try {
     const data = await studyApi.overview({})
     stats.value = {
-      todayMinutes: Math.round((data?.todayDuration || 0) / 60),
-      weekMinutes: Math.round((data?.weekDuration || 0) / 60),
-      finishedCount: data?.finishedCount || 0,
+      todaySeconds: data?.todaySeconds || 0,
+      weekSeconds: data?.weekSeconds || 0,
+      finishedCount: data?.finishedResources || 0,
     }
   } catch {
     stats.value = null
@@ -171,7 +192,10 @@ async function doLogout() {
 }
 
 function goPlay(r) {
-  router.push({ name: 'play', params: { id: r.id } })
+  // 播放历史用 r.id（资源 ID），学习记录是聚合行，用 r.resourceId
+  const id = r.id || r.resourceId
+  if (!id) return
+  router.push({ name: 'play', params: { id } })
 }
 
 onMounted(() => {

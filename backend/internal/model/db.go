@@ -116,17 +116,6 @@ func SeedDefaultData(db *gorm.DB, adminUser, adminPassHash string) error {
 		"multi_conn":        "4",
 		"play_mode_default": "proxy",
 		"site_name":         "小书童学习系统",
-		// 「搜一搜 · 搜全网」即时转存播放：默认开启，但账号/目录留空，
-		// 由管理员在「系统设置」里指定（留空时会自动挑该网盘的默认账号）。
-		"instant_enabled":     "true",
-		"instant_disk_type":   "",
-		"instant_account_id":  "",
-		"instant_remote_dir":  "",
-		"instant_category_id": "",
-		// 多网盘并存：按网盘类型各指定一个转存账号 / 目录。
-		// 搜全网的结果是混杂多种网盘的，只配一个账号时别的网盘必然失败。
-		"instant_account_map":    "",
-		"instant_remote_dir_map": "",
 	}
 	for k, v := range defaults {
 		var existed int64

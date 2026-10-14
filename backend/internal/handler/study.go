@@ -21,22 +21,62 @@ func NewStudyHandler(db *gorm.DB, aiHandler *AIHandler) *StudyHandler {
 	return &StudyHandler{db: db, ai: aiHandler}
 }
 
-// Overview 学习统计概览
-func (h *StudyHandler) Overview(c *gin.Context) {
-	userID := util.GetUintQuery(c, "userId", 0)
-	startDate := c.DefaultQuery("startDate", time.Now().AddDate(0, 0, -30).Format("2006-01-02"))
-	endDate := c.DefaultQuery("endDate", time.Now().Format("2006-01-02"))
+// playStudyActions 计入「学习时长」的行为类型
+var playStudyActions = []string{"play_progress", "play_finish"}
 
+// resolveStudyUser 解析统计对象。
+//
+// 显式 userId 参数优先（管理端按选定用户查看）；未传时回落到**当前登录用户**。
+// 不能像以前那样缺省成 0 —— user_id=0 会让「总时长按全站合计、按目录/按天
+// 分布却硬编码 user_id=0 返回空」自相矛盾，孩子端正是那个不传 userId 的调用方。
+func resolveStudyUser(c *gin.Context) uint64 {
+	if v := util.GetUintQuery(c, "userId", 0); v > 0 {
+		return v
+	}
+	return util.CurrentUserID(c)
+}
+
+// scopedRecords 构造「日期区间 + 用户 + 学习行为」的基础查询。
+//
+// 区间比较用 study_date（写入时按本地时间生成的 YYYY-MM-DD）而不是 happened_at：
+// 字符串字典序即时间序，彻底避开「纯日期串 vs 带时区时间戳」的隐式转换，
+// 也省掉了原先 endDate+" 23:59:59" 漏掉最后一秒的毛病。
+//
+// 每次调用都新建查询：gorm 的链式 Where 会挂在同一个 Statement 上，
+// 复用变量会让条件互相污染。
+func (h *StudyHandler) scopedRecords(from, to string, userID uint64) *gorm.DB {
 	q := h.db.Model(&model.StudyRecord{}).
-		Where("happened_at >= ? AND happened_at < ?", startDate, endDate+" 23:59:59")
+		Where("study_date >= ? AND study_date <= ?", from, to).
+		Where("action IN ?", playStudyActions)
 	if userID > 0 {
 		q = q.Where("user_id = ?", userID)
 	}
+	return q
+}
+
+// sumDuration 统计区间内累计学习秒数
+func (h *StudyHandler) sumDuration(from, to string, userID uint64) int64 {
+	var sec int64
+	h.scopedRecords(from, to, userID).
+		Select("COALESCE(SUM(duration),0)").Scan(&sec)
+	return sec
+}
+
+// weekdayOffsetMonday 距本周一的天数（周一=0 … 周日=6）
+func weekdayOffsetMonday(t time.Time) int {
+	return (int(t.Weekday()) + 6) % 7
+}
+
+// Overview 学习统计概览
+func (h *StudyHandler) Overview(c *gin.Context) {
+	userID := resolveStudyUser(c)
+
+	now := time.Now()
+	startDate := c.DefaultQuery("startDate", now.AddDate(0, 0, -30).Format("2006-01-02"))
+	endDate := c.DefaultQuery("endDate", now.Format("2006-01-02"))
 
 	// 总时长（秒）
-	var totalSeconds int64
-	q.Where("action IN ?", []string{"play_progress", "play_finish"}).
-		Select("COALESCE(SUM(duration),0)").Scan(&totalSeconds)
+	totalSeconds := h.sumDuration(startDate, endDate, userID)
 
 	// 按目录统计（分钟）
 	type categoryStat struct {
@@ -45,11 +85,8 @@ func (h *StudyHandler) Overview(c *gin.Context) {
 		Minutes      int64  `json:"minutes"`
 	}
 	var byCategory []categoryStat
-	h.db.Model(&model.StudyRecord{}).
+	h.scopedRecords(startDate, endDate, userID).
 		Select("category_id, category_name, COALESCE(SUM(duration),0)/60 as minutes").
-		Where("happened_at >= ? AND happened_at < ?", startDate, endDate+" 23:59:59").
-		Where("user_id = ?", userID).
-		Where("action IN ?", []string{"play_progress", "play_finish"}).
 		Group("category_id, category_name").
 		Order("minutes desc").
 		Scan(&byCategory)
@@ -60,11 +97,8 @@ func (h *StudyHandler) Overview(c *gin.Context) {
 		Minutes int64  `json:"minutes"`
 	}
 	var byDay []dayStat
-	h.db.Model(&model.StudyRecord{}).
+	h.scopedRecords(startDate, endDate, userID).
 		Select("study_date as date, COALESCE(SUM(duration),0)/60 as minutes").
-		Where("happened_at >= ? AND happened_at < ?", startDate, endDate+" 23:59:59").
-		Where("user_id = ?", userID).
-		Where("action IN ?", []string{"play_progress", "play_finish"}).
 		Group("study_date").Order("study_date asc").
 		Scan(&byDay)
 
@@ -74,11 +108,8 @@ func (h *StudyHandler) Overview(c *gin.Context) {
 		Minutes int64 `json:"minutes"`
 	}
 	var byHour []hourStat
-	h.db.Model(&model.StudyRecord{}).
+	h.scopedRecords(startDate, endDate, userID).
 		Select("study_hour as hour, COALESCE(SUM(duration),0)/60 as minutes").
-		Where("happened_at >= ? AND happened_at < ?", startDate, endDate+" 23:59:59").
-		Where("user_id = ?", userID).
-		Where("action IN ?", []string{"play_progress", "play_finish"}).
 		Group("study_hour").Order("study_hour asc").
 		Scan(&byHour)
 
@@ -89,11 +120,13 @@ func (h *StudyHandler) Overview(c *gin.Context) {
 
 	// 学习天数（去重）
 	var daysCount int64
-	h.db.Model(&model.StudyRecord{}).
-		Where("happened_at >= ? AND happened_at < ?", startDate, endDate+" 23:59:59").
-		Where("user_id = ?", userID).
-		Where("action IN ?", []string{"play_progress", "play_finish"}).
-		Distinct("study_date").Count(&daysCount)
+	h.scopedRecords(startDate, endDate, userID).Distinct("study_date").Count(&daysCount)
+
+	// 今日 / 本周（周一为起点）
+	today := now.Format("2006-01-02")
+	weekStart := now.AddDate(0, 0, -weekdayOffsetMonday(now)).Format("2006-01-02")
+	todaySeconds := h.sumDuration(today, today, userID)
+	weekSeconds := h.sumDuration(weekStart, today, userID)
 
 	util.OK(c, gin.H{
 		"totalMinutes":        totalSeconds / 60,
@@ -103,13 +136,28 @@ func (h *StudyHandler) Overview(c *gin.Context) {
 		"byHour":              byHour,
 		"finishedResources":   finished,
 		"inProgressResources": inProgress,
+
+		// 孩子端「我的」页顶部三个数字直接吃这几个字段
+		"todaySeconds": todaySeconds,
+		"weekSeconds":  weekSeconds,
+		"todayMinutes": todaySeconds / 60,
+		"weekMinutes":  weekSeconds / 60,
 	})
 }
 
-// Records 学习记录明细
+// Records 学习记录明细。
+//
+// groupBy=resource 时按资源聚合：一次播放会每 15 秒落一条心跳记录，
+// 直接列明细的话孩子端「学习记录」会被同一个资源刷屏，看不出"学了什么"。
+// 聚合后每行 = 一个资源，带累计时长与最后学习时间。
 func (h *StudyHandler) Records(c *gin.Context) {
 	page, pageSize := util.GetPage(c)
-	userID := util.GetUintQuery(c, "userId", 0)
+	userID := resolveStudyUser(c)
+
+	if c.Query("groupBy") == "resource" {
+		h.recordsGroupedByResource(c, page, pageSize, userID)
+		return
+	}
 
 	q := h.db.Model(&model.StudyRecord{})
 	if userID > 0 {
@@ -121,6 +169,109 @@ func (h *StudyHandler) Records(c *gin.Context) {
 	var list []model.StudyRecord
 	q.Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&list)
 	util.Page(c, total, page, pageSize, list)
+}
+
+// recordsGroupedByResource 按资源聚合的学习记录
+//
+// 这里刻意用裸 SQL + 手工 Scan，而不是 `Model(...).Scan(&聚合结构)`：
+// gorm 的自动扫描在这种"聚合别名 + 自定义结构"的组合下会**静默丢列**
+// （实测 `COUNT(*) AS times`、`MAX(happened_at) AS happened_at` 都扫不进来，
+// 不报错、直接给零值），踩过一次不想再踩。手工 Scan 按 SELECT 顺序取，稳。
+func (h *StudyHandler) recordsGroupedByResource(c *gin.Context, page, pageSize int, userID uint64) {
+	where := ""
+	countArgs := []interface{}{}
+	if userID > 0 {
+		where = " WHERE user_id = ?"
+		countArgs = append(countArgs, userID)
+	}
+
+	var total int64
+	if err := h.db.Raw("SELECT COUNT(DISTINCT resource_id) FROM study_records"+where, countArgs...).
+		Scan(&total).Error; err != nil {
+		util.ServerError(c, "统计学习记录失败")
+		return
+	}
+
+	const cols = `SELECT resource_id,
+			MAX(resource_title)       AS resource_title,
+			MAX(category_id)          AS category_id,
+			MAX(category_name)        AS category_name,
+			MAX(media_type)           AS media_type,
+			COALESCE(SUM(duration),0) AS duration,
+			MAX(happened_at)          AS happened_at,
+			COUNT(*)                  AS times
+		FROM study_records`
+
+	args := append([]interface{}{}, countArgs...)
+	// PostgreSQL 不允许 ORDER BY 引用既不在 GROUP BY、又不是聚合结果的列，
+	// 所以排序键必须写作 MAX(happened_at)。
+	sqlText := cols + where + " GROUP BY resource_id ORDER BY MAX(happened_at) DESC LIMIT ? OFFSET ?"
+	args = append(args, pageSize, (page-1)*pageSize)
+
+	rows, err := h.db.Raw(sqlText, args...).Rows()
+	if err != nil {
+		util.ServerError(c, "查询学习记录失败")
+		return
+	}
+	defer rows.Close()
+
+	list := make([]studyItem, 0)
+	for rows.Next() {
+		var it studyItem
+		// happened_at 扫成 interface{} 再自行解析：PostgreSQL 的 timestamptz
+		// 直接给 time.Time，而 SQLite 存的是字符串，sql.NullTime 只认
+		// time.Time（字符串会报 unsupported Scan），两边都要能跑。
+		var rawHappenedAt interface{}
+		if err := rows.Scan(
+			&it.ResourceID, &it.ResourceTitle, &it.CategoryID,
+			&it.CategoryName, &it.MediaType, &it.Duration,
+			&rawHappenedAt, &it.Times,
+		); err != nil {
+			util.ServerError(c, "读取学习记录失败")
+			return
+		}
+		it.HappenedAt = parseFlexibleTime(rawHappenedAt)
+		list = append(list, it)
+	}
+
+	util.Page(c, total, page, pageSize, list)
+}
+
+// parseFlexibleTime 解析各数据库驱动返回的时间表示
+func parseFlexibleTime(v interface{}) time.Time {
+	switch t := v.(type) {
+	case time.Time:
+		return t
+	case []byte:
+		return parseFlexibleTime(string(t))
+	case string:
+		for _, layout := range []string{
+			time.RFC3339Nano,
+			"2006-01-02 15:04:05.999999999-07:00",
+			"2006-01-02 15:04:05.999999999",
+			"2006-01-02 15:04:05-07:00",
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05.999999999",
+			time.DateOnly,
+		} {
+			if parsed, err := time.Parse(layout, t); err == nil {
+				return parsed
+			}
+		}
+	}
+	return time.Time{}
+}
+
+// studyItem 按资源聚合后的一行
+type studyItem struct {
+	ResourceID    uint64    `json:"resourceId"`
+	ResourceTitle string    `json:"resourceTitle"`
+	CategoryID    uint64    `json:"categoryId"`
+	CategoryName  string    `json:"categoryName"`
+	MediaType     string    `json:"mediaType"`
+	Duration      int64     `json:"duration"`
+	HappenedAt    time.Time `json:"happenedAt"`
+	Times         int64     `json:"times"`
 }
 
 // Analyze 生成 AI 学情报告

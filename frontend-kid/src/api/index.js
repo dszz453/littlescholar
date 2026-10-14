@@ -64,18 +64,6 @@ export const resourceApi = {
   facets: (params) => http.get('/app/resources/facets', { params }),
 }
 
-export const searchApi = {
-  // 搜全网：聚合全网网盘分享（走 PanSou）
-  global: (data) => http.post('/app/search/global', data),
-}
-
-export const instantApi = {
-  // 即时转存播放：把搜到的分享转存到系统配置的网盘目录，并返回可播放资源
-  play: (data) => http.post('/app/instant/play', data),
-  // 浏览分享内的目录层级（搜全网里"一层文件夹一层打开"）
-  browse: (data) => http.post('/app/instant/browse', data),
-}
-
 export const playApi = {
   // 获取播放信息（含播放地址、断点位置）
   //
@@ -97,4 +85,7 @@ export const aiApi = {
 
 export const studyApi = {
   overview: (params) => http.get('/app/study/overview', { params }),
+  // 学习记录明细。groupBy=resource 时按资源聚合（一次播放每 15 秒一条心跳，
+  // 不聚合的话同一个资源会把列表刷屏）。
+  records: (params) => http.get('/app/study/records', { params }),
 }
