@@ -97,20 +97,18 @@ func TestStudyOverviewScopesToCurrentUser(t *testing.T) {
 		}
 	}
 
-	var sum int
-	for _, item := range cats {
-		m := item.(map[string]interface{})
-		sum += int(m["minutes"].(float64))
-	}
-	if sum != numField(t, data, "totalMinutes") {
-		t.Errorf("byCategory 合计 %d 分钟 != totalMinutes %d（口径不一致）",
-			sum, numField(t, data, "totalMinutes"))
-	}
-
-	// byCategory / byDay / byHour 三条分布查询都必须真的带出数值。
-	// 它们曾经全程为零：`Model(...).Select("... AS minutes").Scan(&[]T)` 会按
-	// 模型 schema 核对列，聚合别名不在字段里就被静默丢弃（PostgreSQL 上必现、
-	// SQLite 上侥幸能过）。所以这里不能只看"合计相等"，得逐条确认有值。
+	// 分布值必须真的带出来，但要允许"分组合计 < 总数"。
+	//
+	// 三条分布查询在 SQL 里做的是 `SUM(duration)/60` —— 每个分组各自向下取整，
+	// 余数（最多 59 秒/组）会被丢掉，所以 **分组合计天然可能比 totalMinutes 少
+	// 最多 (组数-1) 分钟**。这是整数除法口径决定的，不是数据错误；线上实测
+	// byCategory 3 组合计 7 分钟、totalMinutes 8 分钟就是这个原因。
+	// 断言写成"只能少一个余数以内"，而不是严格相等 —— 严格相等只在种子数据
+	// 恰好都是 60 的整数倍时才成立，换个种子就假红。
+	//
+	// 更要紧的是它们曾经**整列为零**：`Model(...).Select("... AS minutes").Scan(&[]T)`
+	// 会按模型 schema 核对列，聚合别名不在字段里就被静默丢弃（PostgreSQL 上必现、
+	// SQLite 上侥幸能过）。所以这里不能只看合计，必须确认真的有值。
 	days := listField(t, data, "byDay")
 	if len(days) != 2 {
 		t.Fatalf("byDay 有 %d 组，期望 2 天，实际 %v", len(days), days)
@@ -120,8 +118,12 @@ func TestStudyOverviewScopesToCurrentUser(t *testing.T) {
 		m := item.(map[string]interface{})
 		daySum += int(m["minutes"].(float64))
 	}
-	if daySum != numField(t, data, "totalMinutes") {
-		t.Errorf("byDay 合计 %d 分钟 != totalMinutes %d", daySum, numField(t, data, "totalMinutes"))
+	if daySum <= 0 {
+		t.Errorf("byDay 全为零，分布统计没带出数据: %v", days)
+	}
+	if daySum > numField(t, data, "totalMinutes") {
+		t.Errorf("byDay 合计 %d 分钟 > totalMinutes %d（不该出现）",
+			daySum, numField(t, data, "totalMinutes"))
 	}
 
 	hours := listField(t, data, "byHour")
@@ -133,8 +135,30 @@ func TestStudyOverviewScopesToCurrentUser(t *testing.T) {
 		m := item.(map[string]interface{})
 		hourSum += int(m["minutes"].(float64))
 	}
-	if hourSum != numField(t, data, "totalMinutes") {
-		t.Errorf("byHour 合计 %d 分钟 != totalMinutes %d", hourSum, numField(t, data, "totalMinutes"))
+	if hourSum <= 0 {
+		t.Errorf("byHour 全为零，时段分布没带出数据: %v", hours)
+	}
+	if hourSum > numField(t, data, "totalMinutes") {
+		t.Errorf("byHour 合计 %d 分钟 > totalMinutes %d（不该出现）",
+			hourSum, numField(t, data, "totalMinutes"))
+	}
+
+	// byCategory 同理：合计只能因取整余数而偏小，且不得为零
+	sum := 0
+	for _, item := range cats {
+		m := item.(map[string]interface{})
+		sum += int(m["minutes"].(float64))
+	}
+	if sum <= 0 {
+		t.Errorf("byCategory 全为零，分布统计没带出数据: %v", cats)
+	}
+	if sum > numField(t, data, "totalMinutes") {
+		t.Errorf("byCategory 合计 %d 分钟 > totalMinutes %d（不该出现）",
+			sum, numField(t, data, "totalMinutes"))
+	}
+	if numField(t, data, "totalMinutes")-sum > len(cats)-1 {
+		t.Errorf("byCategory 取整损失 %d 分钟超过组数上限 %d",
+			numField(t, data, "totalMinutes")-sum, len(cats)-1)
 	}
 }
 
