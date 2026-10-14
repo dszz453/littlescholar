@@ -45,7 +45,7 @@ class ServerSetupView(
         addView(subtitle("孩子端 · 请先填写服务器地址"))
 
         input.apply {
-            hint = ServerConfig.default.ifEmpty { "http://192.168.31.220:8093" }
+            hint = ServerConfig.default.ifEmpty { "https://study.19860819.xyz:8616" }
             setText(ServerConfig.default)
             setSingleLine(true)
             inputType = InputType.TYPE_TEXT_VARIATION_URI

@@ -177,6 +177,30 @@
         <span class="qb-hint">{{ modeHint }}</span>
       </section>
 
+      <!-- ===== 上一首 / 下一首 =====
+           以前只能在锁屏 / 耳机上用系统媒体控件换集，页面上没有入口 ——
+           手机上想换一首还得去翻播放列表。
+           这两个按钮与锁屏、通知栏走的是同一套 prevTrackId/nextTrackId，
+           顺序 / 随机 / 单曲三种模式下的行为完全一致，不会各走各的。 -->
+      <section v-if="canSwitch" class="track-nav">
+        <button
+          class="track-btn pressable"
+          :disabled="!hasPrev"
+          aria-label="上一首"
+          @click="goPrevTrack"
+        >
+          ⏮ 上一首
+        </button>
+        <button
+          class="track-btn pressable"
+          :disabled="!hasNext"
+          aria-label="下一首"
+          @click="goNextTrack"
+        >
+          下一首 ⏭
+        </button>
+      </section>
+
       <!-- ===== 播放控制条（音频 / 图片 / PDF 用，视频用原生控件） ===== -->
       <section v-if="isAudio && !error" class="controls">
         <button class="skip pressable" @click="seekBy(-15)" aria-label="后退15秒">↺15</button>
@@ -970,6 +994,24 @@ function prevTrackId() {
   return idx > 0 ? playlist.value[idx - 1].id : 0
 }
 
+/* ---------- 上一首 / 下一首（页面按钮） ---------- */
+// 只有一集时不显示这一栏：摆两个必然点不动的按钮只会让人困惑。
+const canSwitch = computed(() => !error.value && playlist.value.length > 1)
+
+// 顺序播放到两头时把按钮置灰 —— 比"点了没反应"更清楚
+const hasPrev = computed(() => prevTrackId() !== 0)
+const hasNext = computed(() => nextTrackId() !== 0)
+
+function goPrevTrack() {
+  const id = prevTrackId()
+  if (id) goTo(id)
+}
+
+function goNextTrack() {
+  const id = nextTrackId()
+  if (id) goTo(id)
+}
+
 /* ---------- 切换资源 ---------- */
 // switchTo 点击列表项：已经在播的那集只收弹层，不重新加载
 function switchTo(id) {
@@ -1039,6 +1081,15 @@ function onPageHide() {
 }
 
 onMounted(() => {
+  // 给安卓壳（以及任何宿主）用的最小桥：通知栏 / 锁屏 / 车机的
+  // 上一首、下一首、播放暂停都调这里，与页面按钮、系统媒体面板
+  // 共用同一套实现 —— 换集逻辑只存在一份。
+  window.__kidMedia = {
+    prev: goPrevTrack,
+    next: goNextTrack,
+    toggle: () => togglePlay(),
+    isPlaying: () => isPlaying.value,
+  }
   load()
   startReportTimer()
   document.addEventListener('visibilitychange', onVisibilityChange)
@@ -1046,6 +1097,12 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  // 离开播放页要把桥摘掉，否则宿主会拿到一个已经卸载的组件上的旧闭包
+  try {
+    delete window.__kidMedia
+  } catch (e) {
+    window.__kidMedia = null
+  }
   cleanupMedia()
   stopTranscodePolling()
   document.removeEventListener('visibilitychange', onVisibilityChange)
@@ -1409,7 +1466,31 @@ watch(isPlaying, (v) => {
   align-items: center;
   justify-content: center;
   gap: 34px;
-  padding: 22px 16px 10px;
+  padding: 12px 16px 10px;
+}
+
+/* ===== 上一首 / 下一首 ===== */
+.track-nav {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  padding: 18px 16px 0;
+}
+.track-btn {
+  flex: 1 1 0;
+  max-width: 168px;
+  border: none;
+  background: #fff;
+  color: var(--c-text);
+  font-size: 14.5px;
+  font-weight: 600;
+  padding: 13px 10px;
+  border-radius: 999px;
+  box-shadow: var(--shadow-sm);
+}
+.track-btn:disabled {
+  opacity: 0.42;
+  box-shadow: none;
 }
 .play-btn {
   width: 66px;

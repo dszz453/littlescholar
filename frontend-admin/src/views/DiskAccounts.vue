@@ -31,7 +31,7 @@
         <el-input
           v-model="kidUrl"
           class="ke-input"
-          placeholder="http://192.168.31.220:8093"
+          placeholder="https://study.19860819.xyz:8616"
           @keyup.enter="refreshQr"
         >
           <template #append>
@@ -39,8 +39,8 @@
           </template>
         </el-input>
         <div class="ke-tip text-secondary">
-          默认按当前访问的域名 + 孩子端端口 <b>8093</b> 猜出来；若孩子端设备在家用，
-          改成内网地址（如 <code>http://192.168.31.220:8093</code>）会更快、也不绕公网。
+          默认是线上入口 <code>https://study.19860819.xyz:8616</code>；若孩子端设备在家用，可改成内网地址
+          （如 <code>http://192.168.31.220:8093</code>）—— 更快、也不绕公网。
         </div>
       </div>
       <div class="ke-qr-wrap">
@@ -316,12 +316,16 @@ const groups = [
 const kidUrl = ref('')
 const kidQrCanvas = ref(null)
 
-/** 猜一个孩子端地址：优先上次填过的，否则「当前域名 + :8093」。 */
+// 孩子端线上入口（当前部署）。写成常量而不是"当前域名换端口"：
+// 孩子端与后台现在不在同一个域名/端口上（后台在内网口，孩子端走
+// study.19860819.xyz:8616），靠猜必然猜错。
+const KID_URL_DEFAULT = 'https://study.19860819.xyz:8616'
+
+/** 猜一个孩子端地址：优先上次填过的，否则用线上入口。 */
 function guessKidUrl() {
   const saved = localStorage.getItem('ls_kid_url')
   if (saved) return saved
-  const { protocol, hostname } = window.location
-  return `${protocol}//${hostname}:8093`
+  return KID_URL_DEFAULT
 }
 
 async function refreshQr() {

@@ -2,6 +2,7 @@ package xyz.littlescholar.kid
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -102,6 +103,20 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
 
         setupWebView(root)
+
+        // 让"最近任务（任务中心）"里的卡片显示「小书童」+ 应用图标 + 品牌色，
+        // 而不是把网页标题或一片白当成卡片预览。不带这行的表现是：卡片上
+        // 只有 URL / 空白，家长在多任务里认不出这个 App。
+        setTaskDescription(
+            ActivityManager.TaskDescription(
+                getString(R.string.app_name),
+                R.mipmap.ic_launcher,
+                ContextCompat.getColor(this, R.color.brand)
+            )
+        )
+
+        // 通知栏 / 锁屏的上一首、下一首要作用到 WebView 里的播放器
+        MediaBridge.attach(webView)
 
         swipe.setOnRefreshListener {
             webView.reload()
@@ -335,6 +350,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        MediaBridge.detach()
         webView.destroy()
         super.onDestroy()
     }

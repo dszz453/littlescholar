@@ -30,6 +30,11 @@ class MediaPlaybackService : Service() {
 
         const val ACTION_START = "xyz.littlescholar.kid.START"
         const val ACTION_STOP = "xyz.littlescholar.kid.STOP"
+        // 通知栏上的三个按钮。它们不自己实现换集，而是通过 MediaBridge
+        // 转给播放页 —— 换集逻辑只存在一份（见 MediaBridge 的注释）。
+        const val ACTION_PREV = "xyz.littlescholar.kid.PREV"
+        const val ACTION_TOGGLE = "xyz.littlescholar.kid.TOGGLE"
+        const val ACTION_NEXT = "xyz.littlescholar.kid.NEXT"
 
         fun start(ctx: Context) {
             val i = Intent(ctx, MediaPlaybackService::class.java).apply {
@@ -66,6 +71,21 @@ class MediaPlaybackService : Service() {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
+            }
+            // 通知栏按钮：转给网页执行。服务本身不持播放状态，
+            // 也不刷新通知文案 —— "正在播放哪一集"由页面文案承担，
+            // 这里只做"按一下就换集"，简单可靠。
+            ACTION_PREV -> {
+                MediaBridge.prev()
+                return START_STICKY
+            }
+            ACTION_TOGGLE -> {
+                MediaBridge.toggle()
+                return START_STICKY
+            }
+            ACTION_NEXT -> {
+                MediaBridge.next()
+                return START_STICKY
             }
             else -> {
                 startForeground(NOTI_ID, buildNotification())
@@ -107,9 +127,27 @@ class MediaPlaybackService : Service() {
             .setOngoing(true)
             .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            // 上一首 / 播放暂停 / 下一首。
+            // 系统媒体面板（MediaSession）也会出现这三个，两者并存不冲突：
+            // 面板在锁屏与下拉通知里，这里的按钮则保证"通知卡片被展开/被折叠"
+            // 的机型上也有入口。
+            .addAction(0, getString(R.string.noti_prev), action(ACTION_PREV))
+            .addAction(0, getString(R.string.noti_toggle), action(ACTION_TOGGLE))
+            .addAction(0, getString(R.string.noti_next), action(ACTION_NEXT))
 
         // O 以下用大图样式占位；O+ 由系统媒体面板接管
         return builder.build()
+    }
+
+    /** 通知按钮用的 PendingIntent：回到本服务处理。 */
+    private fun action(act: String): PendingIntent {
+        val i = Intent(this, MediaPlaybackService::class.java).apply { action = act }
+        return PendingIntent.getService(
+            this,
+            act.hashCode(),
+            i,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
     }
 
     private fun acquireWakeLock() {
