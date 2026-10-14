@@ -736,7 +736,74 @@ func (u *UC) Transfer(ctx context.Context, cred *adapter.Credential, shareURL, p
 
 // ============ 播放 / 下载 ============
 
+// ucCookieRefreshTTL 同夸克：刷新后的 cookie 在内存里保留 5 分钟，
+// 覆盖"播放信息 + 取流"两次相邻调用，又不至于拖到 __puus 失效。
+const ucCookieRefreshTTL = 5 * time.Minute
+
+type ucCachedCookie struct {
+	cookie string
+	exp    time.Time
+}
+
+var (
+	ucRefreshMu    sync.Mutex
+	ucRefreshCache = map[string]ucCachedCookie{} // key = 库里存的原始 cookie
+)
+
+// refreshCookie 用一次 file/sort 把 __puus 换成新鲜的。
+//
+// ⚠️ 与夸克同源的问题：UC 与夸克同属阿里系，CDN 准入同样看 __puus，而
+// 库里存的 cookie 是扫码那一刻的快照。__puus 旧了之后，列目录/取直链的
+// API 照样 200，但真去下载时 CDN 回 412 —— 孩子端就是「不能播放，可能
+// 地址过期或格式不支持」。修法见 quark.refreshCookie 的详细注释。
+//
+// UC 的 __puus 不是 /config 下发，而是要打一次 file/sort（与 exchangeTicket
+// 第二步一致）。
+func (u *UC) refreshCookie(ctx context.Context, cookie string, force bool) string {
+	if !force {
+		ucRefreshMu.Lock()
+		c, ok := ucRefreshCache[cookie]
+		ucRefreshMu.Unlock()
+		if ok && time.Now().Before(c.exp) {
+			return c.cookie
+		}
+	}
+
+	fresh, err := adapter.FetchCookies(ctx,
+		apiBase+"/file/sort?pr=UCBrowser&fr=pc&pdir_fid=0&_page=1&_size=50"+
+			"&_fetch_total=1&_fetch_sub_dirs=0&_sort=file_type:asc,updated_at:desc",
+		map[string]string{
+			"User-Agent": ucUA,
+			"Referer":    ucPan + "/",
+			"Cookie":     cookie,
+		})
+	if err != nil || strings.TrimSpace(fresh) == "" {
+		return cookie
+	}
+	merged := adapter.MergeCookie(cookie, fresh)
+
+	ucRefreshMu.Lock()
+	ucRefreshCache[cookie] = ucCachedCookie{cookie: merged, exp: time.Now().Add(ucCookieRefreshTTL)}
+	ucRefreshMu.Unlock()
+	return merged
+}
+
+// GetDirectLink 获取直链。先刷新 __puus 再取链，失败强制再刷一次重试。
 func (u *UC) GetDirectLink(ctx context.Context, cred *adapter.Credential, fileID string) (*adapter.DirectLink, error) {
+	cookie := u.refreshCookie(ctx, cred.Cookie, false)
+	link, err := u.fetchLink(ctx, cookie, fileID)
+	if err != nil {
+		link, err = u.fetchLink(ctx, u.refreshCookie(ctx, cred.Cookie, true), fileID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// UC 与夸克同属阿里系 CDN，准入同样看 Cookie —— 这里必须用刷新过的那份。
+	link.Headers = adapter.MediaHeaders(ucUA, "https://drive.uc.cn/", cookie)
+	return link, nil
+}
+
+func (u *UC) fetchLink(ctx context.Context, cookie, fileID string) (*adapter.DirectLink, error) {
 	var resp struct {
 		Code int `json:"code"`
 		Data []struct {
@@ -747,7 +814,7 @@ func (u *UC) GetDirectLink(ctx context.Context, cred *adapter.Credential, fileID
 	_, err := u.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
 		URL:     apiBase + "/file/download",
-		Headers: u.headers(cred.Cookie),
+		Headers: u.headers(cookie),
 		Query:   map[string]string{"pr": "UCBrowser", "fr": "pc"},
 		Body:    map[string]interface{}{"fids": []string{fileID}},
 	}, &resp)
@@ -760,9 +827,7 @@ func (u *UC) GetDirectLink(ctx context.Context, cred *adapter.Credential, fileID
 	return &adapter.DirectLink{
 		URL:          resp.Data[0].DownloadURL,
 		Size:         resp.Data[0].Size,
-		ExpiresAt: time.Now().Add(30 * time.Minute).Unix(),
-		// UC 与夸克同属阿里系 CDN，准入同样看 Cookie。
-		Headers:      adapter.MediaHeaders(ucUA, "https://drive.uc.cn/", cred.Cookie),
+		ExpiresAt:    time.Now().Add(30 * time.Minute).Unix(),
 		AcceptRanges: true,
 	}, nil
 }

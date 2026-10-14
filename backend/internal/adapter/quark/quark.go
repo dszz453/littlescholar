@@ -747,8 +747,95 @@ func (q *Quark) Transfer(ctx context.Context, cred *adapter.Credential, shareURL
 
 // ============ 播放 / 下载 ============
 
-// GetDirectLink 获取直链
+// cookieRefreshTTL 刷新后的 cookie 在内存里保留多久。
+//
+// 太短 → 每次取直链都多打一次 /config；太长 → 拿一个已经过期的 __puus 去下载。
+// 5 分钟足够覆盖"播放信息 + 取流"这两次相邻调用（它们各自都会取一次直链），
+// 又不至于拖到 __puus 失效。
+const cookieRefreshTTL = 5 * time.Minute
+
+type cachedCookie struct {
+	cookie string
+	exp    time.Time
+}
+
+var (
+	cookieCacheMu sync.Mutex
+	cookieCache   = map[string]cachedCookie{} // key = 库里存的原始 cookie
+)
+
+// refreshCookie 用一次 /config 把 __puus 换成新鲜的，返回合并后的 cookie。
+//
+// ⚠️ 这条是夸克「能列目录、但一播就 412」的唯一根因，别删。
+//
+// __puus 是夸克 CDN 的准入凭据，而且**只在业务请求的 Set-Cookie 里下发**
+// （换票响应中没有，见 exchangeTicket 的注释）。库里存的是扫码那一刻的快照，
+// 放几个小时后 __puus 就旧了。此时夸克的处理非常有迷惑性：
+//
+//   - 列目录 / 取直链的 API 照常 200（它们不校验 __puus 新鲜度），
+//     管理端看账号状态、看资源列表、看"检查"全部正常；
+//   - 但拿这张直链真去下载时，CDN 一律回 412 Precondition Failed。
+//
+// 到孩子端就是「不能播放，可能地址过期或格式不支持」——而且换个资源、重进
+// 页面都没用，因为每次取链用的都还是那张旧 cookie。
+//
+// 实测对照（同一个文件、同一台机器）：
+//
+//	旧 cookie 取链 → CDN GET 412（去掉 Cookie / Referer / UA 各种组合仍 412）
+//	先刷新 __puus 再取链 → CDN GET 206 + 真实字节
+//
+// 与参考实现一致：OpenList 的 drivers/quark_uc 是在**每个响应**里把 Set-Cookie
+// 的 __puus 回写进自己的 cookie 并持久化（见其 request()）。我们在播放这条
+// 读路径上按需刷新，效果等价且不必改库。
+//
+// 刷新失败不报错：退回原 cookie，避免网络抖动把"本来能播的"改成"刷新失败"。
+func (q *Quark) refreshCookie(ctx context.Context, cookie string, force bool) string {
+	if !force {
+		cookieCacheMu.Lock()
+		c, ok := cookieCache[cookie]
+		cookieCacheMu.Unlock()
+		if ok && time.Now().Before(c.exp) {
+			return c.cookie
+		}
+	}
+
+	fresh, err := adapter.FetchCookies(ctx, baseURL+"/config?pr=ucpro&fr=pc&uc_param_str=", map[string]string{
+		"User-Agent": userAgent,
+		"Referer":    "https://pan.quark.cn/",
+		"Cookie":     cookie,
+	})
+	if err != nil || strings.TrimSpace(fresh) == "" {
+		return cookie
+	}
+	merged := adapter.MergeCookie(cookie, fresh)
+
+	cookieCacheMu.Lock()
+	cookieCache[cookie] = cachedCookie{cookie: merged, exp: time.Now().Add(cookieRefreshTTL)}
+	cookieCacheMu.Unlock()
+	return merged
+}
+
+// GetDirectLink 获取直链。
+//
+// 顺序很重要：**先刷新 cookie 再取链** —— 链和 cookie 必须"同时新鲜"，
+// 只换其中一个都不行（旧链配新 cookie 一样 412）。
+// 另外取链失败时会强制再刷一次重试，因为夸克偶发回 code=15000（inner error），
+// 多数是 __puus 刚好在这一刻过期。
 func (q *Quark) GetDirectLink(ctx context.Context, cred *adapter.Credential, fileID string) (*adapter.DirectLink, error) {
+	cookie := q.refreshCookie(ctx, cred.Cookie, false)
+	link, err := q.fetchLink(ctx, cookie, fileID)
+	if err != nil {
+		link, err = q.fetchLink(ctx, q.refreshCookie(ctx, cred.Cookie, true), fileID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	link.Headers = adapter.MediaHeaders(userAgent, "https://pan.quark.cn/", cookie)
+	return link, nil
+}
+
+// fetchLink 用给定 cookie 打一次 /file/download。
+func (q *Quark) fetchLink(ctx context.Context, cookie, fileID string) (*adapter.DirectLink, error) {
 	var resp struct {
 		Status int `json:"status"`
 		Code   int `json:"code"`
@@ -760,7 +847,7 @@ func (q *Quark) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
 		URL:     baseURL + "/file/download",
-		Headers: q.headers(cred.Cookie),
+		Headers: q.headers(cookie),
 		Query:   map[string]string{"pr": "ucpro", "fr": "pc"},
 		Body:    map[string]interface{}{"fids": []string{fileID}},
 	}, &resp)
@@ -773,10 +860,7 @@ func (q *Quark) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 	return &adapter.DirectLink{
 		URL:          resp.Data[0].DownloadURL,
 		Size:         resp.Data[0].Size,
-		ExpiresAt: time.Now().Add(30 * time.Minute).Unix(),
-		// Cookie 是必需的：夸克 CDN 靠它做准入，只带 UA/Referer 会被
-		// 判 412（实测，见 adapter.MediaHeaders 的注释）。
-		Headers:      adapter.MediaHeaders(userAgent, "https://pan.quark.cn/", cred.Cookie),
+		ExpiresAt:    time.Now().Add(30 * time.Minute).Unix(),
 		AcceptRanges: true, // 夸克直链支持 Range
 	}, nil
 }

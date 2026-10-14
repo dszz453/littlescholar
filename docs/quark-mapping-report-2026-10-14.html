@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>夸克网盘「孩子学习」整理验收报告</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --line:#e5e7eb; --text:#1f2328; --muted:#6b7280;
+    --brand:#2563eb; --brand-soft:#eff6ff; --ok:#15803d; --ok-soft:#f0fdf4;
+    --warn:#b45309; --warn-soft:#fffbeb; --chip:#f3f4f6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:28px 20px 56px;background:var(--bg);color:var(--text);
+    font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;}
+  .wrap{max-width:1080px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 6px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+  .sub code{background:var(--chip);padding:1px 6px;border-radius:5px;font-size:12px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:12px;margin-bottom:26px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .card .k{font-size:12px;color:var(--muted);letter-spacing:.02em}
+  .card .v{font-size:24px;font-weight:650;margin-top:4px;line-height:1.2}
+  .card .n{font-size:11.5px;color:var(--muted);margin-top:2px}
+  .card.hi{background:var(--brand-soft);border-color:#bfdbfe}
+  .card.hi .v{color:var(--brand)}
+  h2{font-size:15px;margin:30px 0 12px;padding-left:10px;border-left:3px solid var(--brand)}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:6px 18px 14px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-weight:600;color:var(--muted);font-size:12px;background:#fafbfc}
+  tr:last-child td{border-bottom:none}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .tree{font-size:13px}
+  .tree .lv1{font-weight:650;color:var(--brand);margin-top:10px}
+  .tree .lv2{padding-left:20px;margin-top:3px}
+  .tree .lv3{padding-left:44px;color:var(--muted);font-size:12.5px}
+  .tree .cnt{color:var(--muted);font-variant-numeric:tabular-nums;font-size:12px}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:20px;background:var(--chip);color:var(--muted);margin-left:6px}
+  .tag.ok{background:var(--ok-soft);color:var(--ok)}
+  .tag.warn{background:var(--warn-soft);color:var(--warn)}
+  ul{margin:6px 0 0;padding-left:22px}
+  li{margin:4px 0}
+  .note{background:var(--warn-soft);border:1px solid #fde68a;border-radius:10px;padding:12px 16px;font-size:13px}
+  footer{margin-top:34px;color:var(--muted);font-size:12px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>夸克网盘「孩子学习」内容整理 · 验收报告</h1>
+  <div class="sub">
+    2026-10-14 · 正式环境 <code>fn.19860819.xyz:8092</code>（新机 19878 / 飞牛 NAS）·
+    范围：<code>孩子学习</code> + <code>牛津树1-9童老师</code> + <code>新概念英语</code>
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="k">扫描到的叶子目录</div><div class="v">637</div><div class="n">原始，含全部子目录</div></div>
+    <div class="card"><div class="k">可播内容叶子</div><div class="v">436</div><div class="n">含音视频 / PDF</div></div>
+    <div class="card hi"><div class="k">按树结构去重后</div><div class="v">352</div><div class="n">剔除 (1)(2)(3) 副本</div></div>
+    <div class="card hi"><div class="k">新建映射</div><div class="v">343</div><div class="n">零失败</div></div>
+    <div class="card"><div class="k">新建分类</div><div class="v">34</div><div class="n">另复用 3 个已有</div></div>
+    <div class="card"><div class="k">入库资源</div><div class="v">6 236</div><div class="n">耗时 105 秒</div></div>
+    <div class="card"><div class="k">映射总量（现存）</div><div class="v">292</div><div class="n">清理后净额</div></div>
+    <div class="card"><div class="k">资源总量</div><div class="v">6 899</div><div class="n">全站可见</div></div>
+  </div>
+
+  <h2>一、内容类型分布（637 个原始叶子）</h2>
+  <div class="panel">
+    <table>
+      <tr><th>类型</th><th class="num">数量</th><th>处理</th></tr>
+      <tr><td>可播内容（MP3 / MP4 / PDF / 图片等）</td><td class="num">436</td><td><span class="tag ok">建映射</span></td></tr>
+      <tr><td>图片素材 + exe</td><td class="num">94</td><td><span class="tag">跳过</span></td></tr>
+      <tr><td>PPT</td><td class="num">73</td><td><span class="tag">跳过</span></td></tr>
+      <tr><td>DVD-VOB</td><td class="num">19</td><td><span class="tag">跳过</span></td></tr>
+      <tr><td>SWF</td><td class="num">15</td><td><span class="tag">跳过</span></td></tr>
+    </table>
+    <p style="color:var(--muted);font-size:12.5px;margin:12px 0 2px">
+      跳过项按「无效素材不建映射」的决策处理，不占用目录树。
+    </p>
+  </div>
+
+  <h2>二、整理后的目录结构（分类 · 资源数）</h2>
+  <div class="panel">
+    <div class="tree">
+      <div class="lv1">乐学英语 <span class="cnt">#1 · 6 749</span></div>
+
+      <div class="lv2">├─ 新概念英语 <span class="cnt">#2 · 1 003</span></div>
+      <div class="lv3">第一册精讲 171 · 第二册精讲 167 · 第三册精讲 167 · 第四册精讲 153<br>
+        雪梨老师·第一册 153 · 雪梨老师·跟读 64 · 国际音标 63 · 教材电子书 31 · 语法速成 11</div>
+
+      <div class="lv2">├─ 牛津树英语 <span class="cnt">#16 · 2 705</span></div>
+      <div class="lv3">童老师精讲 L1–L9 929 · 练习册 458 · 1–14 级 439 · 精讲·Peggy 285 ·
+        精讲·Susan 238 · 配套资料 158 · 自然拼读 132 · 动画 66</div>
+
+      <div class="lv2">├─ 桥梁书 <span class="cnt">#19 · 797</span></div>
+      <div class="lv3">驯龙大师 475（01/02/03）<span class="tag">已有</span> · 糊涂女佣 144<span class="tag">已有</span> ·
+        驯龙高手动画 118 · 苍蝇小子 60<span class="tag">已有</span> · 皮特猫 0</div>
+
+      <div class="lv2">├─ 神奇树屋 <span class="cnt">#31 · 491</span></div>
+      <div class="lv3">精读 1–6（47 / 49 / 50 / 24 / 46 / 47）· 配套读物 30</div>
+
+      <div class="lv2">├─ 培生英语 <span class="cnt">#32 · 740</span></div>
+      <div class="lv3">分级音频 289 · 绘本 PDF 277 · 分级视频 96 · 单词卡 36 · 培生故事 32 · 练习册 10</div>
+
+      <div class="lv2">└─ 典范英语 <span class="cnt">#61 · 1 013</span></div>
+      <div class="lv3">1–6 册 571 · 7–10 册 442</div>
+
+      <div class="lv1">开心故事 <span class="cnt">#9 · 147</span></div>
+      <div class="lv2">└─ 李哪吒校园狂想曲 <span class="cnt">#49 · 147</span></div>
+    </div>
+    <p style="color:var(--muted);font-size:12.5px;margin:14px 0 2px">
+      分类总数 65（顶层 5）。<b>目录树上的数字要打开才会计</b> —— <code>resourceCount</code> 是缓存字段，
+      需带 <code>?withResourceCount=true</code> 才回填；本报告的数字即由此取得。
+    </p>
+  </div>
+
+  <h2>三、去重与清理</h2>
+  <div class="panel">
+    <ul>
+      <li><b>去重规则</b>：副本判据放在树的每一层 —— 同一父目录下「存在无 <code>(N)</code> 后缀的兄弟」时，带 <code>(N)</code> 的才算副本。
+        只看叶子名会把 <code>Chapter (1)…(10)</code> 这类<b>合法分集</b>误判成重复。结果：21 个副本子树 / 84 个叶子，637 → <b>352</b>。</li>
+      <li><b>同步策略</b>：逐条 <code>POST /mappings/:id/sync</code>。全量同步是串行阻塞式，几百条必超时。</li>
+      <li><b>同步结果</b>：入库 <b>6 236</b> 条；失败 3（azw3/epub/mobi 不在后端媒体白名单）；跳过 443（file_id 已存在）。</li>
+      <li><b>冗余清理</b>：发现已有递归映射 <code>#11 Magic Tree House 01-55</code> 早已覆盖 58 个子目录 ——
+        <code>Register</code> 去重键是 <code>disk_account_id + file_id</code>（不分映射/分类），所以新映射同步全部 <code>skipped</code>、表现为「映射建了但 0 资源」。
+        连同 3 条无媒体、1 条旧映射、1 条重复叶子，<b>共删除 62 条冗余映射</b>，剩 <b>292 条</b>。</li>
+    </ul>
+  </div>
+
+  <h2>四、已知限制</h2>
+  <div class="note">
+    <ul style="margin:0">
+      <li><b>纯电子书目录播不了</b>：后端媒体白名单不含 <code>epub / mobi / azw3</code>（3 个目录，同步返回「没有找到可导入的媒体文件」）。</li>
+      <li><b>搜全网结果只自动挑一个文件播放</b>：接口返回 files 清单，但前端未提供选择入口。</li>
+      <li><b>天翼 / 阿里云盘不支持扫码</b>：只能用 Cookie / refresh_token（本轮未涉及）。</li>
+    </ul>
+  </div>
+
+  <footer>数据来源：<code>GET /api/admin/categories/tree?withResourceCount=true</code>、
+    <code>GET /api/admin/mappings</code>、<code>GET /api/admin/resources</code> · 采集于 2026-10-14</footer>
+</div>
+</body>
+</html>
