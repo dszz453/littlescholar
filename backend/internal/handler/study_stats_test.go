@@ -106,6 +106,36 @@ func TestStudyOverviewScopesToCurrentUser(t *testing.T) {
 		t.Errorf("byCategory 合计 %d 分钟 != totalMinutes %d（口径不一致）",
 			sum, numField(t, data, "totalMinutes"))
 	}
+
+	// byCategory / byDay / byHour 三条分布查询都必须真的带出数值。
+	// 它们曾经全程为零：`Model(...).Select("... AS minutes").Scan(&[]T)` 会按
+	// 模型 schema 核对列，聚合别名不在字段里就被静默丢弃（PostgreSQL 上必现、
+	// SQLite 上侥幸能过）。所以这里不能只看"合计相等"，得逐条确认有值。
+	days := listField(t, data, "byDay")
+	if len(days) != 2 {
+		t.Fatalf("byDay 有 %d 组，期望 2 天，实际 %v", len(days), days)
+	}
+	daySum := 0
+	for _, item := range days {
+		m := item.(map[string]interface{})
+		daySum += int(m["minutes"].(float64))
+	}
+	if daySum != numField(t, data, "totalMinutes") {
+		t.Errorf("byDay 合计 %d 分钟 != totalMinutes %d", daySum, numField(t, data, "totalMinutes"))
+	}
+
+	hours := listField(t, data, "byHour")
+	if len(hours) == 0 {
+		t.Fatal("byHour 为空，时段分布没带出数据")
+	}
+	hourSum := 0
+	for _, item := range hours {
+		m := item.(map[string]interface{})
+		hourSum += int(m["minutes"].(float64))
+	}
+	if hourSum != numField(t, data, "totalMinutes") {
+		t.Errorf("byHour 合计 %d 分钟 != totalMinutes %d", hourSum, numField(t, data, "totalMinutes"))
+	}
 }
 
 // groupBy=resource：一次播放每 15 秒落一条心跳，孩子端「学习记录」必须按资源

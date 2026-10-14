@@ -62,6 +62,108 @@ func (h *StudyHandler) sumDuration(from, to string, userID uint64) int64 {
 	return sec
 }
 
+// categoryStat / dayStat / hourStat 聚合结果的响应结构
+type categoryStat struct {
+	CategoryID   uint64 `json:"categoryId"`
+	CategoryName string `json:"categoryName"`
+	Minutes      int64  `json:"minutes"`
+}
+
+type dayStat struct {
+	Date    string `json:"date"`
+	Minutes int64  `json:"minutes"`
+}
+
+type hourStat struct {
+	Hour    int   `json:"hour"`
+	Minutes int64 `json:"minutes"`
+}
+
+// 三条分布查询一律走 Rows() + 手工按序扫描，**不用** Scan(&自定义切片)。
+//
+// 原因：`Model(&StudyRecord{}).Select("... AS secs").Scan(&[]T)` 里，gorm 会拿
+// Model 的 schema 去核对查询返回了哪些列，聚合别名 `secs` 不在 StudyRecord 的字段里
+// 就被静默丢弃 —— 不报错、直接留零值。SQLite 驱动下侥幸能过、PostgreSQL 下必现
+// （线上实测：totalMinutes=19 而 byCategory 全为 0），是"单测绿、线上废"的典型。
+// 手工扫描只认 SELECT 顺序，与驱动无关，测试与线上才真正走同一条路径。
+func (h *StudyHandler) categoryStats(from, to string, userID uint64) ([]categoryStat, error) {
+	rows, err := h.scopedRecords(from, to, userID).
+		Select("category_id, category_name, COALESCE(SUM(duration),0) AS secs").
+		Group("category_id, category_name").
+		Order("secs DESC").
+		Rows()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]categoryStat, 0)
+	for rows.Next() {
+		var (
+			it   categoryStat
+			secs int64
+		)
+		if err := rows.Scan(&it.CategoryID, &it.CategoryName, &secs); err != nil {
+			return nil, err
+		}
+		it.Minutes = secs / 60
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (h *StudyHandler) dayStats(from, to string, userID uint64) ([]dayStat, error) {
+	rows, err := h.scopedRecords(from, to, userID).
+		Select("study_date AS d, COALESCE(SUM(duration),0) AS secs").
+		Group("study_date").
+		Order("d ASC").
+		Rows()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]dayStat, 0)
+	for rows.Next() {
+		var (
+			it   dayStat
+			secs int64
+		)
+		if err := rows.Scan(&it.Date, &secs); err != nil {
+			return nil, err
+		}
+		it.Minutes = secs / 60
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (h *StudyHandler) hourStats(from, to string, userID uint64) ([]hourStat, error) {
+	rows, err := h.scopedRecords(from, to, userID).
+		Select("study_hour AS h, COALESCE(SUM(duration),0) AS secs").
+		Group("study_hour").
+		Order("h ASC").
+		Rows()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]hourStat, 0)
+	for rows.Next() {
+		var (
+			it   hourStat
+			secs int64
+		)
+		if err := rows.Scan(&it.Hour, &secs); err != nil {
+			return nil, err
+		}
+		it.Minutes = secs / 60
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
 // weekdayOffsetMonday 距本周一的天数（周一=0 … 周日=6）
 func weekdayOffsetMonday(t time.Time) int {
 	return (int(t.Weekday()) + 6) % 7
@@ -78,40 +180,23 @@ func (h *StudyHandler) Overview(c *gin.Context) {
 	// 总时长（秒）
 	totalSeconds := h.sumDuration(startDate, endDate, userID)
 
-	// 按目录统计（分钟）
-	type categoryStat struct {
-		CategoryID   uint64 `json:"categoryId"`
-		CategoryName string `json:"categoryName"`
-		Minutes      int64  `json:"minutes"`
+	// 分布统计（按目录 / 按天 / 按小时）与总数共用同一套过滤条件，
+	// 否则又会出现"总数有值、图表全空"的口径分裂。
+	byCategory, err := h.categoryStats(startDate, endDate, userID)
+	if err != nil {
+		util.ServerError(c, "读取分类统计失败")
+		return
 	}
-	var byCategory []categoryStat
-	h.scopedRecords(startDate, endDate, userID).
-		Select("category_id, category_name, COALESCE(SUM(duration),0)/60 as minutes").
-		Group("category_id, category_name").
-		Order("minutes desc").
-		Scan(&byCategory)
-
-	// 按天统计
-	type dayStat struct {
-		Date    string `json:"date"`
-		Minutes int64  `json:"minutes"`
+	byDay, err := h.dayStats(startDate, endDate, userID)
+	if err != nil {
+		util.ServerError(c, "读取学习趋势失败")
+		return
 	}
-	var byDay []dayStat
-	h.scopedRecords(startDate, endDate, userID).
-		Select("study_date as date, COALESCE(SUM(duration),0)/60 as minutes").
-		Group("study_date").Order("study_date asc").
-		Scan(&byDay)
-
-	// 按小时分布
-	type hourStat struct {
-		Hour    int   `json:"hour"`
-		Minutes int64 `json:"minutes"`
+	byHour, err := h.hourStats(startDate, endDate, userID)
+	if err != nil {
+		util.ServerError(c, "读取时段分布失败")
+		return
 	}
-	var byHour []hourStat
-	h.scopedRecords(startDate, endDate, userID).
-		Select("study_hour as hour, COALESCE(SUM(duration),0)/60 as minutes").
-		Group("study_hour").Order("study_hour asc").
-		Scan(&byHour)
 
 	// 完成 / 进行中资源数
 	var finished, inProgress int64
@@ -277,11 +362,11 @@ type studyItem struct {
 // Analyze 生成 AI 学情报告
 func (h *StudyHandler) Analyze(c *gin.Context) {
 	var req struct {
-		UserID      uint64     `json:"userId" binding:"required"`
-		StartDate   string     `json:"startDate"`
-		EndDate     string     `json:"endDate"`
-		AIConfigID  uint64     `json:"aiConfigId"`
-		ExtraPrompt string     `json:"extraPrompt"`
+		UserID      uint64 `json:"userId" binding:"required"`
+		StartDate   string `json:"startDate"`
+		EndDate     string `json:"endDate"`
+		AIConfigID  uint64 `json:"aiConfigId"`
+		ExtraPrompt string `json:"extraPrompt"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		util.BadRequest(c, "请指定要分析的用户")
@@ -402,29 +487,17 @@ func (h *StudyHandler) DeleteReport(c *gin.Context) {
 	util.OKWithMessage(c, "删除成功", nil)
 }
 
-// collectStats 汇总统计数据
+// collectStats 汇总统计数据（喂给 AI 学情分析）
 func (h *StudyHandler) collectStats(userID uint64, startDate, endDate string) map[string]interface{} {
-	type catStat struct {
-		CategoryName string `json:"categoryName"`
-		Minutes      int64  `json:"minutes"`
+	// 与 Overview 共用同一套分布查询，避免 AI 报告里的统计口径与页面不一致。
+	byCategory, err := h.categoryStats(startDate, endDate, userID)
+	if err != nil {
+		byCategory = nil
 	}
-	var byCategory []catStat
-	h.db.Model(&model.StudyRecord{}).
-		Select("category_name, COALESCE(SUM(duration),0)/60 as minutes").
-		Where("user_id = ? AND happened_at >= ? AND happened_at < ?", userID, startDate, endDate+" 23:59:59").
-		Where("action IN ?", []string{"play_progress", "play_finish"}).
-		Group("category_name").Order("minutes desc").Scan(&byCategory)
-
-	type dayStat struct {
-		Date    string `json:"date"`
-		Minutes int64  `json:"minutes"`
+	byDay, err := h.dayStats(startDate, endDate, userID)
+	if err != nil {
+		byDay = nil
 	}
-	var byDay []dayStat
-	h.db.Model(&model.StudyRecord{}).
-		Select("study_date as date, COALESCE(SUM(duration),0)/60 as minutes").
-		Where("user_id = ? AND happened_at >= ? AND happened_at < ?", userID, startDate, endDate+" 23:59:59").
-		Where("action IN ?", []string{"play_progress", "play_finish"}).
-		Group("study_date").Order("study_date asc").Scan(&byDay)
 
 	var totalMinutes int64
 	for _, d := range byDay {
@@ -435,12 +508,12 @@ func (h *StudyHandler) collectStats(userID uint64, startDate, endDate string) ma
 	h.db.Model(&model.PlayRecord{}).Where("user_id = ? AND finished = ?", userID, true).Count(&finished)
 
 	return map[string]interface{}{
-		"periodDays":         len(byDay),
-		"totalMinutes":       totalMinutes,
-		"avgMinutesPerDay":   safeDiv(totalMinutes, int64(len(byDay))),
-		"byCategory":         byCategory,
-		"byDay":              byDay,
-		"finishedResources":  finished,
+		"periodDays":        len(byDay),
+		"totalMinutes":      totalMinutes,
+		"avgMinutesPerDay":  safeDiv(totalMinutes, int64(len(byDay))),
+		"byCategory":        byCategory,
+		"byDay":             byDay,
+		"finishedResources": finished,
 	}
 }
 
