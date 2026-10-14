@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"fmt"
+
 	"github.com/gin-gonic/gin"
 	"github.com/littlescholar/core/internal/model"
 	"github.com/littlescholar/core/internal/service"
@@ -406,6 +408,7 @@ func (h *CategoryHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	var resCount, mapCount int64
 	err := h.db.Transaction(func(tx *gorm.DB) error {
 		ids := []uint64{id}
 		if cascade {
@@ -415,11 +418,40 @@ func (h *CategoryHandler) Delete(c *gin.Context) {
 				ids = append(ids, d.ID)
 			}
 		}
-		// 解除资源关联（把资源移到无目录状态或直接删除，这里选择删除关联并置空）
+
+		// ⚠️ 这里**绝不能再把资源的 category_id 置 0**。
+		//
+		// resources.category_id 上有外键 fk_resources_category（NO ACTION），
+		// 置 0 会立刻违反外键：
+		//
+		//	ERROR: insert or update on table "resources" violates foreign key
+		//	constraint "fk_resources_category" (SQLSTATE 23503)
+		//
+		// 事务随即回滚，接口只回一句「删除失败」—— 于是**任何有资源的目录都删不掉**。
+		// 而"有映射的目录"必然有资源（映射就是往里导资源的），用户看到的现象
+		// 就成了「目录里有映射就不能删除」。踩过一次，别再改回去。
+		//
+		// 正确做法：跟着目录一起**软删**。孩子端立刻看不到，也不留指向
+		// 已删目录的幽灵行。
 		if err := tx.Model(&model.Resource{}).Where("category_id IN ?", ids).
-			Update("category_id", 0).Error; err != nil {
+			Count(&resCount).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("category_id IN ?", ids).Delete(&model.Resource{}).Error; err != nil {
+			return err
+		}
+
+		// 映射一并删除（用户要的就是"删目录顺带删映射"）。
+		// 只软删即可满足外键 —— 分类自己也是软删 —— 但留着会变成指向
+		// 已删目录的悬空映射，在「资源映射」页里以空目录名的形式阴魂不散。
+		if err := tx.Model(&model.ResourceMapping{}).Where("category_id IN ?", ids).
+			Count(&mapCount).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("category_id IN ?", ids).Delete(&model.ResourceMapping{}).Error; err != nil {
+			return err
+		}
+
 		if err := tx.Where("category_id IN ?", ids).Delete(&model.UserCategoryGrant{}).Error; err != nil {
 			return err
 		}
@@ -430,7 +462,12 @@ func (h *CategoryHandler) Delete(c *gin.Context) {
 		return
 	}
 	h.perm.InvalidateAll() // 目录已删，清全部用户缓存
-	util.OKWithMessage(c, "删除成功", nil)
+
+	msg := "删除成功"
+	if resCount > 0 || mapCount > 0 {
+		msg = fmt.Sprintf("删除成功，并清理了 %d 个资源、%d 条映射", resCount, mapCount)
+	}
+	util.OKWithMessage(c, msg, gin.H{"removedResources": resCount, "removedMappings": mapCount})
 }
 
 // currentUser 从上下文取用户

@@ -162,13 +162,29 @@
                 Local Storage / 网络请求中取出 refresh_token 粘贴到此处。
               </div>
             </el-form-item>
-            <el-form-item v-else label="Cookie" required>
+            <el-form-item v-else label="Cookie" :required="form.diskType !== 'baidu'">
               <el-input
                 v-model="form.cookie"
                 type="textarea"
                 :rows="5"
                 placeholder="从浏览器开发者工具中复制完整 Cookie 字符串"
               />
+            </el-form-item>
+            <!-- 百度：可改用 AList 的 OAuth 路线（只要一个 refresh_token，长期有效）。
+                 填了就优先走 OAuth，不填则用上面的 Cookie。 -->
+            <el-form-item v-if="form.diskType === 'baidu'" label="刷新令牌">
+              <el-input
+                v-model="form.refreshToken"
+                type="textarea"
+                :rows="3"
+                placeholder="可选：百度 OAuth refresh_token（填了优先走 AList 的 OAuth 路线）"
+              />
+              <div class="form-tip">
+                与 Cookie 二选一即可。OAuth 路线能走官方取链（直接 302 播放），且不用怕 BDUSS 过期；<br />
+                但<b>转存分享仍需要 Cookie</b>。到
+                <a :href="baiduAuthUrl" target="_blank" rel="noopener">AList 授权页</a>
+                扫码授权后把回调页给出的 refresh_token 粘到这里。
+              </div>
             </el-form-item>
             <el-form-item label="备注名称">
               <el-input v-model="form.nickname" placeholder="如：我的夸克" />
@@ -270,6 +286,11 @@ const diskTypes = ref([])
 
 const addDialog = ref(false)
 const addTab = ref('qr')
+// AList 文档公开的授权入口（client_id 也是 AList 的），扫码后回调页会给出 refresh_token
+const baiduAuthUrl =
+  'https://openapi.baidu.com/oauth/2.0/authorize?response_type=code&client_id=hq9yQ9w9kR4YHj1kyYafLygVocobh7Sf' +
+  '&redirect_uri=https%3A%2F%2Falistgo.com%2Ftool%2Fbaidu%2Fcallback&scope=basic%2Cnetdisk&qrcode=1'
+
 const addDiskType = ref('quark')
 const addKind = ref('disk')
 const saving = ref(false)
@@ -369,7 +390,7 @@ function onTabChange(name) {
 
 function openAdd(kind) {
   addKind.value = kind || 'disk'
-  form.value = { diskType: addKind.value === 'disk' ? addDiskType.value : addKind.value, cookie: '', nickname: '', url: '', username: '', password: '', rootPath: '' }
+  form.value = { diskType: addKind.value === 'disk' ? addDiskType.value : addKind.value, cookie: '', refreshToken: '', nickname: '', url: '', username: '', password: '', rootPath: '' }
   addTab.value = 'qr'
   qrContent.value = ''
   qrImage.value = ''
@@ -485,11 +506,15 @@ async function save() {
   let payload = null
 
   if (addKind.value === 'disk') {
-    if (!f.cookie || !f.cookie.trim()) {
-      ElMessage.warning('请填写 Cookie / Token')
+    const cookie = (f.cookie || '').trim()
+    const rt = (f.refreshToken || '').trim()
+    if (!cookie && !rt) {
+      ElMessage.warning(f.diskType === 'baidu' ? '请填写 Cookie，或填 OAuth 刷新令牌' : '请填写 Cookie / Token')
       return
     }
-    payload = { diskType: f.diskType, cookie: f.cookie.trim(), nickname: f.nickname }
+    payload = { diskType: f.diskType, cookie, nickname: f.nickname }
+    // 百度：把 refresh_token 放进 extra，适配器据此改走 OAuth 路线
+    if (f.diskType === 'baidu' && rt) payload.extra = { refresh_token: rt }
   } else if (addKind.value === 'webdav') {
     if (!f.url || !f.url.trim()) {
       ElMessage.warning('请填写 WebDAV 地址')

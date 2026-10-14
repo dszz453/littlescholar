@@ -33,29 +33,6 @@
         <p class="s-intro">{{ digestCard.intro }}</p>
       </div>
 
-      <!-- 继续学习：有历史时显示 -->
-      <section v-if="recent.length" class="recent-wrap">
-        <div class="section-title">
-          <h2>接着上次看</h2>
-          <span class="more" @click="goHistory">全部 ›</span>
-        </div>
-
-        <div class="recent-scroll">
-          <div
-            v-for="r in recent"
-            :key="r.id"
-            class="recent-card pressable"
-            @click="goPlay(r)"
-          >
-            <span class="r-emoji">{{ recentEmoji(r) }}</span>
-            <div class="r-title ellipsis-2">{{ r.title }}</div>
-            <div class="r-progress" v-if="r.percent > 0">
-              <div class="bar" :style="{ width: r.percent + '%' }"></div>
-            </div>
-          </div>
-        </div>
-      </section>
-
       <!-- 主导航：一级图标网格 -->
       <div class="section-title">
         <h2>我的学习乐园</h2>
@@ -101,14 +78,13 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import SearchBar from '@/components/SearchBar.vue'
 import { useUserStore } from '@/stores/user'
-import { playApi, planApi, digestApi } from '@/api'
+import { planApi, digestApi } from '@/api'
 import { resolveIcon, tint } from '@/assets/icons'
 
 const router = useRouter()
 const userStore = useUserStore()
 
 const keyword = ref('')
-const recent = ref([])
 const loading = ref(true)
 // 今日任务（null = 没有计划，不显示这条）
 const planTask = ref(null)
@@ -152,11 +128,6 @@ function countOf(node) {
   return ''
 }
 
-function recentEmoji(r) {
-  const map = { audio: '🎧', video: '🎬', pdf: '📄', image: '🖼️' }
-  return map[r.mediaType] || '📚'
-}
-
 function onSearch(v) {
   if (!v) return
   router.push({ name: 'search', query: { q: v } })
@@ -165,14 +136,6 @@ function onSearch(v) {
 function goCategory(node) {
   // 有子级 → 进目录页；无子级但有资源 → 进目录页看资源列表
   router.push({ name: 'category', params: { id: node.id } })
-}
-
-function goPlay(r) {
-  router.push({ name: 'play', params: { id: r.id } })
-}
-
-function goHistory() {
-  router.push({ name: 'me', query: { tab: 'history' } })
 }
 
 function goPlan() {
@@ -236,14 +199,6 @@ onMounted(async () => {
   // 下面三个都是"有就显示、没有就不显示"，彼此独立，谁失败都不影响别人
   loadPlanTask()
   loadDigestCard()
-
-  // 最近播放，失败静默（新用户没有历史）
-  try {
-    const data = await playApi.history({ page: 1, pageSize: 6 })
-    recent.value = (data?.list || data || []).slice(0, 6)
-  } catch {
-    recent.value = []
-  }
 })
 </script>
 
@@ -352,55 +307,6 @@ onMounted(async () => {
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
-}
-
-/* ===== 继续学习（横向滚动） ===== */
-
-.recent-wrap {
-  margin: 0 -16px;
-}
-.recent-scroll {
-  display: flex;
-  gap: 11px;
-  overflow-x: auto;
-  padding: 2px 16px 6px;
-  scrollbar-width: none;
-}
-.recent-scroll::-webkit-scrollbar {
-  display: none;
-}
-
-.recent-card {
-  flex: 0 0 auto;
-  width: 128px;
-  padding: 13px;
-  background: #fff;
-  border-radius: var(--r-md);
-  box-shadow: var(--shadow-sm);
-}
-.r-emoji {
-  font-size: 25px;
-  line-height: 1;
-}
-.r-title {
-  margin-top: 8px;
-  font-size: 13.5px;
-  font-weight: 600;
-  line-height: 1.35;
-  min-height: 36px;
-}
-.r-progress {
-  margin-top: 8px;
-  height: 4px;
-  background: #eef2f7;
-  border-radius: 999px;
-  overflow: hidden;
-}
-.bar {
-  height: 100%;
-  background: var(--c-primary);
-  border-radius: 999px;
-  transition: width 0.3s ease;
 }
 
 /* ===== 一级图标网格 ===== */

@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -78,6 +80,17 @@ func (b *Baidu) api() string { return b.pan() + "/api" }
 //
 // 数字是 64 位（fs_id 已经到 3.1e13），所以不能退化成 float64。
 type flexInt64 int64
+
+// baiduListItem /api/list 与 /rest/2.0/xpan/file?method=list 的同构条目。
+// 两处响应形状一致，抽出来让 OAuth 与 Cookie 两条路共用一套转换。
+type baiduListItem struct {
+	FsID        flexInt64 `json:"fs_id"`
+	Path        string    `json:"path"`
+	ServerName  string    `json:"server_filename"`
+	IsDir       flexInt64 `json:"isdir"`
+	Size        flexInt64 `json:"size"`
+	ServerMtime flexInt64 `json:"server_mtime"`
+}
 
 func (f *flexInt64) UnmarshalJSON(b []byte) error {
 	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
@@ -374,6 +387,49 @@ func (b *Baidu) fetchStoken(ctx context.Context, bduss, userAgent string) (strin
 }
 
 func (b *Baidu) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*adapter.AccountInfo, error) {
+	// OAuth 账号（只配了 refresh_token、没有 cookie）：`/api/*` 那套用不了，
+	// 校验也只能走 xpan。AList 同样用 /xpan/nas?method=uinfo 判活。
+	if at := b.accessToken(ctx, cred); at != "" && strings.TrimSpace(cred.Cookie) == "" {
+		var nas struct {
+			Errno  int    `json:"errno"`
+			Errmsg string `json:"errmsg"`
+			Data   struct {
+				BaiduName   string `json:"baidu_name"`
+				NetdiskName string `json:"netdisk_name"`
+				VipType     int    `json:"vip_type"`
+			} `json:"data"`
+		}
+		if _, err := b.http.DoJSON(ctx, &adapter.Request{
+			Method: "GET",
+			URL:    xpanBase + "/nas",
+			Query:  map[string]string{"method": "uinfo", "access_token": at},
+		}, &nas); err != nil {
+			return nil, err
+		}
+		if nas.Errno != 0 {
+			// 拿到 access_token 却过不了 uinfo，基本就是 refresh_token 被吊销
+			return nil, adapter.ErrCookieInvalid
+		}
+		info := &adapter.AccountInfo{
+			Nickname: orDefault(nas.Data.NetdiskName, nas.Data.BaiduName, "百度网盘"),
+		}
+		// 容量拿不到（未授权或接口抖动）不影响"账号可用"的判定，忽略即可
+		var quota struct {
+			Errno int   `json:"errno"`
+			Total int64 `json:"total"`
+			Used  int64 `json:"used"`
+		}
+		if _, err := b.http.DoJSON(ctx, &adapter.Request{
+			Method: "GET",
+			URL:    xpanBase + "/quota",
+			Query:  map[string]string{"method": "info", "access_token": at},
+		}, &quota); err == nil && quota.Errno == 0 {
+			info.CapacityTotal = quota.Total
+			info.CapacityUsed = quota.Used
+		}
+		return info, nil
+	}
+
 	var resp struct {
 		Errno    int    `json:"errno"`
 		Bdstoken string `json:"bdstoken"`
@@ -441,15 +497,29 @@ func (b *Baidu) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 	}
 	var resp struct {
 		Errno int `json:"errno"`
-		List  []struct {
-			FsID        flexInt64 `json:"fs_id"`
-			Path        string    `json:"path"`
-			ServerName  string    `json:"server_filename"`
-			IsDir       flexInt64 `json:"isdir"`
-			Size        flexInt64 `json:"size"`
-			ServerMtime flexInt64 `json:"server_mtime"`
-		} `json:"list"`
+		List  []baiduListItem `json:"list"`
 	}
+
+	// OAuth 账号没有 cookie，`/api/*` 那套（网页接口）用不了 —— 必须走
+	// 开放平台 `/rest/2.0/xpan/file?method=list`。这是 AList 的做法。
+	if at := b.accessToken(ctx, cred); at != "" && strings.TrimSpace(cred.Cookie) == "" {
+		_, err := b.http.DoJSON(ctx, &adapter.Request{
+			Method: "GET",
+			URL:    xpanBase + "/file",
+			Query: map[string]string{
+				"method": "list", "dir": dirID, "order": "time", "desc": "1",
+				"start": "0", "limit": "1000", "access_token": at,
+			},
+		}, &resp)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Errno != 0 {
+			return nil, fmt.Errorf("列出百度目录失败(xpan): errno=%d", resp.Errno)
+		}
+		return baiduFileItems(resp.List), nil
+	}
+
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
 		URL:     b.api() + "/list",
@@ -465,8 +535,13 @@ func (b *Baidu) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 	if resp.Errno != 0 {
 		return nil, fmt.Errorf("列出百度目录失败: errno=%d", resp.Errno)
 	}
-	items := make([]adapter.FileItem, 0, len(resp.List))
-	for _, f := range resp.List {
+	return baiduFileItems(resp.List), nil
+}
+
+// baiduFileItems 把 /api/list 与 /rest/2.0/xpan/file 两种同构响应转成 FileItem。
+func baiduFileItems(list []baiduListItem) []adapter.FileItem {
+	items := make([]adapter.FileItem, 0, len(list))
+	for _, f := range list {
 		// 目录的 ID 用**路径**而不是 fs_id。
 		//
 		// 百度 /api/list 的 dir 参数、转存/新建/删除的 path 参数，
@@ -1052,6 +1127,173 @@ func (b *Baidu) Transfer(ctx context.Context, cred *adapter.Credential, shareURL
 	return b.SaveToDir(ctx, cred, share, targetDirID)
 }
 
+// ============ OAuth（AList 的路线）============
+//
+// 为什么两条路都留着：
+//   - **Cookie 路（BDUSS + STOKEN）**：不需要申请任何东西，用户粘一段字符串就能用。
+//     缺点是只有网页/客户端那套 `/api/*` 接口，且 BDUSS 会随改密码失效。
+//   - **OAuth 路（refresh_token）**：AList 用的是这条。凭 access_token 可以走
+//     开放平台接口 `/rest/2.0/xpan/*`，官方取链是「拿 dlink → 用
+//     User-Agent: pan.baidu.com 发 HEAD → 跟到 Location（真正的 CDN 地址）→
+//     把这个地址丢给播放器」，浏览器端可以直接 302 播，不必我们中转。
+//     refresh_token 长期有效（换来的 access_token 30 天有效，可自动续）。
+//
+// 两条路的**取舍由账号配置决定**：Extra 里配了 refresh_token 就走 OAuth，
+// 否则走 Cookie。互不干扰，见 GetDirectLink / ListDir / ValidateCookie。
+const (
+	oauthTokenURL = "https://openapi.baidu.com/oauth/2.0/token"
+	// xpan 开放平台（要 access_token，Cookie 鉴权下这些路径恒 404）
+	xpanBase = "https://pan.baidu.com/rest/2.0/xpan"
+	// AList 文档公开的客户端 ID / 密钥（用于 refresh_token 换 access_token）
+	defaultBaiduClientID     = "hq9yQ9w9kR4YHj1kyYafLygVocobh7Sf"
+	defaultBaiduClientSecret = "YH2VpZcFJHYNnV6vLfHQXDBhcE7ZChyE"
+)
+
+// panDLUA 百度 CDN 认的下载 UA。AList 的 linkOfficial 里也是这一串，
+// 且只带它一个头（不带 Cookie）。
+const panDLUA = "pan.baidu.com"
+
+type baiduToken struct {
+	token string
+	exp   time.Time
+}
+
+var (
+	baiduTokenMu sync.Mutex
+	baiduTokens  = map[string]baiduToken{} // key = refresh_token
+)
+
+// accessToken 用 refresh_token 换 access_token（内存缓存，提前一天过期）。
+// 返回空串 = 这个账号没配 OAuth，调用方走 Cookie 那条路。
+func (b *Baidu) accessToken(ctx context.Context, cred *adapter.Credential) string {
+	rt := ""
+	if cred.Extra != nil {
+		rt = strings.TrimSpace(cred.Extra["refresh_token"])
+	}
+	if rt == "" {
+		return ""
+	}
+	baiduTokenMu.Lock()
+	if t, ok := baiduTokens[rt]; ok && time.Now().Before(t.exp) {
+		baiduTokenMu.Unlock()
+		return t.token
+	}
+	baiduTokenMu.Unlock()
+
+	cid := defaultBaiduClientID
+	if v := strings.TrimSpace(cred.Extra["client_id"]); v != "" {
+		cid = v
+	}
+	sec := defaultBaiduClientSecret
+	if v := strings.TrimSpace(cred.Extra["client_secret"]); v != "" {
+		sec = v
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", rt)
+	form.Set("client_id", cid)
+	form.Set("client_secret", sec)
+
+	var resp struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+		Error       string `json:"error"`
+		ErrorDesc   string `json:"error_description"`
+	}
+	if _, err := b.http.DoJSON(ctx, &adapter.Request{
+		Method:  "POST",
+		URL:     oauthTokenURL,
+		RawBody: []byte(form.Encode()),
+		Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
+	}, &resp); err != nil {
+		return ""
+	}
+	if resp.AccessToken == "" {
+		return ""
+	}
+	ttl := resp.ExpiresIn
+	if ttl <= 0 {
+		ttl = 2592000 // 官方默认 30 天
+	}
+	// 提前一天作废，避开"刚好在这时候过期"的边界
+	exp := time.Now().Add(time.Duration(ttl) * time.Second).Add(-24 * time.Hour)
+	if !exp.After(time.Now()) {
+		exp = time.Now().Add(time.Duration(ttl/2) * time.Second)
+	}
+	baiduTokenMu.Lock()
+	baiduTokens[rt] = baiduToken{token: resp.AccessToken, exp: exp}
+	baiduTokenMu.Unlock()
+	return resp.AccessToken
+}
+
+// resolveLocation 发一次 HEAD（UA=pan.baidu.com，**不跟重定向**）取 Location。
+// 这就是 AList linkOfficial 的那一步：dlink 本身是 302，真正的 CDN 地址在
+// Location 里，浏览器拿到它就能直连播放。
+func resolveLocation(ctx context.Context, u string) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", panDLUA)
+	cli := &http.Client{
+		Timeout:       20 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.Header.Get("Location")
+}
+
+// linkViaOAuth AList 的官方取链流程（access_token 版）。
+func (b *Baidu) linkViaOAuth(ctx context.Context, fileID, at string) (*adapter.DirectLink, error) {
+	var resp struct {
+		Errno  int           `json:"errno"`
+		Errmsg string        `json:"errmsg"`
+		Info   []baiduDLItem `json:"info"`
+		List   []baiduDLItem `json:"list"`
+	}
+	_, err := b.http.DoJSON(ctx, &adapter.Request{
+		Method: "GET",
+		URL:    xpanBase + "/multimedia",
+		Query: map[string]string{
+			"method": "filemetas", "fsids": "[" + fileID + "]",
+			"dlink": "1", "access_token": at,
+		},
+	}, &resp)
+	if err != nil {
+		return nil, err
+	}
+	items := resp.Info
+	if len(items) == 0 {
+		items = resp.List
+	}
+	if len(items) == 0 || items[0].Dlink == "" {
+		return nil, fmt.Errorf("百度 OAuth 取链失败: errno=%d %s", resp.Errno, resp.Errmsg)
+	}
+	signed := items[0].Dlink
+	if !strings.Contains(signed, "access_token=") {
+		signed += "&access_token=" + at
+	}
+	link := &adapter.DirectLink{
+		Size:         items[0].Size.Int64(),
+		ExpiresAt:    time.Now().Add(8 * time.Hour).Unix(),
+		Headers:      map[string]string{"User-Agent": panDLUA},
+		AcceptRanges: true,
+	}
+	if loc := resolveLocation(ctx, signed); loc != "" {
+		link.URL = loc // 已经解析到 CDN 终址，客户端直连即可
+		return link, nil
+	}
+	// HEAD 没跟出来就退回带 token 的 dlink（仍然只带 UA）——至少能播。
+	link.URL = signed
+	return link, nil
+}
+
 // ============ 播放 / 下载 ============
 
 // baiduDLItem /api/filemetas 的单条结果。
@@ -1078,11 +1320,17 @@ type baiduDLItem struct {
 }
 
 // GetDirectLink 获取直链
+//
+// 配了 refresh_token 就按 AList 的 OAuth 路线走（xpan/multimedia + HEAD 取 Location），
+// 否则走 Cookie 路线（/api/filemetas + Cookie）。
 func (b *Baidu) GetDirectLink(ctx context.Context, cred *adapter.Credential, fileID string) (*adapter.DirectLink, error) {
+	if at := b.accessToken(ctx, cred); at != "" {
+		return b.linkViaOAuth(ctx, fileID, at)
+	}
 	var resp struct {
-		Errno int            `json:"errno"`
-		Info  []baiduDLItem  `json:"info"`
-		List  []baiduDLItem  `json:"list"`
+		Errno int           `json:"errno"`
+		Info  []baiduDLItem `json:"info"`
+		List  []baiduDLItem `json:"list"`
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",

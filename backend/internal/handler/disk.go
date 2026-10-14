@@ -290,8 +290,11 @@ func (h *DiskHandler) AddManual(c *gin.Context) {
 			util.BadRequest(c, err.Error())
 			return
 		}
-	} else if req.Cookie == "" {
-		util.BadRequest(c, "请填写 Cookie / Token")
+	} else if req.Cookie == "" && strings.TrimSpace(req.Extra["refresh_token"]) == "" {
+		// 百度还支持只填 OAuth 刷新令牌（AList 的路线）：此时没有 cookie，
+		// 列目录/取直链走 /rest/2.0/xpan/*。注意这条路上**转存分享不可用**
+		// （转存走的是网页接口，只认 cookie）。
+		util.BadRequest(c, "请填写 Cookie；百度账号也可以改填 OAuth 刷新令牌（refresh_token）")
 		return
 	}
 

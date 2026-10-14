@@ -228,13 +228,20 @@ async function save() {
 
 async function removeNode(data) {
   try {
+    // 说清"会连带删掉什么"：后端会把该目录（含子目录）下的资源与
+    // 资源映射一起删掉，所以提示里必须写明，否则用户以为只是删个空目录。
+    const cnt = data.resourceCount ? `该目录（含子目录）下有 ${data.resourceCount} 个资源，` : ''
     await ElMessageBox.confirm(
-      `确定删除目录「${data.name}」吗？若包含子目录将一并删除。`,
+      `确定删除目录「${data.name}」吗？${cnt}其下的资源与「资源映射」将一并删除，此操作不可撤销。`,
       '删除确认',
       { type: 'warning', confirmButtonText: '确定删除', cancelButtonText: '取消' }
     )
-    await categoryApi.remove(data.id, true)
-    ElMessage.success('删除成功')
+    // 响应拦截器已经把 data.data 拆出来了，这里拿到的是
+    // { removedResources, removedMappings }
+    const res = await categoryApi.remove(data.id, true)
+    const r = res?.removedResources || 0
+    const m = res?.removedMappings || 0
+    ElMessage.success(r || m ? `删除成功，并清理了 ${r} 个资源、${m} 条映射` : '删除成功')
     loadTree()
   } catch (e) {
     /* 取消或失败 */
