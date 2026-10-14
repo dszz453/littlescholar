@@ -139,6 +139,77 @@ body {
   font-size: 15px;
 }
 
+/* ============ 错误态 ============ */
+
+/*
+ * 与「空态」刻意长得不一样：
+ * 空态是"这里本来就没东西"（温和、不用操作），
+ * 错误态是"没拿到东西"（要能一眼分辨，并且给一个重试按钮）。
+ * 两者混在一起的话，网络抖一下家长就会以为内容被删了。
+ */
+.error-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 56px 32px;
+  color: var(--c-text-sub);
+}
+.error-box .emoji {
+  font-size: 48px;
+  margin-bottom: 12px;
+  opacity: 0.8;
+}
+.error-box p {
+  margin: 0 0 16px;
+  font-size: 15px;
+}
+.retry {
+  padding: 11px 30px;
+  border: 0;
+  border-radius: 999px;
+  background: #fff;
+  color: var(--c-primary);
+  font-size: 14.5px;
+  font-weight: 600;
+  font-family: inherit;
+  box-shadow: var(--shadow-sm);
+}
+
+/* ============ 骨架屏 ============ */
+
+/*
+ * 微光扫过：用背景渐变位移，比整块闪烁更柔和，也不会在低端机上抖动。
+ * 放在全局是因为首页的图标网格、列表页的卡片列表都要用同一套观感。
+ */
+.sk-anim {
+  background: linear-gradient(90deg, #eef2f7 25%, #f6f9fc 37%, #eef2f7 63%);
+  background-size: 400% 100%;
+  animation: sk-shine 1.4s ease infinite;
+}
+@keyframes sk-shine {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sk-anim {
+    animation: none;
+  }
+}
+
+/* 骨架屏里的"文字条" */
+.sk-line {
+  height: 14px;
+  border-radius: 6px;
+}
+.sk-line.sm {
+  height: 10px;
+}
+
 /* ============ 加载动画 ============ */
 
 .loading {

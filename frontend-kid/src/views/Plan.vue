@@ -1,15 +1,13 @@
 <template>
   <div class="page plan-page">
-    <!-- 顶部：返回 + 标题 + 新建 -->
-    <header class="bar" :style="barStyle">
-      <div class="bar-row">
-        <button class="back pressable" @click="goBack">‹</button>
-        <h1 class="bar-title">学习计划</h1>
-        <button class="add pressable" @click="openCreate">＋</button>
-      </div>
-    </header>
+    <!-- 顶部：返回 + 标题 + 新建（返回与安全区统一由 PageBar 处理） -->
+    <PageBar title="学习计划">
+      <template #right>
+        <button class="add pressable" type="button" aria-label="新建计划" @click="openCreate">＋</button>
+      </template>
+    </PageBar>
 
-    <div v-if="loading" class="loading"><div class="spinner"></div></div>
+    <SkeletonList v-if="loading" :count="3" />
 
     <div v-else class="page-pad">
       <!-- ===== 今日打卡 ===== -->
@@ -237,6 +235,8 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
+import PageBar from '@/components/PageBar.vue'
+import SkeletonList from '@/components/SkeletonList.vue'
 import { useUserStore } from '@/stores/user'
 import { planApi } from '@/api'
 import { showToast } from 'vant'
@@ -258,8 +258,6 @@ const openedAward = ref(null)
 const minuteOptions = [10, 20, 30, 45, 60]
 
 const form = ref({ categoryId: '', startDate: '', endDate: '', minMinutes: 20 })
-
-const barStyle = computed(() => ({ paddingTop: 'calc(8px + var(--safe-top))' }))
 
 // 环形进度（本周打卡天数 / 目标天数）
 const circumference = 2 * Math.PI * 18
@@ -295,10 +293,6 @@ function progressOf(p) {
 
 function shortDate(d) {
   return d ? String(d).slice(5).replace('-', '/') : ''
-}
-
-function goBack() {
-  router.back()
 }
 
 function goPlanCategory(p) {
@@ -495,19 +489,9 @@ onUnmounted(() => {
   padding-bottom: calc(96px + var(--safe-bottom));
 }
 
-.bar {
-  padding: 0 16px 10px;
-  background: linear-gradient(180deg, #e8f0ff 0%, var(--c-bg) 100%);
-}
-.bar-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.back,
 .add {
-  width: 38px;
-  height: 38px;
+  width: 40px;
+  height: 40px;
   flex: 0 0 auto;
   border: 0;
   border-radius: 50%;
@@ -515,19 +499,9 @@ onUnmounted(() => {
   box-shadow: var(--shadow-sm);
   font-size: 22px;
   line-height: 1;
-  color: var(--c-text);
-  font-family: inherit;
-}
-.add {
   color: var(--c-primary);
   font-weight: 700;
-}
-.bar-title {
-  flex: 1;
-  margin: 0;
-  font-size: 19px;
-  font-weight: 700;
-  text-align: center;
+  font-family: inherit;
 }
 
 /* ===== 今日打卡 ===== */

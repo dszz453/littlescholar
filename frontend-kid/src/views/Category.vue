@@ -1,25 +1,41 @@
 <template>
   <div class="page">
-    <!-- 顶部：返回 + 面包屑 -->
-    <header class="bar" :style="barStyle">
-      <div class="bar-row">
-        <button class="back pressable" @click="goBack">‹</button>
-        <div class="crumb">
-          <span class="crumb-item" @click="goRoot">首页</span>
-          <template v-for="c in crumbs" :key="c.id">
-            <span class="sep">›</span>
-            <span
-              class="crumb-item"
-              :class="{ current: c.id === node?.id }"
-              @click="goCrumb(c)"
-            >{{ c.name }}</span>
-          </template>
-        </div>
-        <span class="ico-lg">{{ icon.emoji }}</span>
+    <!-- 顶部：返回 + 面包屑（统一走 PageBar，安全区与返回兜底只有一处实现） -->
+    <PageBar>
+      <div class="crumb">
+        <span class="crumb-item" @click="goRoot">首页</span>
+        <template v-for="c in crumbs" :key="c.id">
+          <span class="sep">›</span>
+          <span
+            class="crumb-item"
+            :class="{ current: c.id === node?.id }"
+            @click="goCrumb(c)"
+          >{{ c.name }}</span>
+        </template>
       </div>
-    </header>
+      <template #right>
+        <span class="ico-lg">{{ icon.emoji }}</span>
+      </template>
+    </PageBar>
 
     <div class="page-pad">
+      <!-- 小书童说：把这个目录读成一段人话。
+           由后台每天定时生成（见后端 DigestHandler），没生成过就不显示。 -->
+      <section v-if="digest" class="digest-card pop-in">
+        <div class="d-head">
+          <span class="d-ava">🤖</span>
+          <span class="d-name">小书童说</span>
+          <span v-if="digest.resourceCount" class="d-count">{{ digest.resourceCount }} 个内容</span>
+        </div>
+        <p class="d-intro">{{ digest.intro }}</p>
+        <ul v-if="digest.points && digest.points.length" class="d-points">
+          <li v-for="(p, i) in digest.points" :key="i">{{ p }}</li>
+        </ul>
+        <div v-if="digest.keywords && digest.keywords.length" class="d-tags">
+          <span v-for="k in digest.keywords" :key="k" class="d-tag">{{ k }}</span>
+        </div>
+      </section>
+
       <!-- 子目录 -->
       <template v-if="children.length">
         <div class="section-title"><h2>分类</h2></div>
@@ -56,8 +72,14 @@
         </button>
       </template>
 
-      <!-- 加载 / 空态 -->
-      <div v-if="loading" class="loading"><div class="spinner"></div></div>
+      <!-- 加载 / 出错 / 空态 -->
+      <SkeletonList v-if="loading" :count="4" />
+
+      <div v-else-if="failed" class="error-box">
+        <span class="emoji">😵</span>
+        <p>内容没能加载出来</p>
+        <button class="retry pressable" @click="load">再试一次</button>
+      </div>
 
       <div v-else-if="!children.length && !resources.length" class="empty">
         <span class="emoji">🍃</span>
@@ -65,6 +87,8 @@
         <p class="text-sub">等爸爸妈妈放点内容进来吧</p>
       </div>
     </div>
+
+    <BackTop />
   </div>
 </template>
 
@@ -73,8 +97,11 @@ import { ref, computed, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import CategoryCard from '@/components/CategoryCard.vue'
 import ResourceCard from '@/components/ResourceCard.vue'
+import PageBar from '@/components/PageBar.vue'
+import SkeletonList from '@/components/SkeletonList.vue'
+import BackTop from '@/components/BackTop.vue'
 import { useUserStore } from '@/stores/user'
-import { resourceApi } from '@/api'
+import { resourceApi, digestApi } from '@/api'
 import { resolveIcon } from '@/assets/icons'
 
 const route = useRoute()
@@ -82,11 +109,13 @@ const router = useRouter()
 const userStore = useUserStore()
 
 const loading = ref(true)
+const failed = ref(false)
 const loadingMore = ref(false)
 const resources = ref([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = 20
+const digest = ref(null)
 
 const nodeId = computed(() => route.params.id)
 
@@ -100,14 +129,11 @@ const icon = computed(() => resolveIcon(node.value?.icon, node.value?.color))
 
 const hasMore = computed(() => resources.value.length < total.value)
 
-const barStyle = computed(() => ({
-  paddingTop: 'calc(8px + var(--safe-top))',
-}))
-
 async function fetchResources(reset = true) {
   if (reset) {
     page.value = 1
     resources.value = []
+    failed.value = false
   }
   try {
     const data = await resourceApi.list({
@@ -125,7 +151,12 @@ async function fetchResources(reset = true) {
     total.value = data?.total ?? list.length
     resources.value = reset ? list : [...resources.value, ...list]
   } catch {
-    if (reset) resources.value = []
+    // 列表加载失败要能看出来：静默清空会让页面显示成"这个分类是空的"，
+    // 家长会以为内容被删了。
+    if (reset) {
+      resources.value = []
+      failed.value = true
+    }
   }
 }
 
@@ -136,6 +167,21 @@ async function load() {
     await fetchResources(true)
   } finally {
     loading.value = false
+  }
+  // 沉淀单独取：失败不该影响目录内容（它是锦上添花的一张卡片）
+  loadDigest()
+}
+
+// loadDigest 取当前目录的「小书童说」。
+// 后端在没有沉淀时返回 null 而不是报错，所以这里静默即可。
+async function loadDigest() {
+  digest.value = null
+  try {
+    const d = await digestApi.forCategory(nodeId.value)
+    // 切目录时旧请求可能后到，回来时已不是当前目录就丢弃
+    digest.value = d && String(d.categoryId) === String(nodeId.value) ? d : null
+  } catch {
+    digest.value = null
   }
 }
 
@@ -148,11 +194,6 @@ async function loadMore() {
   } finally {
     loadingMore.value = false
   }
-}
-
-function goBack() {
-  if (window.history.length > 1) router.back()
-  else router.push({ name: 'home' })
 }
 
 function goRoot() {
@@ -177,38 +218,7 @@ watch(nodeId, load)
 </script>
 
 <style scoped>
-.bar {
-  position: sticky;
-  top: 0;
-  z-index: 50;
-  background: rgba(247, 249, 252, 0.94);
-  backdrop-filter: blur(12px);
-  padding-bottom: 8px;
-}
-
-.bar-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 0 16px;
-}
-
-.back {
-  flex: 0 0 auto;
-  width: 36px;
-  height: 36px;
-  border: 0;
-  border-radius: 50%;
-  background: #fff;
-  box-shadow: var(--shadow-sm);
-  font-size: 24px;
-  line-height: 1;
-  color: var(--c-text);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding-bottom: 3px;
-}
+/* 顶部返回栏与安全区已统一由 PageBar 承担，这里只剩面包屑自身的排版 */
 
 .crumb {
   flex: 1;
@@ -255,5 +265,82 @@ watch(nodeId, load)
   font-size: 15px;
   font-weight: 600;
   font-family: inherit;
+}
+
+/* ===== 小书童说 ===== */
+
+.digest-card {
+  margin-top: 4px;
+  padding: 15px 16px;
+  border-radius: var(--r-lg);
+  /* 与普通白卡片区分开：孩子要一眼认出"这是小书童写的" */
+  background: linear-gradient(150deg, #eef4ff 0%, #f7fbff 100%);
+  border: 1px solid #dbe7ff;
+  box-shadow: var(--shadow-sm);
+}
+
+.d-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.d-ava {
+  font-size: 17px;
+  line-height: 1;
+}
+.d-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: #3d6fe0;
+}
+.d-count {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: #7f93b8;
+}
+
+.d-intro {
+  margin: 9px 0 0;
+  font-size: 14px;
+  line-height: 1.62;
+  color: #33465e;
+}
+
+.d-points {
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.d-points li {
+  position: relative;
+  padding-left: 15px;
+  margin-top: 5px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #4a5c73;
+}
+.d-points li::before {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 7px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #7ea6f5;
+}
+
+.d-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 11px;
+}
+.d-tag {
+  font-size: 11.5px;
+  color: #4a7ef0;
+  background: rgba(91, 143, 249, 0.12);
+  padding: 2px 9px;
+  border-radius: 999px;
 }
 </style>

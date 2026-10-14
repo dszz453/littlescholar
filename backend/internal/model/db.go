@@ -109,6 +109,7 @@ func AllModels() []interface{} {
 		&StudyPlan{},
 		&StudyCheckIn{},
 		&StudyAward{},
+		&KnowledgeDigest{},
 		&AIConfig{},
 		&AIReport{},
 		&AIChatSession{},
@@ -158,6 +159,11 @@ func SeedDefaultData(db *gorm.DB, adminUser, adminPassHash string) error {
 		"multi_conn":        "4",
 		"play_mode_default": "proxy",
 		"site_name":         "小书童学习系统",
+		// 小书童的知识沉淀：每天把目录读成人话。
+		// daily_limit 是每轮最多重算多少个范围（= 多少次 AI 调用），
+		// 用来兜住额度；内容没变化的目录会自动跳过，不占额度。
+		"digest_enabled":     "true",
+		"digest_daily_limit": "40",
 	}
 	for k, v := range defaults {
 		var existed int64

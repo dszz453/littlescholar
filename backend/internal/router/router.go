@@ -39,6 +39,10 @@ type Deps struct {
 	// 留空时下面会兜底自建，保证单独调用 Setup 的场景（测试）仍可用。
 	AI   *handler.AIHandler
 	Plan *handler.PlanHandler
+	// Digest 同上：每日知识沉淀的定时任务也挂在 main 的优雅退出链上。
+	Digest *handler.DigestHandler
+	// Organize AI 整理助手（纯请求-响应，没有后台任务，由 router 自行构造即可）
+	Organize *handler.OrganizeHandler
 }
 
 // Setup 装配路由
@@ -71,6 +75,14 @@ func Setup(deps *Deps) *gin.Engine {
 	planH := deps.Plan
 	if planH == nil {
 		planH = handler.NewPlanHandler(deps.DB, deps.Perm, aiH)
+	}
+	digestH := deps.Digest
+	if digestH == nil {
+		digestH = handler.NewDigestHandler(deps.DB, deps.Perm, aiH)
+	}
+	organizeH := deps.Organize
+	if organizeH == nil {
+		organizeH = handler.NewOrganizeHandler(deps.DB, deps.Perm, aiH)
 	}
 	studyH := handler.NewStudyHandler(deps.DB, aiH)
 	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret)
@@ -178,6 +190,14 @@ func Setup(deps *Deps) *gin.Engine {
 		admin.DELETE("/ai/configs/:id", aiH.DeleteConfig)
 		admin.POST("/ai/configs/:id/test", aiH.TestConfig)
 
+		// 知识沉淀（小书童每天把目录读成人话）
+		admin.GET("/digests", digestH.List)
+		admin.POST("/digests/refresh", digestH.Refresh)
+
+		// AI 整理助手：先出方案（只读），人工确认后再执行
+		admin.POST("/organize/plan", organizeH.Plan)
+		admin.POST("/organize/apply", organizeH.Apply)
+
 		// 学情分析
 		admin.GET("/study/overview", studyH.Overview)
 		admin.GET("/study/records", studyH.Records)
@@ -261,6 +281,10 @@ func Setup(deps *Deps) *gin.Engine {
 		app.GET("/study/today", planH.Today)
 		app.GET("/study/awards", planH.Awards)
 		app.POST("/study/awards/refresh", planH.RefreshAward)
+
+		// 小书童的知识沉淀：「这个目录里是什么、先学什么」
+		app.GET("/digests", digestH.AppList)
+		app.GET("/digests/:categoryId", digestH.Get)
 	}
 
 	// ============ 播放（后台 + C端通用，需登录）============

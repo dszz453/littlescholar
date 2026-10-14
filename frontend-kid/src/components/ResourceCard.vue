@@ -2,7 +2,7 @@
   <div class="res-card pressable" @click="$emit('click')">
     <!-- 封面：有图用图，无图用类型色块 + 图标 -->
     <div class="cover" :style="coverStyle">
-      <img v-if="node.cover" :src="node.cover" alt="" class="cover-img" />
+      <img v-if="node.cover" :src="node.cover" alt="" class="cover-img" loading="lazy" decoding="async" />
       <span v-else class="cover-emoji">{{ typeEmoji }}</span>
 
       <!-- 类型角标 -->

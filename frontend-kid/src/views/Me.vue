@@ -51,7 +51,7 @@
         >{{ t.label }}</button>
       </div>
 
-      <div v-if="loading" class="loading"><div class="spinner"></div></div>
+      <SkeletonList v-if="loading" :count="4" />
 
       <!-- 播放历史 -->
       <template v-else-if="tab === 'history'">
@@ -107,6 +107,7 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ResourceCard from '@/components/ResourceCard.vue'
+import SkeletonList from '@/components/SkeletonList.vue'
 import { useUserStore } from '@/stores/user'
 import { playApi, studyApi, planApi } from '@/api'
 
@@ -115,7 +116,8 @@ const router = useRouter()
 const userStore = useUserStore()
 
 const tab = ref('history')
-const loading = ref(false)
+// 初始就是 true：否则首帧会先闪一下"还没有记录"的空态再被数据替换
+const loading = ref(true)
 const history = ref([])
 const records = ref([])
 const stats = ref(null)

@@ -82,10 +82,24 @@ const routes = [
         meta: { title: '学习分析', icon: 'DataAnalysis' },
       },
       {
+        // 这三个都是"让 AI 干活"的功能，归到同一个分组里。
+        // 分组的图标取第一个子项的 groupIcon（见 MainLayout 的 menus 计算）。
         path: 'ai-config',
         name: 'AIConfig',
         component: () => import('@/views/AIConfig.vue'),
-        meta: { title: 'AI 配置', icon: 'MagicStick' },
+        meta: { title: 'AI 配置', icon: 'MagicStick', group: 'AI 助手', groupIcon: 'MagicStick' },
+      },
+      {
+        path: 'digests',
+        name: 'Digests',
+        component: () => import('@/views/Digests.vue'),
+        meta: { title: '知识沉淀', icon: 'Notebook', group: 'AI 助手' },
+      },
+      {
+        path: 'organize',
+        name: 'Organize',
+        component: () => import('@/views/Organize.vue'),
+        meta: { title: 'AI 整理助手', icon: 'Tools', group: 'AI 助手' },
       },
       {
         path: 'settings',

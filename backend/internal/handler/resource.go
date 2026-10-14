@@ -624,8 +624,16 @@ func (h *ResourceHandler) SearchAll(c *gin.Context) {
 // 资源数按「直接挂载 + 子孙累加」口径 —— 孩子搜到一个大类时，
 // 关心的是它底下总共有多少内容，而不是只有直接挂在它上面的那几个。
 func (h *ResourceHandler) categoryMeta(scopeIDs []uint64, unrestricted bool) (map[uint64]string, map[uint64]int64) {
+	return categoryMeta(h.db, scopeIDs, unrestricted)
+}
+
+// categoryMeta 的实现（包级函数：知识沉淀等其它 handler 也要用同一套口径）。
+//
+// scopeIDs/unrestricted 只影响"直接资源数"的统计范围；目录名表始终是全量，
+// 因为面包屑需要祖先名称，而祖先可能不在可见集合里。
+func categoryMeta(db *gorm.DB, scopeIDs []uint64, unrestricted bool) (map[uint64]string, map[uint64]int64) {
 	var cats []model.Category
-	h.db.Select("id, name, path").Find(&cats)
+	db.Select("id, name, path").Find(&cats)
 
 	names := make(map[uint64]string, len(cats))
 	for _, cat := range cats {
@@ -642,7 +650,7 @@ func (h *ResourceHandler) categoryMeta(scopeIDs []uint64, unrestricted bool) (ma
 	// 比不显示更让人困惑。Model() 让 gorm 自动补 `deleted_at IS NULL`，
 	// 与 List/Facets 走同一套口径。
 	direct := map[uint64]int64{}
-	q := h.db.Model(&model.Resource{}).Select("category_id, count(*) as total")
+	q := db.Model(&model.Resource{}).Select("category_id, count(*) as total")
 	if !unrestricted {
 		q = q.Where("category_id IN ?", scopeIDs)
 	}

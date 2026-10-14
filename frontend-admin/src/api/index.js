@@ -149,6 +149,20 @@ export const aiApi = {
   testConfig: (id) => http.post(`/admin/ai/configs/${id}/test`),
 }
 
+// 知识沉淀：小书童每天把目录读成人话
+export const digestApi = {
+  list: () => http.get('/admin/digests'),
+  // 传 categoryId 只刷这一个（同步返回）；不传或传 0 是全量刷新（后台异步跑）
+  refresh: (categoryId, force = false) =>
+    http.post('/admin/digests/refresh', { categoryId, force }),
+}
+
+// AI 整理助手：先出方案（只读），人工确认后再执行
+export const organizeApi = {
+  plan: (data) => http.post('/admin/organize/plan', data),
+  apply: (data) => http.post('/admin/organize/apply', data),
+}
+
 export const studyApi = {
   overview: (params) => http.get('/admin/study/overview', { params }),
   records: (params) => http.get('/admin/study/records', { params }),

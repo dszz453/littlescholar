@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -263,6 +264,11 @@ func main() {
 	// 周奖状定时任务要在下面挂到优雅退出链上，main 必须持有同一实例。
 	aiHandler := handler.NewAIHandler(db, encryptor)
 	planHandler := handler.NewPlanHandler(db, permService, aiHandler)
+	digestHandler := handler.NewDigestHandler(db, permService, aiHandler).WithLogger(logger)
+	organizeHandler := handler.NewOrganizeHandler(db, permService, aiHandler).WithLogger(logger)
+	if n, parseErr := strconv.Atoi(sysConf("digest_daily_limit", "")); parseErr == nil && n > 0 {
+		digestHandler.DailyLimit = n
+	}
 
 	engine := router.Setup(&router.Deps{
 		DB:        db,
@@ -279,6 +285,8 @@ func main() {
 		StartedAt: startedAt,
 		AI:        aiHandler,
 		Plan:      planHandler,
+		Digest:    digestHandler,
+		Organize:  organizeHandler,
 	})
 
 	// 8.1 每周 AI 奖状
@@ -288,6 +296,18 @@ func main() {
 	// 生成是幂等的（同一用户同一周只发一张），重复跑不会重复颁奖。
 	stopAward := planHandler.StartAwardScheduler(logger, 24*time.Hour, 5*time.Minute)
 	defer stopAward()
+
+	// 8.2 小书童的知识沉淀
+	//
+	// 每天把「目录里都有什么」读成人话。首次延迟 8 分钟，排在奖状之后 ——
+	// 两件事都要调 AI，错开可以避免启动瞬间并发打满额度。
+	// 内容指纹没变就跳过，所以稳定运行后每天实际只重算变化了的那几个目录。
+	if sysConf("digest_enabled", "true") == "true" {
+		stopDigest := digestHandler.StartDigestScheduler(logger, 24*time.Hour, 8*time.Minute)
+		defer stopDigest()
+	} else {
+		logger.Info("知识沉淀定时任务未启用（system_configs.digest_enabled=false），仍可在后台手动刷新")
+	}
 
 	// 9. 启动 HTTP 服务
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)

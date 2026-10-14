@@ -43,7 +43,13 @@
         <ResourceCard v-for="r in allResources" :key="r.id" :node="r" @click="goPlay(r)" />
       </template>
 
-      <div v-else-if="loading" class="loading"><div class="spinner"></div></div>
+      <SkeletonList v-else-if="loading" :count="5" />
+
+      <div v-else-if="failed" class="error-box">
+        <span class="emoji">😵</span>
+        <p>搜索没能完成，可能是网络不太顺</p>
+        <button class="retry pressable" @click="doSearch()">再试一次</button>
+      </div>
 
       <template v-else-if="categories.length || results.length">
         <!-- 命中的「文件夹」——可以点进去，这是这次搜索最大的变化：
@@ -101,6 +107,8 @@
         </p>
       </div>
     </div>
+
+    <BackTop />
   </div>
 </template>
 
@@ -109,6 +117,8 @@ import { ref, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import SearchBar from '@/components/SearchBar.vue'
 import ResourceCard from '@/components/ResourceCard.vue'
+import SkeletonList from '@/components/SkeletonList.vue'
+import BackTop from '@/components/BackTop.vue'
 import { resourceApi, searchApi } from '@/api'
 import { resolveIcon, tint } from '@/assets/icons'
 
@@ -123,6 +133,7 @@ const keyword = ref('')
 
 const searched = ref(false)
 const loading = ref(false)
+const failed = ref(false)
 const loadingMore = ref(false)
 const categories = ref([])
 const results = ref([])
@@ -157,6 +168,7 @@ async function doSystemSearch(q) {
   }
   searched.value = true
   loading.value = true
+  failed.value = false
   page.value = 1
   try {
     const data = await searchApi.all(searchParams(q, 1))
@@ -166,9 +178,11 @@ async function doSystemSearch(q) {
     // 筛选标签跟结果同步刷新：没有结果的网盘不该继续占位置
     refreshFacets(q)
   } catch {
+    // 失败与"搜不到"必须分开：都显示成"没有找到"会让人以为库里真的没有
     categories.value = []
     results.value = []
     total.value = 0
+    failed.value = true
   } finally {
     loading.value = false
   }
@@ -204,6 +218,7 @@ async function loadMore() {
 
 function reset() {
   searched.value = false
+  failed.value = false
   categories.value = []
   results.value = []
   total.value = 0

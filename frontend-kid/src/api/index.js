@@ -96,6 +96,14 @@ export const studyApi = {
   records: (params) => http.get('/app/study/records', { params }),
 }
 
+export const digestApi = {
+  // 小书童对这个目录的「知识沉淀」。
+  // 没有沉淀时后端返回 data:null（不是错误）—— 前端据此不显示卡片即可。
+  forCategory: (categoryId) => http.get(`/app/digests/${categoryId}`),
+  // 可见目录下的沉淀列表（首页挑一条展示用）
+  list: (params) => http.get('/app/digests', { params }),
+}
+
 export const planApi = {
   list: (params) => http.get('/app/study/plans', { params }),
   create: (data) => http.post('/app/study/plans', data),
