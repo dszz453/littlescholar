@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>目录删除 / 孩子端首页 / 百度 AList 方案 · 交付说明</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--line:#e5e7eb;--text:#1f2328;--muted:#6b7280;
+    --brand:#2563eb;--brand-soft:#eff6ff;--ok:#15803d;--ok-soft:#f0fdf4;
+    --bad:#b91c1c;--bad-soft:#fef2f2;--warn:#b45309;--warn-soft:#fffbeb;--chip:#f3f4f6}
+  *{box-sizing:border-box}
+  body{margin:0;padding:28px 20px 56px;background:var(--bg);color:var(--text);
+    font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 6px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+  .sub code{background:var(--chip);padding:1px 6px;border-radius:5px;font-size:12px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:26px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .card .k{font-size:12px;color:var(--muted)}
+  .card .v{font-size:16px;font-weight:650;margin-top:5px;line-height:1.35}
+  .card .n{font-size:11.5px;color:var(--muted);margin-top:3px}
+  .card.ok{background:var(--ok-soft);border-color:#bbf7d0}.card.ok .v{color:var(--ok)}
+  h2{font-size:15px;margin:30px 0 12px;padding-left:10px;border-left:3px solid var(--brand)}
+  h3{font-size:13.5px;margin:18px 0 8px;color:var(--muted);font-weight:600}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:6px 18px 16px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-weight:600;color:var(--muted);font-size:12px;background:#fafbfc}
+  tr:last-child td{border-bottom:none}
+  td.c,th.c{text-align:center;white-space:nowrap}
+  .bad{color:var(--bad);font-weight:600}.good{color:var(--ok);font-weight:600}
+  code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:12.5px}
+  pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:14px 16px;overflow:auto;font-size:12.5px;line-height:1.55}
+  ul,ol{margin:6px 0 0;padding-left:22px}li{margin:5px 0}
+  .note{background:var(--warn-soft);border:1px solid #fde68a;border-radius:10px;padding:12px 16px;font-size:13px}
+  footer{margin-top:34px;color:var(--muted);font-size:12px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>目录删除 · 孩子端首页 · 百度 AList 方案</h1>
+  <div class="sub">
+    2026-10-14 · 提交 <code>7dc8550</code> + <code>2a46b2f</code> · 两台机器三端均已上线（旧机 8090/8091、新机 8092/8093）
+  </div>
+
+  <div class="cards">
+    <div class="card ok"><div class="k">① 目录删除</div><div class="v">已可删，映射一并清</div><div class="n">原为「删除失败」</div></div>
+    <div class="card ok"><div class="k">② 孩子端首页</div><div class="v">「接着上次看」已移除</div><div class="n">线上 chunk 实测无该文案</div></div>
+    <div class="card ok"><div class="k">③ 百度</div><div class="v">接上 AList 的 OAuth 路线</div><div class="n">与 Cookie 路线并存</div></div>
+    <div class="card"><div class="k">整体冒烟</div><div class="v">33 通过 / 0 失败</div><div class="n">新机 8092 + 孩子端 8093</div></div>
+  </div>
+
+  <h2>① 目录管理：有映射的目录删不掉</h2>
+  <div class="panel">
+    <h3>真因不是「有映射」，而是「有资源」</h3>
+    <p>删除代码里把资源的 <code>category_id</code> 置 0，而这一列上有真外键（<code>NO ACTION</code>）：</p>
+<pre>UPDATE "resources" SET "category_id"=0 ...        ← 撞外键
+ERROR: insert or update on table "resources" violates foreign key
+constraint "fk_resources_category" (SQLSTATE 23503)</pre>
+    <p>事务随即回滚，接口只回 <code>{"code":500,"message":"删除失败"}</code>。而<b>带映射的目录必然有资源</b>（映射就是往里导资源的），所以你看到的现象就是「目录里有映射就不能删除」。</p>
+
+    <h3>实测三种场景（改之前）</h3>
+    <table>
+      <tr><th>场景</th><th class="c">旧行为</th></tr>
+      <tr><td>空目录</td><td class="c">删除成功</td></tr>
+      <tr><td><b>目录里有资源</b></td><td class="c bad">500 删除失败（日志里就是 23503）</td></tr>
+      <tr><td>只有映射、没有资源</td><td class="c">能删，但<b>映射悬空</b>留在「资源映射」页</td></tr>
+    </table>
+
+    <h3>改法</h3>
+    <ul>
+      <li>删目录时跟随<b>软删</b>其（含子目录）资源与资源映射 —— 不再置 0。</li>
+      <li>响应回传 <code>removedResources</code> / <code>removedMappings</code>，后台弹「删除成功，并清理了 N 个资源、M 条映射」。</li>
+      <li>确认框写清"其下的资源与资源映射将一并删除，此操作不可撤销"，并显示该目录（含子目录）的资源数。</li>
+    </ul>
+    <p><b>验收</b>（临时分类 + 1 资源 + 1 映射，跑完自动清理）：</p>
+    <table>
+      <tr><th>项</th><th class="c">改之前</th><th class="c">改之后</th></tr>
+      <tr><td>删除有资源 + 有映射的目录</td><td class="c bad">500 删除失败</td><td class="c good">删除成功，并清理了 1 个资源、1 条映射</td></tr>
+      <tr><td>删除后残留</td><td class="c">—</td><td class="c good">分类消失、映射残留 0、无临时残留</td></tr>
+    </table>
+  </div>
+
+  <h2>② 孩子端首页：「接着上次看」已移除</h2>
+  <div class="panel">
+    <p>整段移除（含「全部 ›」入口），同时删掉了配套的最近播放请求、<code>recent</code> 状态、<code>goPlay</code>/<code>goHistory</code>/<code>recentEmoji</code> 与那段 CSS —— 不留死代码。首页现在是：<b>今日任务 → 小书童说 → 我的学习乐园</b>。</p>
+    <p><b>验收</b>：不去看截图，直接把线上 <code>8093</code> 的打包产物全抓下来 grep（<code>index.html</code> 及其引到的全部 JS chunk，共 10 个资源）：</p>
+    <table>
+      <tr><th>文案</th><th class="c">结果</th></tr>
+      <tr><td>「接着上次看」</td><td class="c good">所有 chunk 里均<b>不存在</b></td></tr>
+      <tr><td>「我的学习乐园」</td><td class="c good">存在于 <code>/assets/Home-Dv9UI8CQ.js</code></td></tr>
+    </table>
+  </div>
+
+  <h2>③ 百度：接入 AList 的路线（与 Cookie 并存）</h2>
+  <div class="panel">
+    <h3>AList 的做法</h3>
+<pre>refresh_token → access_token（30 天，可续）
+/xpan/multimedia?method=filemetas&amp;fsids=[id]&amp;dlink=1   → dlink
+HEAD dlink（User-Agent: pan.baidu.com，不跟重定向）      → Location = 真正的 CDN 地址
+把 Location 直接交给播放器（浏览器可 302 直连）</pre>
+
+    <h3>本次接进来的部分</h3>
+    <table>
+      <tr><th>位置</th><th>行为</th></tr>
+      <tr><td><code>accessToken()</code></td><td>refresh_token → access_token，内存缓存、提前一天失效；client_id/secret 默认用 AList 文档那对</td></tr>
+      <tr><td><code>linkViaOAuth()</code></td><td><code>/xpan/multimedia</code> + <code>HEAD</code>(UA=<code>pan.baidu.com</code>、不跟重定向) 取 <code>Location</code>；取不到则退回带 token 的 dlink</td></tr>
+      <tr><td><code>ListDir()</code></td><td>OAuth 账号（无 cookie）改走 <code>/rest/2.0/xpan/file?method=list</code></td></tr>
+      <tr><td><code>ValidateCookie()</code></td><td>OAuth 走 <code>/xpan/nas?method=uinfo</code>（另取 <code>/xpan/quota</code> 的容量）</td></tr>
+      <tr><td>后台表单</td><td>百度多一个「刷新令牌」输入框 + AList 授权页链接；Cookie 与刷新令牌<b>二选一</b></td></tr>
+    </table>
+    <p style="color:var(--muted);font-size:12.5px">两条路互不干扰：<b>Extra 里配了 refresh_token 就走 OAuth，否则走原来的 Cookie</b>（现有的百度账号没配，所以行为不变，已回归验证 206）。</p>
+
+    <h3>怎么用</h3>
+    <ol>
+      <li>后台「资源接入 → 手动填写 → 百度网盘」，点表单里的 <b>AList 授权页</b> 链接（也可以直接用下面这条）。</li>
+      <li>手机百度 App 扫码授权；回调页会把 <b>refresh_token</b> 显示出来，复制。</li>
+      <li>粘到「刷新令牌」框里保存即可（不填 Cookie 也行）。之后校验/列目录/播放都走 OAuth。</li>
+    </ol>
+<pre>https://openapi.baidu.com/oauth/2.0/authorize?response_type=code
+  &amp;client_id=hq9yQ9w9kR4YHj1kyYafLygVocobh7Sf
+  &amp;redirect_uri=https%3A%2F%2Falistgo.com%2Ftool%2Fbaidu%2Fcallback
+  &amp;scope=basic%2Cnetdisk&amp;qrcode=1</pre>
+
+    <div class="note" style="margin-top:14px">
+      <b>限制</b>：OAuth 路线<b>转存分享仍需要 Cookie</b>（转存走的是网页接口，只认 cookie）。要"能播 + 能转存"就两个都填。
+      另：OAuth 路线的实际效果我<b>还没有端到端验证过</b> —— 需要一个真实的 refresh_token；你把上面的码扫出来给我，我立刻验。
+    </div>
+  </div>
+
+  <h2>四、回归</h2>
+  <div class="panel">
+    <table>
+      <tr><th>项</th><th class="c">结果</th></tr>
+      <tr><td>整体冒烟（<code>BASE=:8092 KID_BASE=:8093</code>）</td><td class="c good">33 通过 / 0 失败</td></tr>
+      <tr><td>百度 Cookie 路线（717MB mp4 端到端）</td><td class="c good">206 video/mp4（首部 + 中部拖动）</td></tr>
+      <tr><td>夸克（新机，抽样）</td><td class="c good">206</td></tr>
+      <tr><td>CI <code>lint-and-build</code> / <code>build-and-push-images</code></td><td class="c good">全绿</td></tr>
+    </table>
+    <p style="color:var(--muted);font-size:12.5px;margin:12px 0 2px">
+      所有验收都用了临时数据（临时分类 / 临时映射 / 登记的资源），跑完自动删除；已核对无残留。
+    </p>
+  </div>
+
+  <footer>证据脚本：<code>.workbuddy/tmp/{verify_cat_delete,verify_baidu_e2e,repro_cat_delete,grep_kid_bundle,smoke_round4}.py</code> · 2026-10-14</footer>
+</div>
+</body>
+</html>
