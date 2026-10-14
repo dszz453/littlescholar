@@ -25,7 +25,8 @@ import android.widget.TextView
  */
 class ServerSetupView(
     context: Context,
-    private val onSave: (String) -> Unit
+    private val onSave: (String) -> Unit,
+    private val onScan: () -> Unit
 ) : LinearLayout(context) {
 
     private val input = EditText(context)
@@ -68,6 +69,17 @@ class ServerSetupView(
                 "在电脑或手机浏览器里打开孩子端，地址栏里那一串就是（要带端口号，如 :8093）。\n" +
                     "填错也没关系，连不上会自动回到这一页。"
             ).also { it.setTextAlignment(TEXT_ALIGNMENT_VIEW_START) }
+        )
+
+        val scan = Button(context).apply {
+            text = "扫二维码"
+            textSize = 15f
+            setOnClickListener { onScan() }
+        }
+        addView(
+            scan,
+            LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .also { it.topMargin = pad(20) }
         )
 
         val connect = Button(context).apply {
@@ -122,6 +134,18 @@ class ServerSetupView(
             errorBox.text = msg
             errorBox.visibility = VISIBLE
         }
+    }
+
+    /**
+     * 扫码之后把结果填进输入框（只填不提交）。
+     *
+     * 刻意不自动连接：扫到的可能是公网地址、也可能是内网地址，
+     * 让家长看一眼再点「连接」，扫错了还能改。
+     */
+    fun setUrl(raw: String) {
+        input.setText(ServerConfig.normalize(raw))
+        input.setSelection(input.text?.length ?: 0)
+        showError(null)
     }
 
     /** 聚焦到输入框并全选，方便家长直接覆盖重填。 */

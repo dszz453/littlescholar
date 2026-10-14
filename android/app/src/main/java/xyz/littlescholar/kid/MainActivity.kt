@@ -1,7 +1,9 @@
 package xyz.littlescholar.kid
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -14,9 +16,14 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 
 /**
  * 小书童 · 孩子端容器
@@ -42,6 +49,32 @@ class MainActivity : AppCompatActivity() {
 
     /** 设置页；为 null 表示未显示。 */
     private var setupView: ServerSetupView? = null
+
+    /**
+     * 扫码结果只**回填**到设置页的输入框，不自动连接。
+     * 扫到的可能是公网、也可能是内网地址，让家长看一眼再点「连接」；
+     * 扫错了还能手动改，自动连接反而会把人卡在一个连不上的界面上。
+     */
+    private val scanLauncher = registerForActivityResult(ScanContract()) { result ->
+        val text = result.contents
+        if (!text.isNullOrBlank()) {
+            setupView?.setUrl(text)
+        }
+    }
+
+    /** 相机权限被拒时明确告知去哪儿开，不做静默失败。 */
+    private val cameraPermLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) {
+                launchScan()
+            } else {
+                Toast.makeText(
+                    this,
+                    "没有相机权限，扫不了码。\n可到「设置 → 应用 → 小书童 → 权限」里打开相机。",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -119,11 +152,15 @@ class MainActivity : AppCompatActivity() {
             existing.focusInput()
             return
         }
-        val view = ServerSetupView(this) { url ->
-            siteUrl = ServerConfig.set(this, url)
-            hideSetup()
-            loadSite()
-        }
+        val view = ServerSetupView(
+            this,
+            onSave = { url ->
+                siteUrl = ServerConfig.set(this, url)
+                hideSetup()
+                loadSite()
+            },
+            onScan = { requestScan() }
+        )
         view.showError(msg)
         setupView = view
         root.addView(
@@ -134,6 +171,26 @@ class MainActivity : AppCompatActivity() {
             )
         )
         view.focusInput()
+    }
+
+    /** 扫码入口：先确认相机权限，再拉起扫码界面。 */
+    private fun requestScan() {
+        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            launchScan()
+        } else {
+            cameraPermLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun launchScan() {
+        val opts = ScanOptions()
+        opts.setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+        opts.setPrompt("对准电脑屏幕上的二维码")
+        opts.setBeepEnabled(false)
+        opts.setOrientationLocked(true)
+        scanLauncher.launch(opts)
     }
 
     private fun hideSetup() {

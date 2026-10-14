@@ -9,6 +9,17 @@ plugins {
 // 所以换个地址**不需要重新打包**。想改预填值用 -PsiteUrl=xxx。
 def siteUrl = project.hasProperty('siteUrl') ? project.siteUrl : 'http://fn.19860819.xyz:8093'
 
+// ============ release 签名 ============
+// 口令放在 android/keystore.properties（**已 gitignore，不要提交**）。
+// 文件不存在时 release 照样能构建，只是产出未签名 APK —— 方便别人 clone
+// 下来先跑通，不必先自己造一套密钥。
+def keystoreProps = new Properties()
+def keystorePropsFile = rootProject.file('keystore.properties')
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+def hasSigning = keystoreProps.getProperty('storeFile') != null
+
 android {
     namespace 'xyz.littlescholar.kid'
     compileSdk rootProject.ext.compileSdkVer
@@ -24,18 +35,33 @@ android {
         buildConfigField 'String', 'SITE_URL', "\"${siteUrl}\""
     }
 
+    signingConfigs {
+        if (hasSigning) {
+            release {
+                storeFile rootProject.file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
+
     buildTypes {
         debug {
             minifyEnabled false
             debuggable true
+            // 与 release 用同一个 applicationId，方便两个包互换安装；
+            // 想同时装两个就把下面这行注释打开加上后缀。
+            // applicationIdSuffix '.debug'
         }
         release {
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
                     'proguard-rules.pro'
-            // 未配置签名时产出未签名 APK，仍需手动签名；
-            // 要自动签名请在下面补 signingConfigs。
+            if (hasSigning) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 
@@ -63,4 +89,8 @@ dependencies {
     implementation 'androidx.activity:activity-ktx:1.9.0'
     implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
     implementation 'androidx.webkit:webkit:1.11.0'
+    // 扫二维码。选 journeyapps 的 zxing-android-embedded 而不是 ML Kit：
+    // 前者自带扫码界面、不依赖 Google Play 服务，包体也小得多 ——
+    // 这种"家里用一次"的场景没必要引 ML Kit。
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
 }

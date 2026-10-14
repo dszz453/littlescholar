@@ -102,3 +102,5 @@ tmp/
 temp/
 *.bak
 *.orig
+android/keystore.jks
+android/keystore.properties

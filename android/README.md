@@ -39,6 +39,11 @@ WebView 套壳工程。把已经做好的孩子端 PWA 包成 APK，额外解决
 | 首次打开（没存过地址） | 装完第一次用 |
 | **长按屏幕任意处** | 家长要换地址（孩子不会误触长按） |
 | **页面加载失败时自动弹出** | 地址填错 / 服务器没起 / 不在同一网络 |
+| **扫二维码** | 设置页里的按钮；扫后台「资源接入 → 孩子端入口」那张码，不用手输 |
+
+> 扫码只**回填**到输入框，不自动连接 —— 扫到的可能是公网也可能是内网地址，
+> 让家长看一眼再点「连接」，扫错了还能改。
+> 相机权限被拒时会明确提示去哪儿打开，不做静默失败。
 
 第三条是关键：没有它，填错地址就是一片白屏，家长也不知道该改什么。
 错误提示里会带上"当前尝试的地址"，方便对着改。
@@ -137,33 +142,33 @@ Windows 下若 `./gradlew` 不可执行，用 `sh gradlew assembleDebug`。
 
 > **首次构建**会下载 Gradle 与依赖，耗时较长。已配置阿里云镜像加速。
 
-### 配置签名（可选）
+### release 签名
 
-在 `app/build.gradle` 的 `android {}` 内补充：
+**已经配好了**：`app/build.gradle` 会自动读 `android/keystore.properties`，
+存在就签名、不存在就产出未签名包（两者都不影响 debug 构建）。
 
-```gradle
-signingConfigs {
-    release {
-        storeFile file("../keystore.jks")
-        storePassword "你的密码"
-        keyAlias "littlescholar"
-        keyPassword "你的密码"
-    }
-}
-buildTypes {
-    release {
-        signingConfig signingConfigs.release
-        // ...其余保持不变
-    }
-}
+```
+android/
+├── keystore.jks            # 密钥库（已 gitignore）
+└── keystore.properties     # 口令（已 gitignore）
 ```
 
-生成密钥库：
+```properties
+storeFile=keystore.jks
+storePassword=***
+keyAlias=littlescholar
+keyPassword=***
+```
 
 ```bash
-keytool -genkey -v -keystore keystore.jks -keyalg RSA \
-        -keysize 2048 -validity 10000 -alias littlescholar
+sh gradlew assembleRelease     # 产出 app/build/outputs/apk/release/app-release.apk
 ```
+
+> ⚠️ **这两个文件务必备份。** 密钥丢了就再也无法给已安装的 App 升级
+> —— Android 只允许「同一签名」的包覆盖安装，签名不一致会被系统直接拒绝，
+> 只能卸载重装（用户数据、登录态全丢）。
+>
+> 换机器/换人构建时，把这两个文件拷过去即可；不要把口令提交进仓库。
 
 ---
 

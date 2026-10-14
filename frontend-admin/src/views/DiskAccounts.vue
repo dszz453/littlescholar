@@ -19,6 +19,36 @@
       </template>
     </el-alert>
 
+    <!-- 孩子端入口：装完 App 首次打开要填服务器地址，这里给它一张二维码，
+         家长用 App 里的「扫二维码」扫一下就行，不用在平板上敲 IP:端口。 -->
+    <div class="card-box mb-16 kid-entry">
+      <div class="ke-main">
+        <div class="ke-title">孩子端入口</div>
+        <div class="ke-tip">
+          安装「小书童」App 后首次打开会要求填写服务器地址 ——
+          让孩子端设备用 App 里的<b>「扫二维码」</b>扫右边这张即可。
+        </div>
+        <el-input
+          v-model="kidUrl"
+          class="ke-input"
+          placeholder="http://192.168.31.220:8093"
+          @keyup.enter="refreshQr"
+        >
+          <template #append>
+            <el-button @click="refreshQr">生成二维码</el-button>
+          </template>
+        </el-input>
+        <div class="ke-tip text-secondary">
+          默认按当前访问的域名 + 孩子端端口 <b>8093</b> 猜出来；若孩子端设备在家用，
+          改成内网地址（如 <code>http://192.168.31.220:8093</code>）会更快、也不绕公网。
+        </div>
+      </div>
+      <div class="ke-qr-wrap">
+        <canvas ref="kidQrCanvas" class="ke-qr"></canvas>
+        <div class="ke-tip text-secondary ke-qr-note">{{ kidUrl || '（地址为空）' }}</div>
+      </div>
+    </div>
+
     <el-tabs v-model="tab" @tab-change="onTabChange">
       <el-tab-pane
         v-for="g in groups"
@@ -280,6 +310,36 @@ const groups = [
   { name: 'webdav', label: 'WebDAV' },
   { name: 'local', label: '本地硬盘' },
 ]
+// ============ 孩子端入口二维码 ============
+// 直接用已在用的 qrcode 库在前端画（登录扫码那套也是它），所以这个功能
+// 不需要任何后端接口，离线可用。
+const kidUrl = ref('')
+const kidQrCanvas = ref(null)
+
+/** 猜一个孩子端地址：优先上次填过的，否则「当前域名 + :8093」。 */
+function guessKidUrl() {
+  const saved = localStorage.getItem('ls_kid_url')
+  if (saved) return saved
+  const { protocol, hostname } = window.location
+  return `${protocol}//${hostname}:8093`
+}
+
+async function refreshQr() {
+  const url = (kidUrl.value || '').trim()
+  if (!url) {
+    ElMessage.warning('请先填写孩子端地址')
+    return
+  }
+  localStorage.setItem('ls_kid_url', url)
+  try {
+    await nextTick()
+    // 用 toCanvas 而不是 toDataURL：不用把 base64 塞进响应式变量，省一次大字符串拷贝
+    await QRCode.toCanvas(kidQrCanvas.value, url, { width: 168, margin: 1 })
+  } catch (e) {
+    ElMessage.error('生成二维码失败')
+  }
+}
+
 const tab = ref('disk')
 const accounts = ref([])
 const diskTypes = ref([])
@@ -618,6 +678,8 @@ async function remove(acc) {
 onMounted(() => {
   loadAll()
   loadTypes()
+  kidUrl.value = guessKidUrl()
+  refreshQr()
 })
 </script>
 
@@ -719,4 +781,49 @@ onMounted(() => {
   color: var(--ls-text-secondary);
   line-height: 1.7;
 }
+
+/* ===== 孩子端入口 ===== */
+.kid-entry {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+}
+.ke-main {
+  flex: 1;
+  min-width: 0;
+}
+.ke-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.ke-tip {
+  font-size: 12.5px;
+  color: var(--ls-text-secondary);
+  line-height: 1.7;
+}
+.ke-input {
+  margin: 12px 0 8px;
+  max-width: 460px;
+}
+.ke-qr-wrap {
+  text-align: center;
+  flex: 0 0 auto;
+}
+.ke-qr {
+  display: block;
+  width: 168px;
+  height: 168px;
+  background: #fff;
+  border: 1px solid var(--ls-border, #e5e7eb);
+  border-radius: 8px;
+  padding: 6px;
+  box-sizing: content-box;
+}
+.ke-qr-note {
+  margin-top: 6px;
+  max-width: 180px;
+  word-break: break-all;
+}
+</style>
 </style>
