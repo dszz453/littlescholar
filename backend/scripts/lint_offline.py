@@ -167,9 +167,16 @@ def check_router_methods(files, quiet):
         for fn, ret in re.findall(r"func (New\w+Handler)\([^)]*\)\s*\*?(\w+)", src):
             ctor_ret[fn] = ret
 
+    # 变量 -> 构造器返回类型
+    #
+    # 赋值符同时接受 `:=` 与 `=`：handler 除了"当场 new"之外，还可以由
+    # 上层（main）构造后经 Deps 注入 —— 那种写法是
+    #     aiH := deps.AI
+    #     if aiH == nil { aiH = handler.NewAIHandler(...) }
+    # 仍带构造器调用，只是用 `=` 赋值。只认 `:=` 会把它误判成"没有构造器"。
     vtype = {
         var: ctor_ret.get(ctor)
-        for var, ctor in re.findall(r"(\w+H)\s*:=\s*handler\.(New\w+Handler)", router_src)
+        for var, ctor in re.findall(r"(\w+H)\s*:?=\s*handler\.(New\w+Handler)", router_src)
     }
 
     # 类型 -> 方法集
