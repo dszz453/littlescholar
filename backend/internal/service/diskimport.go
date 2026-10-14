@@ -120,7 +120,16 @@ func IsMediaFile(name string) bool { return mediaFileExts[ExtOfName(name)] }
 // 猜不出时按视频处理 —— 这是历史行为（前端播放器对未知类型就是走视频），
 // 改动会让一些没有扩展名的资源突然变成"不支持的类型"。
 func GuessMediaType(title string) string {
-	switch ExtOfName(title) {
+	return MediaTypeByExt(ExtOfName(title))
+}
+
+// MediaTypeByExt 按扩展名判媒体类型。
+//
+// 从 GuessMediaType 里抽出来，是为了让**排序**用的分类（service.MediaRank）
+// 与**播放**用的分类共用同一张表 —— 两边各写一份迟早会漂移，
+// 表现就是"列表里排前面的打不开、能播的排在后面"。
+func MediaTypeByExt(ext string) string {
+	switch strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), ".")) {
 	case "mp3", "wav", "flac", "aac", "m4a", "ogg", "wma", "ape":
 		return model.MediaTypeAudio
 	case "pdf":

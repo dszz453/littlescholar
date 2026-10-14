@@ -624,9 +624,13 @@ func (h *PlayHandler) Playlist(c *gin.Context) {
 	//  1. **不再把当前资源强制排到第一位**。原来第二条就是列表头，
 	//     于是"当前在哪一集"和"下一集是哪一集"永远差一位，顺序播放
 	//     播到第二集就开始绕圈。现在它待在自己该在的位置上。
-	//  2. **不再按 sort_order / id 排**，改按标题自然序 —— 与孩子在
-	//     列表里看到的顺序、以及"这一集后面该是哪一集"的直觉一致。
-	//     纯字典序会把 1-10 排到 1-2 前面（见 util.NaturalCompare）。
+	//  2. **不再按 sort_order / id 排**，改按「音视频优先 + 标题自然序」
+	//     —— 与孩子在目录列表里看到的顺序、以及"这一集后面该是哪一集"
+	//     的直觉一致。纯字典序会把 1-10 排到 1-2 前面（见 util.NaturalCompare）。
+	//
+	//     ⚠️ 排序比较器与目录列表**共用** service.SortItem.Less。
+	//     两处各写一份的话，同一个目录会出现"列表里第一个是 A、
+	//     点播放下一集却是 B"——列表和播放列表说的是同一件事，必须同口径。
 	var items []model.Resource
 	// 带上 id asc：截断发生在哪一条必须可复现。不带排序时"取哪 500 条"
 	// 由数据库自己决定，同一个目录两次请求可能给出不同的列表。
@@ -646,13 +650,26 @@ func (h *PlayHandler) Playlist(c *gin.Context) {
 		items = append(items, res)
 	}
 
-	sort.SliceStable(items, func(i, j int) bool {
-		if cmp := util.NaturalCompare(items[i].Title, items[j].Title); cmp != 0 {
-			return cmp < 0
+	// 借 service.SortItem 排一遍顺序，再按排好的 id 重排 items ——
+	// 这样"怎么排"只有一处实现（列表接口用的是同一份）。
+	keys := make([]service.SortItem, 0, len(items))
+	for _, it := range items {
+		keys = append(keys, service.SortItem{
+			ID: it.ID, Title: it.Title, MediaType: it.MediaType, Ext: it.Ext,
+		})
+	}
+	sort.SliceStable(keys, func(i, j int) bool { return keys[i].Less(keys[j]) })
+	byID := make(map[uint64]model.Resource, len(items))
+	for _, it := range items {
+		byID[it.ID] = it
+	}
+	ordered := make([]model.Resource, 0, len(keys))
+	for _, k := range keys {
+		if it, ok := byID[k.ID]; ok {
+			ordered = append(ordered, it)
 		}
-		// 标题完全相同时按 ID 兜底，保证每次请求的顺序都可复现
-		return items[i].ID < items[j].ID
-	})
+	}
+	items = ordered
 
 	list := make([]gin.H, 0, len(items))
 	for _, it := range items {

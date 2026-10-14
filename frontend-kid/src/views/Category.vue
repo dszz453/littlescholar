@@ -140,6 +140,9 @@ async function fetchResources(reset = true) {
       categoryId: nodeId.value,
       page: page.value,
       pageSize,
+      // 音视频排前面 + 标题自然升序（"9-7 (1)" 在 "(2)" 前、"2" 在 "10" 前）。
+      // 排序在后端做：只排当前页是没用的，第 3 页的视频永远上不到第 1 页来。
+      order: 'media_asc',
       // 只列**本层直属**资源，不递归子目录 —— 子目录已经在上面「分类」
       // 里单独列成卡片了，再带上它们的资源会重复、页面长一倍。
       //

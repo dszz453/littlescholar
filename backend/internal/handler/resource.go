@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"time"
 
@@ -152,6 +153,12 @@ func (h *ResourceHandler) List(c *gin.Context) {
 	diskType := c.Query("diskType")
 	status := c.Query("status")
 	includeSub := c.Query("includeSub") == "true"
+	// order=media_asc：孩子端目录页要的排序 —— 音视频排前面、标题自然升序。
+	// 不传就保持后台那套 sort_order asc, id desc（管理端按录入顺序看更顺手）。
+	//
+	// 这个参数是**真的会被用**的：frontend-kid 的目录页会带上它；
+	// 别学 includeChildren 那种"前端传了、后端不认"的悬空参数。
+	order := c.Query("order")
 
 	q := h.db.Model(&model.Resource{})
 
@@ -196,6 +203,11 @@ func (h *ResourceHandler) List(c *gin.Context) {
 	var total int64
 	q.Count(&total)
 
+	if order == "media_asc" {
+		h.listMediaAsc(c, q, total, page, pageSize)
+		return
+	}
+
 	var list []model.Resource
 	if err := q.Preload("Category").Order("sort_order asc, id desc").
 		Offset((page - 1) * pageSize).Limit(pageSize).Find(&list).Error; err != nil {
@@ -203,6 +215,63 @@ func (h *ResourceHandler) List(c *gin.Context) {
 		return
 	}
 	util.Page(c, total, page, pageSize, list)
+}
+
+// listMediaAsc 「音视频优先 + 标题自然升序」的分页列表。
+//
+// 关键点：**必须先对全量排序、再切页**。
+// 只对当前页排序是错的 —— 那样第 3 页的视频永远上不到第 1 页来，
+// 而"音视频排前面"这个需求本身就是要跨页成立的。
+//
+// 代价控制：排序只取三列（id/title/media_type/ext），排完拿到本页的 id
+// 再用主键取完整行，两次查询都很轻。
+func (h *ResourceHandler) listMediaAsc(c *gin.Context, q *gorm.DB, total int64, page, pageSize int) {
+	// 这里 Select 之后 q 不再复用，所以不必担心条件泄漏到后面的查询
+	var keys []service.SortItem
+	if err := q.Select("id, title, media_type, ext").Find(&keys).Error; err != nil {
+		util.ServerError(c, "查询失败")
+		return
+	}
+	// SQL 排不了这种序：中文/数字混排（"9-7 (1)" 要排在 "(2)" 前）、
+	// 以及"音视频优先"这一层，都要在内存里做（见 service.SortItem.Less）
+	sort.SliceStable(keys, func(i, j int) bool { return keys[i].Less(keys[j]) })
+
+	lo := (page - 1) * pageSize
+	if lo > len(keys) {
+		lo = len(keys)
+	}
+	hi := lo + pageSize
+	if hi > len(keys) {
+		hi = len(keys)
+	}
+	ids := make([]uint64, 0, hi-lo)
+	for _, k := range keys[lo:hi] {
+		ids = append(ids, k.ID)
+	}
+	if len(ids) == 0 {
+		util.Page(c, total, page, pageSize, []model.Resource{})
+		return
+	}
+
+	// 权限已在 q 里收口过，这里按主键取行不必再过滤；但软删仍由 Model() 兜住
+	var rows []model.Resource
+	if err := h.db.Model(&model.Resource{}).Preload("Category").
+		Where("id IN ?", ids).Find(&rows).Error; err != nil {
+		util.ServerError(c, "查询失败")
+		return
+	}
+	// 数据库不保证 IN 的返回顺序，按排好的 id 顺序重排
+	byID := make(map[uint64]model.Resource, len(rows))
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	ordered := make([]model.Resource, 0, len(ids))
+	for _, id := range ids {
+		if r, ok := byID[id]; ok {
+			ordered = append(ordered, r)
+		}
+	}
+	util.Page(c, total, page, pageSize, ordered)
 }
 
 // Facets 资源分布统计。
