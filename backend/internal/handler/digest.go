@@ -632,6 +632,23 @@ func (h *DigestHandler) StartDigestScheduler(logger *zap.Logger, interval, first
 				return
 			}
 		}
+
+		runOnce := func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("知识沉淀 panic", zap.Any("recover", r))
+				}
+			}()
+			h.RunRound(logger)
+		}
+
+		// 首轮延迟结束后**立刻跑一次**，再进入周期循环。
+		//
+		// 只建 ticker 是不够的：ticker 要等满一个 interval 才有第一次 tick，
+		// 于是「首轮延迟 8 分钟」实际变成「首轮延迟 24 小时 8 分钟」——
+		// 上线当天一条沉淀都不会生成，看起来像功能没生效。
+		runOnce()
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -640,14 +657,7 @@ func (h *DigestHandler) StartDigestScheduler(logger *zap.Logger, interval, first
 			case <-stopCh:
 				return
 			case <-ticker.C:
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							logger.Error("知识沉淀 panic", zap.Any("recover", r))
-						}
-					}()
-					h.RunRound(logger)
-				}()
+				runOnce()
 			}
 		}
 	}()

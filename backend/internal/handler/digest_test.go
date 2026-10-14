@@ -9,12 +9,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/littlescholar/core/internal/model"
 	"github.com/littlescholar/core/internal/service"
 	"github.com/littlescholar/core/internal/util"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -368,4 +370,37 @@ func containsID(ids []uint64, want uint64) bool {
 		}
 	}
 	return false
+}
+
+// TestDigestSchedulerRunsOnceAfterFirstDelay 锁住「首轮延迟结束后立刻执行一次」。
+//
+// 曾经的写法是首轮延迟之后只建 ticker 就进 select。ticker 不会立即触发，
+// 要等满一个 interval 才有第一次 tick —— 于是「首轮延迟 8 分钟」实际变成
+// 「24 小时 8 分钟」，新部署的实例当天一条沉淀都不会生成，
+// 而且日志里连一行输出都没有，看着像功能根本没生效。
+//
+// 断言方式刻意不依赖真实等待 interval：interval 传 1 小时，
+// 那么这段时间内唯一可能的触发源就是"首轮延迟后立即执行"。
+func TestDigestSchedulerRunsOnceAfterFirstDelay(t *testing.T) {
+	db := newDigestTestDB(t)
+	seedDigestTree(t, db, "第 1 集", "第 2 集")
+
+	fake := newFakeAI(t)
+	h := newDigestHandlerForTest(t, db, fake.srv.URL)
+
+	stop := h.StartDigestScheduler(zap.NewNop(), time.Hour, 50*time.Millisecond)
+	defer stop()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int64
+		if err := db.Model(&model.KnowledgeDigest{}).Count(&n).Error; err != nil {
+			t.Fatalf("统计沉淀失败: %v", err)
+		}
+		if n > 0 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("首轮延迟已过却一条沉淀都没生成：ticker 语义把首轮执行吃掉了")
 }

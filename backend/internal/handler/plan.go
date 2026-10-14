@@ -613,6 +613,20 @@ func (h *PlanHandler) StartAwardScheduler(logger *zap.Logger, interval, firstDel
 			}
 		}
 
+		runOnce := func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("周奖状生成 panic", zap.Any("recover", r))
+				}
+			}()
+			h.runAwardRound(logger)
+		}
+
+		// 首轮延迟结束后立刻跑一次。只建 ticker 的话，第一次要等到
+		// 一个完整 interval 之后 —— 新部署的实例当天不会发任何奖状。
+		// 颁奖本身是幂等的（同一用户同一周只发一张），多跑一次无副作用。
+		runOnce()
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -621,14 +635,7 @@ func (h *PlanHandler) StartAwardScheduler(logger *zap.Logger, interval, firstDel
 			case <-stopCh:
 				return
 			case <-ticker.C:
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							logger.Error("周奖状生成 panic", zap.Any("recover", r))
-						}
-					}()
-					h.runAwardRound(logger)
-				}()
+				runOnce()
 			}
 		}
 	}()
