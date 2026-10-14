@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>网盘播放修复报告 · 夸克 412 / 百度直链</title>
+<style>
+  :root{
+    --bg:#f6f7f9;--card:#fff;--line:#e5e7eb;--text:#1f2328;--muted:#6b7280;
+    --brand:#2563eb;--brand-soft:#eff6ff;--ok:#15803d;--ok-soft:#f0fdf4;
+    --bad:#b91c1c;--bad-soft:#fef2f2;--warn:#b45309;--warn-soft:#fffbeb;--chip:#f3f4f6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:28px 20px 56px;background:var(--bg);color:var(--text);
+    font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 6px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+  .sub code{background:var(--chip);padding:1px 6px;border-radius:5px;font-size:12px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:26px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .card .k{font-size:12px;color:var(--muted)}
+  .card .v{font-size:20px;font-weight:650;margin-top:4px;line-height:1.25}
+  .card .n{font-size:11.5px;color:var(--muted);margin-top:2px}
+  .card.ok{background:var(--ok-soft);border-color:#bbf7d0}.card.ok .v{color:var(--ok)}
+  h2{font-size:15px;margin:30px 0 12px;padding-left:10px;border-left:3px solid var(--brand)}
+  h3{font-size:13.5px;margin:18px 0 8px;color:var(--muted);font-weight:600}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:6px 18px 16px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-weight:600;color:var(--muted);font-size:12px;background:#fafbfc}
+  tr:last-child td{border-bottom:none}
+  td.c,th.c{text-align:center;white-space:nowrap}
+  .bad{color:var(--bad);font-weight:600}
+  .good{color:var(--ok);font-weight:600}
+  code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:12.5px}
+  pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:14px 16px;overflow:auto;font-size:12.5px;line-height:1.55}
+  pre .c{color:#94a3b8}
+  ul{margin:6px 0 0;padding-left:22px}li{margin:4px 0}
+  .note{background:var(--warn-soft);border:1px solid #fde68a;border-radius:10px;padding:12px 16px;font-size:13px}
+  footer{margin-top:34px;color:var(--muted);font-size:12px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>网盘播放修复报告 —— 夸克 412 与百度直链</h1>
+  <div class="sub">
+    2026-10-14 · 提交 <code>9af33ea</code> / <code>c1e6b7e</code> / <code>a03383d</code> ·
+    参考 OpenList <code>drivers/quark_uc</code>、AList <code>drivers/baidu_netdisk</code>
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="k">孩子端报错文案</div><div class="v" style="font-size:15px">不能播放，可能地址过期或格式不支持</div><div class="n">Play.vue:716 / 761</div></div>
+    <div class="card ok"><div class="k">夸克流（修复后）</div><div class="v">14 / 14</div><div class="n">全部 206 + 真实字节</div></div>
+    <div class="card ok"><div class="k">百度流（修复后）</div><div class="v">206</div><div class="n">717MB mp4，首部与中部均可</div></div>
+    <div class="card"><div class="k">整体冒烟</div><div class="v">33 / 34</div><div class="n">唯一失败项是探针写死账号 id</div></div>
+  </div>
+
+  <h2>一、夸克：全部资源 412</h2>
+  <div class="panel">
+    <h3>怎么定位的</h3>
+    <p>那句文案只由两种情况触发（<code>Play.vue</code>）：媒体元素报 <code>MEDIA_ERR_SRC_NOT_SUPPORTED</code>（静默重试一次后仍失败），或重取播放信息时地址与旧值完全相同。打 7 个新导入分类共 14 条样本走 <code>play</code> → <code>stream(Range)</code>：
+      <b>14/14 全部 412</b>，而 <code>playMode=proxy</code>、<code>ext</code> 都正确 —— 不是格式、不是前端。错误来自 <code>handler/stream.go:327</code>「源站返回 412」，即直链拿到了，但去源站拉流被拒。</p>
+
+    <h3>根因</h3>
+    <p>库里存的 cookie 是<b>扫码那一刻的快照</b>，其中 <code>__puus</code> 是夸克 CDN 的准入凭据，陈旧之后：
+      业务 API（列目录、取直链）<b>照常 200</b> —— 所以管理端看账号 valid、同步成功、资源列表全正常 —— <b>只有真去下载时才 412</b>。
+      于是孩子端"换资源、重进页面"都没用，因为每次取链用的还是那张旧 cookie。</p>
+
+    <h3>交叉实验（同一文件、同一机器）</h3>
+    <table>
+      <tr><th>组合</th><th class="c">CDN 结果</th></tr>
+      <tr><td>旧 cookie 取链 → GET（带 UA + Referer + Cookie）</td><td class="c bad">412</td></tr>
+      <tr><td>同上，去掉 Cookie / 去掉 Referer / 只带 UA / 裸请求 / 换浏览器 UA</td><td class="c bad">全部 412</td></tr>
+      <tr><td><b>先打一次 <code>/1/clouddrive/config</code> 刷新 <code>__puus</code>，再取链 → GET</b></td><td class="c good">206 + 真实字节</td></tr>
+      <tr><td>刷新后但<b>不带</b> Cookie</td><td class="c bad">412</td></tr>
+    </table>
+    <p style="color:var(--muted);font-size:12.5px;margin:12px 0 2px">与 Referer/UA 无关，就是 <code>__puus</code> 陈旧；而 CDN <b>要求</b> Cookie。</p>
+
+    <h3>修法</h3>
+    <ul>
+      <li><code>GetDirectLink</code> <b>先刷新 cookie 再取链</b> —— 链与 cookie 必须"同时新鲜"，只换其中一个都不行。</li>
+      <li>取链失败强制再刷一次重试（夸克偶发 <code>code=15000</code>）。</li>
+      <li>刷新值以原始 cookie 为 key 在内存缓存 5 分钟，覆盖"播放信息 + 取流"两次相邻调用。</li>
+      <li>UC 与夸克同属阿里系、同病，一并修（其 <code>__puus</code> 由一次 <code>file/sort</code> 下发）。</li>
+    </ul>
+    <p style="font-size:12.5px;color:var(--muted)">参考实现：OpenList <code>drivers/quark_uc</code> 在<b>每个响应</b>里把 Set-Cookie 的 <code>__puus</code> 回写进自己的 cookie 并持久化 —— 印证了方向。</p>
+  </div>
+
+  <h2>二、百度：两个重叠的 bug（直链从来没成功过）</h2>
+  <div class="panel">
+    <h3>bug 1 —— 响应形状解析错（根本原因）</h3>
+    <p><code>/api/filemetas</code> 的真实响应是：</p>
+<pre>{"errno":0,
+ "info":[{"dlink":"https://d.pcs.baidu.com/file/…?fid=…",
+          "size":"751828992","fs_id":"1114395303765791", …}],
+ "request_id":…}</pre>
+    <p>而代码按 <code>list[].dlink.dlink</code>（嵌套对象）+ 数字 <code>size</code> 解析 —— <b>键名、<code>dlink</code> 类型、<code>size</code> 类型三处全错</b>，
+      于是 <code>len(resp.List)==0</code> 恒成立。报错却极具迷惑性：</p>
+<pre>{"code":500,"message":"获取播放地址失败: 百度获取直链失败: errno=0"}</pre>
+    <p><code>errno</code> 明明是 0，看着像"接口是好的"，实际是本地没解析出来。<b>这也解释了为什么一直没被发现 —— 线上一条百度资源都没有。</b></p>
+
+    <h3>bug 2 —— 拿 BDUSS 冒充 <code>access_token</code></h3>
+    <p>形状修对之后还有一个坑：dlink 上无条件拼 <code>?access_token=&lt;BDUSS&gt;</code>。百度在 dlink 上<b>先校验 access_token 再看 Cookie</b>，格式合法的伪令牌直接被判死。</p>
+    <table>
+      <tr><th>组合（同一条 dlink，717MB mp4）</th><th class="c">结果</th></tr>
+      <tr><td>UA=<code>netdisk;P2SP;…</code> + <code>access_token=BDUSS</code> + Cookie</td><td class="c bad">401 <code>error_code=110</code> Access token invalid</td></tr>
+      <tr><td>UA=<code>netdisk;P2SP;…</code> + 不带 token + Cookie</td><td class="c good">206 video/mp4</td></tr>
+      <tr><td>UA=<code>pan.baidu.com</code> + 不带 token + Cookie</td><td class="c good">206 video/mp4</td></tr>
+      <tr><td>任意 UA + 不带 token + <b>无</b> Cookie</td><td class="c bad">403 <code>error_code=31045</code> user not exists</td></tr>
+    </table>
+    <ul>
+      <li><b>Cookie（含 STOKEN）是命根子</b>；走 Cookie 鉴权时不能带 access_token。</li>
+      <li><b>UA 不是关键</b> —— 两种 UA 都 206，717MB 大文件也不受文档里"&gt;20MB 要改 <code>User-Agent: pan.baidu.com</code>"那条影响。</li>
+      <li>AList 只能借<b>思路</b>不能借<b>端点</b>：它走 <code>/xpan/multimedia</code> + 真 OAuth 令牌；该端点在 Cookie 鉴权下<b>恒 404</b>（已实测）。</li>
+    </ul>
+  </div>
+
+  <h2>三、验收</h2>
+  <div class="panel">
+    <table>
+      <tr><th>项</th><th>修复前</th><th>修复后</th></tr>
+      <tr><td>夸克 7 分类 × 2 条样本的 <code>stream</code></td><td class="bad">0/14（14 条全 412）</td><td class="good">14/14 → 206 + <code>Content-Range</code> + 真实类型（mp4/pdf/mp3/mp4a，含 443MB 大文件）</td></tr>
+      <tr><td>百度 717MB mp4（端到端，走真实资源）</td><td class="bad"><code>百度获取直链失败: errno=0</code></td><td class="good">首 1KB 与中部 1KB 均 206 video/mp4</td></tr>
+      <tr><td>既有资源 id=76（夸克）</td><td class="bad">新旧机都 412</td><td class="good">新旧机都 206 video/mp4</td></tr>
+      <tr><td>整体冒烟</td><td>—</td><td>33/34（唯一失败项已修：探针写死 <code>accounts/4</code>，新机没有百度账号）</td></tr>
+    </table>
+    <p style="color:var(--muted);font-size:12.5px;margin:12px 0 2px">
+      百度端到端用<b>临时数据</b>验证：建临时分类 → 把账号里 717MB 的 mp4 登记成资源 → 测完删除资源与分类（已核对：关键词命中 0、临时分类不存在）。
+      两台机器（旧机 8090/8091、新机 8092/8093）都已重建 <code>ls-core</code> 并健康。
+    </p>
+  </div>
+
+  <h2>四、遗留</h2>
+  <div class="note">
+    <ul style="margin:0">
+      <li><b>UC 账号 <code>status=invalid</code></b>（cookie 已失效）→ 需要重新扫码或粘贴 cookie；UC 侧修复因此在线上还没法验证。</li>
+      <li><b>百度账号只存在于旧机</b>，且<b>一条百度资源都没有</b> —— 要用百度内容需要先建映射/导入。</li>
+      <li>可评估：借 AList 文档给的客户端 ID/密钥走 <b>OAuth refresh_token</b>，比 BDUSS 稳，且能用 <code>/xpan/*</code> 与百度自带转码（<code>/file/v2/play/project</code>）；夸克侧同理可用其转码地址省掉本地转码。</li>
+    </ul>
+  </div>
+
+  <footer>证据脚本：<code>.workbuddy/tmp/{diag_play_quark,diag_play_baidu,probe_quark_cdn,probe_quark_bind,probe_baidu_dl,verify_baidu_e2e}.py</code> · 采集于 2026-10-14</footer>
+</div>
+</body>
+</html>
