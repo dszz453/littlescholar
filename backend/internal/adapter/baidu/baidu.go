@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,33 @@ func (b *Baidu) pan() string {
 // 如果这里另外写死 panURL，测试会悄悄打到真实的 pan.baidu.com 上，
 // 既慢又会让"测试通过"变得没有意义。
 func (b *Baidu) api() string { return b.pan() + "/api" }
+
+// flexInt64 兼容"同一个字段有时是数字、有时是字符串"。
+//
+// 百度不同接口对同一个语义的编码并不一致：/share/list 的 fs_id 实测返回
+// **字符串** "31245039880635"，而 /api/list 返回数字。声明成 int64 时，
+// 字符串那条会在 json.Unmarshal 阶段让**整条响应**解析失败，报
+// 「响应解析失败: json: cannot unmarshal string into Go struct field …」——
+// 与分享本身毫无关系，却同样把转存卡死。
+//
+// 数字是 64 位（fs_id 已经到 3.1e13），所以不能退化成 float64。
+type flexInt64 int64
+
+func (f *flexInt64) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if s == "" || s == "null" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("无法解析数字 %q: %w", s, err)
+	}
+	*f = flexInt64(v)
+	return nil
+}
+
+func (f flexInt64) Int64() int64 { return int64(f) }
 
 func (b *Baidu) Type() adapter.DiskType { return adapter.DiskBaidu }
 func (b *Baidu) Name() string           { return "百度网盘" }
@@ -414,12 +442,12 @@ func (b *Baidu) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 	var resp struct {
 		Errno int `json:"errno"`
 		List  []struct {
-			FsID        int64  `json:"fs_id"`
-			Path        string `json:"path"`
-			ServerName  string `json:"server_filename"`
-			IsDir       int    `json:"isdir"`
-			Size        int64  `json:"size"`
-			ServerMtime int64  `json:"server_mtime"`
+			FsID        flexInt64 `json:"fs_id"`
+			Path        string    `json:"path"`
+			ServerName  string    `json:"server_filename"`
+			IsDir       flexInt64 `json:"isdir"`
+			Size        flexInt64 `json:"size"`
+			ServerMtime flexInt64 `json:"server_mtime"`
 		} `json:"list"`
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
@@ -453,8 +481,8 @@ func (b *Baidu) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 			ID:        id,
 			Name:      f.ServerName,
 			IsDir:     f.IsDir == 1,
-			Size:      f.Size,
-			UpdatedAt: time.Unix(f.ServerMtime, 0).Format(time.RFC3339),
+			Size:      f.Size.Int64(),
+			UpdatedAt: time.Unix(f.ServerMtime.Int64(), 0).Format(time.RFC3339),
 			Ext:       extOf(f.ServerName),
 		})
 	}
@@ -468,8 +496,8 @@ func (b *Baidu) MakeDir(ctx context.Context, cred *adapter.Credential, parentID,
 		return "", err
 	}
 	var resp struct {
-		Errno int   `json:"errno"`
-		FsID  int64 `json:"fs_id"`
+		Errno int       `json:"errno"`
+		FsID  flexInt64 `json:"fs_id"`
 	}
 	_, err = b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
@@ -713,8 +741,8 @@ func (b *Baidu) unlockShare(ctx context.Context, cred *adapter.Credential, code,
 // 与 /share/verify 的要求正好相反（这对兄弟接口的差异是实测出来的）。
 func (b *Baidu) shareMeta(ctx context.Context, cred *adapter.Credential, code string) (string, string) {
 	var info struct {
-		ShareID int64 `json:"shareid"`
-		UK      int64 `json:"uk"`
+		ShareID flexInt64 `json:"shareid"`
+		UK      flexInt64 `json:"uk"`
 	}
 	candidates := []string{code, normalizeShareCode(code)}
 	for _, c := range candidates {
@@ -788,11 +816,12 @@ func (b *Baidu) listShareDir(ctx context.Context, cred *adapter.Credential, t *s
 	var listResp struct {
 		Errno int `json:"errno"`
 		List  []struct {
-			FsID       int64  `json:"fs_id"`
-			Path       string `json:"path"`
-			ServerName string `json:"server_filename"`
-			IsDir      int    `json:"isdir"`
-			Size       int64  `json:"size"`
+			// ⚠️ fs_id / size 在这个接口里可能是**字符串**，见 flexInt64。
+			FsID       flexInt64 `json:"fs_id"`
+			Path       string    `json:"path"`
+			ServerName string    `json:"server_filename"`
+			IsDir      flexInt64 `json:"isdir"`
+			Size       flexInt64 `json:"size"`
 		} `json:"list"`
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
@@ -814,7 +843,7 @@ func (b *Baidu) listShareDir(ctx context.Context, cred *adapter.Credential, t *s
 			ID:    fmt.Sprint(f.FsID),
 			Name:  f.ServerName,
 			IsDir: f.IsDir == 1,
-			Size:  f.Size,
+			Size:  f.Size.Int64(),
 			Ext:   extOf(f.ServerName),
 			// 下钻用：目录的相对路径。
 			SharePath: f.Path,
@@ -1032,7 +1061,7 @@ func (b *Baidu) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 			Dlink struct {
 				Dlink string `json:"dlink"`
 			} `json:"dlink"`
-			Size int64 `json:"size"`
+			Size flexInt64 `json:"size"`
 		} `json:"list"`
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
@@ -1059,8 +1088,8 @@ func (b *Baidu) GetDirectLink(ctx context.Context, cred *adapter.Credential, fil
 	}
 	return &adapter.DirectLink{
 		URL:          link,
-		Size:         resp.List[0].Size,
-		ExpiresAt: time.Now().Add(8 * time.Hour).Unix(),
+		Size:         resp.List[0].Size.Int64(),
+		ExpiresAt:    time.Now().Add(8 * time.Hour).Unix(),
 		// 百度 PCS 的下载域名（d.pcs.baidu.com）对部分文件会校验 BDUSS，
 		// 与其它网盘保持一致带上 Cookie，避免"换个文件就 403"。
 		Headers:      adapter.MediaHeaders(ua, "https://pan.baidu.com/", cred.Cookie),

@@ -3,6 +3,7 @@ package baidu
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -84,8 +85,12 @@ func fakePan(t *testing.T, log *[]string) http.HandlerFunc {
 				_, _ = w.Write([]byte(`{"errno":-9}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"errno":0,"list":[{"fs_id":99,"path":"/a.txt",` +
-				`"server_filename":"a.mp4","isdir":0,"size":12}]}`))
+			// ⚠️ fs_id / size / isdir 在这里**故意用字符串** —— 线上实测
+			// /share/list 就是给字符串的（而 /api/list 给数字）。声明成 int64
+			// 会让整条响应解析失败，报「cannot unmarshal string into …」，
+			// 与分享本身无关却同样把转存卡死。
+			_, _ = w.Write([]byte(`{"errno":0,"list":[{"fs_id":"31245039880635",` +
+				`"path":"/a.mp4","server_filename":"a.mp4","isdir":"0","size":"12"}]}`))
 
 		case strings.HasSuffix(r.URL.Path, "/share/transfer"):
 			rec("transfer " + r.URL.RawQuery)
@@ -257,6 +262,13 @@ func TestListShareDirCarriesBDCLNDCookie(t *testing.T) {
 	if len(files) != 1 || files[0].Name != "a.mp4" || files[0].IsDir {
 		t.Errorf("解析结果不对：%+v", files)
 	}
+	// 字符串形态的 fs_id 要能正常解析出来（flexInt64）
+	if files[0].ID != "31245039880635" {
+		t.Errorf("fs_id 应解析为 31245039880635，实际 %q", files[0].ID)
+	}
+	if files[0].Size != 12 {
+		t.Errorf("size 应解析为 12，实际 %d", files[0].Size)
+	}
 	joined := strings.Join(log, " | ")
 	if !strings.Contains(joined, "BDCLND=ab%2Fcd%3D") {
 		t.Errorf("Cookie 里应带原样（编码）的 BDCLND，实际：%s", joined)
@@ -287,6 +299,34 @@ func TestSaveToDirSendsDecodedSeKey(t *testing.T) {
 	joined := strings.Join(log, " | ")
 	if !strings.Contains(joined, "sekey=ab%2Fcd%3D") {
 		t.Errorf("sekey 应是解码值再被 url 编码一次（ab%%2Fcd%%3D），实际：%s", joined)
+	}
+}
+
+// TestFlexInt64AcceptsBothForms 百度同一个字段会在数字/字符串之间摇摆。
+//
+// 实测：/share/list 的 fs_id 是 "31245039880635"（字符串），
+// /api/list 的 fs_id 是 31245039880635（数字）。用 int64 接字符串那条时，
+// json.Unmarshal 会让**整条响应**失败 —— 线上就是这么炸的。
+// 顺带注意 fs_id 已经是 3.1e13，超过 float64 的安全整数范围，不能走浮点。
+func TestFlexInt64AcceptsBothForms(t *testing.T) {
+	var v struct {
+		A flexInt64 `json:"a"`
+		B flexInt64 `json:"b"`
+		C flexInt64 `json:"c"`
+		D flexInt64 `json:"d"`
+	}
+	body := `{"a":"31245039880635","b":31245039880635,"c":"","d":null}`
+	if err := json.Unmarshal([]byte(body), &v); err != nil {
+		t.Fatalf("两种形态都应能解析：%v", err)
+	}
+	if v.A != 31245039880635 || v.B != 31245039880635 {
+		t.Errorf("解析结果不对：a=%d b=%d", v.A, v.B)
+	}
+	if v.C != 0 || v.D != 0 {
+		t.Errorf("空串/null 应落到 0：c=%d d=%d", v.C, v.D)
+	}
+	if got := v.A.Int64(); got != 31245039880635 {
+		t.Errorf("Int64() = %d", got)
 	}
 }
 
