@@ -25,6 +25,10 @@
             placeholder="选择一个目录（含它的全部子目录）"
             style="width: 100%"
           />
+          <div class="hint">
+            可以选到任意层级：<b>点左侧箭头</b>展开下级目录，<b>点目录名</b>即选中它
+            （整理范围 = 该目录 + 它的全部子目录）。目录多的时候直接输入名字搜索更快。
+          </div>
         </el-form-item>
 
         <el-form-item label="接入源">
@@ -210,7 +214,11 @@ import { ElMessage } from 'element-plus'
 import { Check, MagicStick } from '@element-plus/icons-vue'
 import { categoryApi, diskApi, organizeApi } from '@/api'
 
-const treeProps = { label: 'name', children: 'children' }
+// value 必须显式写 'id'。
+// el-tree-select 的 props.value 默认是字面量 'value'，而我们的节点字段叫 id；
+// 只写 node-key 在部分版本上不足以让 v-model 拿到 id，结果是"看着选中了、
+// 提交上去却是空/整个节点对象"。显式声明一处，比事后猜版本行为靠谱。
+const treeProps = { label: 'name', children: 'children', value: 'id' }
 
 const catTree = ref([])
 const accounts = ref([])

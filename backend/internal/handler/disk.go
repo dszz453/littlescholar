@@ -217,8 +217,12 @@ func (h *DiskHandler) PollQRCode(c *gin.Context) {
 
 	resp := gin.H{"status": result.Status, "message": result.Message}
 
-	// 确认成功 → 落库
-	if result.Status == "confirmed" && result.Cookie != "" {
+	// 确认成功 → 落库。
+	//
+	// partial 也落库：拿到了 BDUSS 但补不到 STOKEN（能读不能写）。
+	// 这种情况以前也报 confirmed，界面显示"绑定成功"，用户要到下一次
+	// 转存才撞上失败；现在状态如实区分，前端会用黄色提示讲清楚缺什么。
+	if (result.Status == "confirmed" || result.Status == "partial") && result.Cookie != "" {
 		encrypted, err := h.encryptor.Encrypt(result.Cookie)
 		if err != nil {
 			util.ServerError(c, "凭据加密失败")
@@ -249,7 +253,7 @@ func (h *DiskHandler) PollQRCode(c *gin.Context) {
 			return
 		}
 		h.db.Model(&sess).Updates(map[string]interface{}{
-			"status": "confirmed", "account_id": acc.ID, "cookie_raw": "",
+			"status": result.Status, "account_id": acc.ID, "cookie_raw": "",
 		})
 		resp["accountId"] = acc.ID
 		resp["nickname"] = acc.Nickname

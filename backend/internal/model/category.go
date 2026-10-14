@@ -20,6 +20,14 @@ type Category struct {
 	Path        string  `gorm:"size:500;index" json:"path"` // 物化路径 /1/12/35/
 	IsPublic    bool    `gorm:"default:false" json:"isPublic"` // 公开目录无需授权
 
+	// Hidden 只影响**孩子端目录树**（AppTree）是否展示，不影响资源归属、
+	// 权限判定与搜索可见性。
+	//
+	// 用途：「搜一搜 · 搜全网」这类**功能性容器目录**。它的内容要能被
+	// 孩子播到（所以必须公开、必须有权限），但它不该作为一块"学习板块"
+	// 出现在孩子首页，那会让孩子看到一堆自动收录的、没有编排过的文件。
+	Hidden bool `gorm:"default:false" json:"hidden"`
+
 	Children []*Category `gorm:"-" json:"children,omitempty"`
 
 	// 非持久化字段

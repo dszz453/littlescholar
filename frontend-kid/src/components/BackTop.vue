@@ -45,7 +45,7 @@ onUnmounted(() => window.removeEventListener('scroll', onScroll))
   position: fixed;
   right: 16px;
   /* 抬到 TabBar 之上：压在导航条上会点不准 */
-  bottom: calc(76px + var(--safe-bottom));
+  bottom: calc(var(--tabbar-h) + 18px + var(--safe-bottom));
   z-index: 90;
   width: 42px;
   height: 42px;

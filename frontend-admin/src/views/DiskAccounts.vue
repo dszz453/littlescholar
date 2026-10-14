@@ -421,15 +421,23 @@ function startPolling() {
       if (res.status === 'scanned') {
         qrStatusText.value = '已扫码，请在手机上确认'
         qrStatusType.value = 'warning'
-      } else if (res.status === 'confirmed') {
-        qrStatusText.value = '绑定成功！'
-        qrStatusType.value = 'success'
+      } else if (res.status === 'confirmed' || res.status === 'partial') {
+        // partial = 拿到了 BDUSS 但没换到 STOKEN，账号能读不能写。
+        // 这种情况必须说清楚，否则"绑定成功"四个字会把人带偏：
+        // 用户会以为万事俱备，直到下一次转存才失败，根本联想不到绑定环节。
+        const partial = res.status === 'partial'
+        qrStatusText.value = partial ? '已绑定（缺少写权限）' : '绑定成功！'
+        qrStatusType.value = partial ? 'warning' : 'success'
         stopPolling()
-        ElMessage.success(`已绑定账号：${res.nickname || ''}`)
+        if (partial) {
+          ElMessage.warning(res.message || '已绑定，但缺少写权限，转存可能失败')
+        } else {
+          ElMessage.success(`已绑定账号：${res.nickname || ''}`)
+        }
         setTimeout(() => {
           addDialog.value = false
           loadAll()
-        }, 800)
+        }, partial ? 2600 : 800)
       } else if (res.status === 'expired') {
         qrStatusText.value = '二维码已过期，请重新获取'
         qrStatusType.value = 'danger'

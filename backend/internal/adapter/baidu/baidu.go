@@ -25,6 +25,11 @@ import (
 type Baidu struct {
 	http *adapter.HTTPClient
 
+	// panBase 分享/转存类接口的域名。默认 panURL；
+	// 单元测试把它指向本地 httptest 服务器，好断言"请求体到底长什么样"——
+	// form 还是 JSON 这件事肉眼看不出来，只有线上才会以"分享已失效"的形式爆出来。
+	panBase string
+
 	// bdstoken 缓存：写操作全都要它，但每个请求都去换一遍太浪费。
 	tokenMu sync.Mutex
 	tokens  map[string]tokenEntry
@@ -41,9 +46,18 @@ func init() {
 
 func New() *Baidu {
 	return &Baidu{
-		http:   adapter.NewHTTPClient(30 * time.Second),
-		tokens: make(map[string]tokenEntry),
+		http:    adapter.NewHTTPClient(30 * time.Second),
+		panBase: panURL,
+		tokens:  make(map[string]tokenEntry),
 	}
+}
+
+// pan 分享/转存接口的基地址（测试可替换）。
+func (b *Baidu) pan() string {
+	if b.panBase == "" {
+		return panURL
+	}
+	return b.panBase
 }
 
 func (b *Baidu) Type() adapter.DiskType { return adapter.DiskBaidu }
@@ -71,16 +85,44 @@ func gid() string {
 	return strings.ToUpper(hex.EncodeToString(b))
 }
 
-func (b *Baidu) headers(cred *adapter.Credential) map[string]string {
-	h := map[string]string{
-		"User-Agent": ua,
-		"Cookie":     cred.Cookie,
-		"Referer":    "https://pan.baidu.com/disk/home",
-	}
+// cookieOf 拼出完整 cookie。
+//
+// 库里存的通常只有 BDUSS（扫码/手动粘贴都是），而 STOKEN 另存在 Extra 里 ——
+// 两者要拼起来才是一个"能读写"的账号。只带 BDUSS 时能读不能写。
+func cookieOf(cred *adapter.Credential) string {
 	if cred.Extra != nil {
 		if stoken := cred.Extra["STOKEN"]; stoken != "" {
-			h["Cookie"] = strings.TrimRight(cred.Cookie, "; ") + "; STOKEN=" + stoken
+			return strings.TrimRight(cred.Cookie, "; ") + "; STOKEN=" + stoken
 		}
+	}
+	return cred.Cookie
+}
+
+// headers 网盘 **API 接口**（pan.baidu.com/api/…）用的请求头。
+func (b *Baidu) headers(cred *adapter.Credential) map[string]string {
+	return map[string]string{
+		"User-Agent": ua,
+		"Cookie":     cookieOf(cred),
+		"Referer":    "https://pan.baidu.com/disk/home",
+	}
+}
+
+// webHeaders 网盘 **网页接口**（/share/verify、/share/list、/share/transfer）用的请求头。
+//
+// 与 headers 的差别不是风格问题：
+//   - UA：网页接口只认浏览器 UA，netdisk;P2SP;… 会被直接拒；
+//   - Referer：网页接口要的是分享页地址，给 /disk/home 不是"最贴近的真实请求"。
+//
+// formBody 为 true 时补上表单 Content-Type —— 这几个接口的 body 都得是
+// application/x-www-form-urlencoded，走 RawBody 时 http.go 不会自动补头。
+func (b *Baidu) webHeaders(cred *adapter.Credential, referer string, formBody bool) map[string]string {
+	h := map[string]string{
+		"User-Agent": webUA,
+		"Cookie":     cookieOf(cred),
+		"Referer":    referer,
+	}
+	if formBody {
+		h["Content-Type"] = "application/x-www-form-urlencoded"
 	}
 	return h
 }
@@ -166,12 +208,20 @@ func (b *Baidu) PollQRCode(ctx context.Context, sessionID string) (*adapter.Logi
 		return nil, fmt.Errorf("扫码会话无效")
 	}
 
+	// ⚠️ unicast 是**长轮询**：没人扫码时服务端会一直挂着不回包。
+	//
+	// 也就是说"请求超时"在这里是**正常状态**，不是故障 —— 真正有事件
+	// （已扫码 / 已确认）时它会立刻返回。所以这里自己压一个较短的超时：
+	// 外层给的是 20s，而前端每 2s 轮询一次，20s 会让请求越堆越多。
+	pollCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
 	var resp struct {
 		Errno    int    `json:"errno"`
 		ChannelV string `json:"channel_v"`
 		Msg      string `json:"msg"`
 	}
-	_, err := b.http.DoJSON(ctx, &adapter.Request{
+	_, err := b.http.DoJSON(pollCtx, &adapter.Request{
 		Method:  "GET",
 		URL:     passport + "/channel/unicast",
 		Headers: map[string]string{"User-Agent": webUA},
@@ -215,12 +265,16 @@ func (b *Baidu) PollQRCode(ctx context.Context, sessionID string) (*adapter.Logi
 		}
 		cookie, err := b.cookieFromBDUSS(ctx, cv.V)
 		if err != nil {
-			// 拿不到 STOKEN 也算"能用一半"：BDUSS 本身足够读，
-			// 只是转存会失败。把 BDUSS 存进去并如实说明。
+			// 拿到 BDUSS 却补不到 STOKEN：这个账号能读、**不能写**
+			// （转存/新建/改名全都要 STOKEN）。
+			//
+			// 以前这里也返回 confirmed，于是界面显示「绑定成功」，
+			// 用户要到下一次转存才撞上失败，根本联想不到是绑定环节缺东西。
+			// 改为 partial，让前端用黄色提示把话讲明白。
 			return &adapter.LoginResult{
-				Status:  "confirmed",
+				Status:  "partial",
 				Cookie:  "BDUSS=" + cv.V,
-				Message: "已登录，但 " + err.Error(),
+				Message: "已登录，但未取到 STOKEN（转存/改名会用不了）：" + err.Error(),
 			}, nil
 		}
 		return &adapter.LoginResult{Status: "confirmed", Cookie: cookie, Message: "登录成功"}, nil
@@ -235,6 +289,26 @@ func (b *Baidu) PollQRCode(ctx context.Context, sessionID string) (*adapter.Logi
 // 必须拿 BDUSS 去问 gettemplatevariable。少了它，账号"校验通过"，
 // 一列目录就报 -6（登录失效）。
 func (b *Baidu) cookieFromBDUSS(ctx context.Context, bduss string) (string, error) {
+	// 两种 UA 各试一次。该接口在客户端 UA 与浏览器 UA 下并不等价，
+	// 多试一种没有副作用，却能把一部分"本该能登录"的账号救回来。
+	var lastErr error
+	for _, ua := range []string{webUA, ua} {
+		stoken, err := b.fetchStoken(ctx, bduss, ua)
+		if err == nil && stoken != "" {
+			return "BDUSS=" + bduss + "; STOKEN=" + stoken, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("未取到 STOKEN")
+	}
+	return "", lastErr
+}
+
+// fetchStoken 单次尝试用 BDUSS 换 STOKEN。
+func (b *Baidu) fetchStoken(ctx context.Context, bduss, userAgent string) (string, error) {
 	var resp struct {
 		Errno  int                 `json:"errno"`
 		Stoken string              `json:"stoken"`
@@ -244,7 +318,7 @@ func (b *Baidu) cookieFromBDUSS(ctx context.Context, bduss string) (string, erro
 		Method: "GET",
 		URL:    basePanAPI + "/gettemplatevariable",
 		Headers: map[string]string{
-			"User-Agent": ua,
+			"User-Agent": userAgent,
 			"Cookie":     "BDUSS=" + bduss,
 			"Referer":    panURL + "/disk/home",
 		},
@@ -256,14 +330,13 @@ func (b *Baidu) cookieFromBDUSS(ctx context.Context, bduss string) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("获取 STOKEN 失败: %w", err)
 	}
-	stoken := resp.Stoken
-	if stoken == "" && len(resp.Result) > 0 {
-		stoken = resp.Result[0]["stoken"]
+	if resp.Stoken != "" {
+		return resp.Stoken, nil
 	}
-	if stoken == "" {
-		return "", fmt.Errorf("未取到 STOKEN")
+	if len(resp.Result) > 0 && resp.Result[0]["stoken"] != "" {
+		return resp.Result[0]["stoken"], nil
 	}
-	return "BDUSS=" + bduss + "; STOKEN=" + stoken, nil
+	return "", fmt.Errorf("未取到 STOKEN（errno=%d）", resp.Errno)
 }
 
 func (b *Baidu) ValidateCookie(ctx context.Context, cred *adapter.Credential) (*adapter.AccountInfo, error) {
@@ -513,16 +586,40 @@ func (b *Baidu) ParseShare(ctx context.Context, cred *adapter.Credential, shareU
 func (b *Baidu) shareVerify(ctx context.Context, cred *adapter.Credential, surl, passcode string) (int64, int64, string, error) {
 	var verifyResp struct {
 		Errno    int    `json:"errno"`
+		ErrMsg   string `json:"err_msg"`
+		ShowMsg  string `json:"show_msg"`
 		RandSkey string `json:"randsk"`
 		ShareID  int64  `json:"shareid"`
 		UK       int64  `json:"uk"`
 	}
+
+	// ⚠️ body 必须是 **form 编码**，这是本项目踩得最贵的一个坑。
+	//
+	// 原先用 Body（会被 JSON 序列化）提交 {"pwd":…}，服务端解析不到提取码，
+	// 对**任何**分享一律回 errno=-12；而下面又把"非 0"统统映射成
+	// ErrShareExpired，于是线上每一条百度转存都报「分享链接已失效」——
+	// 链接明明是好的（同一个链接 /api/shorturlinfo 能正常返回 shareid/uk）。
+	//
+	// 实测对照（同一个分享、同一天）：
+	//
+	//	JSON body -> errno=-12   （参数压根没被解析）
+	//	form body -> errno=105   （未登录，属于另一个层面的错）
+	//
+	// 两种 body 的响应截然不同，足以确认服务端按 form 解析。
+	form := url.Values{}
+	form.Set("pwd", passcode)
+	form.Set("vcode", "")
+	form.Set("vcode_str", "")
+
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     panURL + "/share/verify",
-		Headers: b.headers(cred),
-		Query:   map[string]string{"surl": surl, "bdstoken": "", "t": fmt.Sprint(time.Now().UnixMilli()), "channel": "chunlei", "web": "1", "app_id": "250528", "clienttype": "0"},
-		Body:    map[string]interface{}{"pwd": passcode, "vcode": "", "vcode_str": ""},
+		URL:     b.pan() + "/share/verify",
+		Headers: b.webHeaders(cred, b.pan()+"/s/"+surl, true),
+		Query: map[string]string{
+			"surl": surl, "bdstoken": "", "t": fmt.Sprint(time.Now().UnixMilli()),
+			"channel": "chunlei", "web": "1", "app_id": "250528", "clienttype": "0",
+		},
+		RawBody: []byte(form.Encode()),
 	}, &verifyResp)
 	if err != nil {
 		return 0, 0, "", err
@@ -531,7 +628,14 @@ func (b *Baidu) shareVerify(ctx context.Context, cred *adapter.Credential, surl,
 		return 0, 0, "", adapter.ErrNeedPassword
 	}
 	if verifyResp.Errno != 0 {
-		return 0, 0, "", adapter.ErrShareExpired
+		// 不要把 errno 吞掉：以前只回一句"分享已失效"，用户和排查的人都
+		// 以为是分享的问题，其实是这边参数/登录态的问题。
+		detail := orDefault(verifyResp.ShowMsg, verifyResp.ErrMsg, "")
+		if detail == "" {
+			detail = fmt.Sprintf("errno=%d", verifyResp.Errno)
+		}
+		return 0, 0, "", fmt.Errorf("%w（%s；若每个分享都如此，多半是账号登录态不完整，请重新接入）",
+			adapter.ErrShareExpired, detail)
 	}
 	return verifyResp.ShareID, verifyResp.UK, verifyResp.RandSkey, nil
 }
@@ -573,8 +677,8 @@ func (b *Baidu) listShareDir(ctx context.Context, cred *adapter.Credential, surl
 	}
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     panURL + "/share/list",
-		Headers: b.headers(cred),
+		URL:     b.pan() + "/share/list",
+		Headers: b.webHeaders(cred, b.pan()+"/s/"+surl, false),
 		Query:   q,
 	}, &listResp)
 	if err != nil {
@@ -737,10 +841,16 @@ func (b *Baidu) SaveToDir(ctx context.Context, cred *adapter.Credential, share *
 		ShowMsg string `json:"show_msg"`
 		ErrMsg  string `json:"err_msg"`
 	}
+	// 转存同样是网页接口：用浏览器 UA + 分享页 Referer。
+	// 真实浏览器点「保存到网盘」时，Referer 就是那个分享页。
+	referer := strings.TrimSpace(share.ShareURL)
+	if referer == "" {
+		referer = b.pan() + "/disk/home"
+	}
 	_, err = b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     panURL + "/share/transfer?" + q.Encode(),
-		Headers: b.headers(cred),
+		URL:     b.pan() + "/share/transfer?" + q.Encode(),
+		Headers: b.webHeaders(cred, referer, true),
 		RawBody: []byte(form.Encode()),
 	}, &resp)
 	if err != nil {

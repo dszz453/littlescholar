@@ -117,7 +117,13 @@ func accumulateCounts(list []*model.Category, countMap map[uint64]int64) {
 func (h *CategoryHandler) AppTree(c *gin.Context) {
 	user := currentUser(c)
 	var cats []model.Category
-	if err := h.db.Order("level asc, sort_order asc, id asc").Find(&cats).Error; err != nil {
+	// hidden 的目录不进孩子端目录树（管理端 Tree 不过滤，管理员照常能管理）。
+	//
+	// 条件用 COALESCE 而不是 `hidden = ?`：AutoMigrate 给存量行补列时不会
+	// 回填默认值，老行是 NULL 而不是 false（本项目已经踩过两次，见 MEMORY）。
+	// 而且这一条是**唯一**条件，不必担心 OR 与软删条件的括号优先级。
+	if err := h.db.Where("COALESCE(hidden, false) = ?", false).
+		Order("level asc, sort_order asc, id asc").Find(&cats).Error; err != nil {
 		util.ServerError(c, "查询目录失败")
 		return
 	}
@@ -167,6 +173,7 @@ type createCategoryRequest struct {
 	Description string  `json:"description"`
 	SortOrder   int     `json:"sortOrder"`
 	IsPublic    bool    `json:"isPublic"`
+	Hidden      bool    `json:"hidden"`
 }
 
 // Create 创建目录
@@ -186,6 +193,7 @@ func (h *CategoryHandler) Create(c *gin.Context) {
 		Description: req.Description,
 		SortOrder:   req.SortOrder,
 		IsPublic:    req.IsPublic,
+		Hidden:      req.Hidden,
 		Level:       1,
 	}
 
@@ -224,6 +232,7 @@ type updateCategoryRequest struct {
 	Description *string `json:"description"`
 	SortOrder   *int    `json:"sortOrder"`
 	IsPublic    *bool   `json:"isPublic"`
+	Hidden      *bool   `json:"hidden"`
 }
 
 // Update 更新目录
@@ -264,6 +273,9 @@ func (h *CategoryHandler) Update(c *gin.Context) {
 	}
 	if req.IsPublic != nil {
 		updates["is_public"] = *req.IsPublic
+	}
+	if req.Hidden != nil {
+		updates["hidden"] = *req.Hidden
 	}
 	if len(updates) == 0 {
 		util.OK(c, cat)

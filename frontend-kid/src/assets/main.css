@@ -24,6 +24,12 @@
   /* 安全区（适配全面屏） */
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
+
+  /* 底部 TabBar 的高度（不含 safe-area）。
+     它是 position:fixed 的，**不占布局空间** —— 所以凡是"内容要贴到屏幕
+     底部"的地方（输入框、悬浮按钮、列表末尾留白）都得自己把这个高度让出来，
+     否则会被盖住。见 .tutor-page 的 composer：那个 bug 就是漏了这一条。 */
+  --tabbar-h: 58px;
 }
 
 * {
@@ -74,7 +80,10 @@ body {
 
 .page {
   min-height: 100vh;
-  padding-bottom: calc(24px + var(--safe-bottom));
+  /* 底部留白必须把 TabBar 的高度一起算进去。
+     TabBar 是 position:fixed，**不占布局空间** —— 只留 24px 的话，列表
+     最后一项、页面底部按钮都会被压在导航条下面，看起来像"内容少了几条"。 */
+  padding-bottom: calc(var(--tabbar-h) + 24px + var(--safe-bottom));
 }
 
 .page-pad {

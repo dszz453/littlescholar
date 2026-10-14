@@ -175,7 +175,11 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  padding-bottom: 0;
+  /* 底部给 TabBar 让位。
+     这里以前写的是 padding-bottom: 0（覆盖 .page 的 24px），而 TabBar 是
+     fixed + z-index:100，正好压在输入框上 —— 孩子看到的输入框其实点不到，
+     所以"没法打字"。58px 是 TabBar 的实测高度，safe-area 另计。 */
+  padding-bottom: calc(var(--tabbar-h) + var(--safe-bottom));
 }
 
 .bar {
@@ -358,7 +362,9 @@ onMounted(() => {
 
 .composer {
   flex: 0 0 auto;
-  padding: 10px 16px calc(10px + var(--safe-bottom));
+  /* safe-area 由 .tutor-page 的 padding-bottom 统一让出，这里不再重复加，
+     否则底部会出现两倍安全区的空白。 */
+  padding: 10px 16px;
   background: rgba(255, 255, 255, 0.96);
   backdrop-filter: blur(12px);
   border-top: 1px solid var(--c-border);

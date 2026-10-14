@@ -35,6 +35,7 @@
               </span>
               <span class="node-name">{{ data.name }}</span>
               <el-tag v-if="data.isPublic" size="small" type="success">公开</el-tag>
+              <el-tag v-if="data.hidden" size="small" type="info">孩子端隐藏</el-tag>
               <span class="node-count">{{ data.resourceCount || 0 }} 个资源</span>
             </div>
             <div class="node-actions">
@@ -99,6 +100,13 @@
             公开目录无需授权即可被所有用户访问
           </span>
         </el-form-item>
+        <el-form-item label="孩子端隐藏">
+          <el-switch v-model="form.hidden" />
+          <span class="text-secondary" style="margin-left: 10px">
+            不在孩子端「我的学习乐园」里显示。用于「搜全网」这类自动收录的容器目录：
+            内容照样能被搜到、能播，只是不作为一块学习板块露出来
+          </span>
+        </el-form-item>
         <el-form-item label="排序">
           <el-input-number v-model="form.sortOrder" :min="0" />
         </el-form-item>
@@ -131,6 +139,7 @@ const form = ref({
   color: '#4a90d9',
   description: '',
   isPublic: false,
+  hidden: false,
   sortOrder: 0,
   parentId: null,
 })
@@ -171,6 +180,7 @@ function openCreate(parent) {
     color: '#4a90d9',
     description: '',
     isPublic: false,
+    hidden: false,
     sortOrder: 0,
     parentId: parent?.id || null,
   }
@@ -186,6 +196,7 @@ function openEdit(data) {
     color: data.color || '#4a90d9',
     description: data.description || '',
     isPublic: data.isPublic || false,
+    hidden: data.hidden || false,
     sortOrder: data.sortOrder || 0,
     parentId: data.parentId,
   }
