@@ -2,10 +2,42 @@ import axios from 'axios'
 import router from '@/router'
 import { showToast } from 'vant'
 
+const BASE = import.meta.env.VITE_API_BASE || '/api'
+
 const http = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || '/api',
+  baseURL: BASE,
   timeout: 60000,
 })
+
+// ============ access token 续期 ============
+//
+// 之前 401 的处理是**直接清 token 跳登录页** —— 而 access token 只有几小时
+// 有效期，于是"孩子隔天打开 App 就得重新输账号密码"成了常态。
+// refreshToken 明明在登录时就存进 localStorage 了，却从来没有被用过。
+//
+// 现在：401 → 拿 refreshToken 换一对新令牌 → **把刚才那次请求原样重放**，
+// 整个过程对孩子无感；只有 refreshToken 本身也失效了才真的回登录页。
+let refreshing = null // 并发去重：同时飞出去几个 401，只允许刷一次
+
+function refreshAccessToken() {
+  const rt = localStorage.getItem('kid_refresh_token')
+  if (!rt) return Promise.reject(new Error('no refresh token'))
+  // 用裸 axios：走 http 实例的话，refresh 自己返回 401 又会触发本拦截器，
+  // 变成自己咬自己。
+  return axios
+    .post(`${BASE}/auth/refresh`, { refreshToken: rt }, { timeout: 20000 })
+    .then((res) => {
+      const body = res.data
+      if (!body || body.code !== 0 || !body.data || !body.data.token) {
+        throw new Error((body && body.message) || 'refresh failed')
+      }
+      localStorage.setItem('kid_token', body.data.token)
+      if (body.data.refreshToken) {
+        localStorage.setItem('kid_refresh_token', body.data.refreshToken)
+      }
+      return body.data.token
+    })
+}
 
 // 请求拦截：注入 token
 http.interceptors.request.use((config) => {
@@ -16,17 +48,44 @@ http.interceptors.request.use((config) => {
   return config
 })
 
+// 401 统一出口：先续期重放，续不动才登出。
+// 后端鉴权失败走的是 `HTTP 200 + body.code=401`（util.Fail），
+// 但反向代理/网关也可能直接回 HTTP 401，两条路都得兜住。
+async function recover401(config) {
+  const cfg = config || {}
+  if (localStorage.getItem('kid_refresh_token') && !cfg.__retried) {
+    try {
+      if (!refreshing) {
+        refreshing = refreshAccessToken().finally(() => {
+          refreshing = null
+        })
+      }
+      const fresh = await refreshing
+      cfg.__retried = true
+      cfg.headers = cfg.headers || {}
+      cfg.headers.Authorization = `Bearer ${fresh}`
+      return http.request(cfg)
+    } catch (e) {
+      // 续期也失败（refreshToken 过期 / 账号被停用）→ 落到下面的登出
+    }
+  }
+  localStorage.removeItem('kid_token')
+  localStorage.removeItem('kid_refresh_token')
+  if (router.currentRoute.value.path !== '/login') {
+    router.replace('/login')
+  }
+  return null
+}
+
 // 响应拦截：解包统一响应格式 {code, message, data}
 http.interceptors.response.use(
-  (response) => {
+  async (response) => {
     const data = response.data
     if (data && typeof data.code !== 'undefined') {
       if (data.code === 0) return data.data
       if (data.code === 401) {
-        localStorage.removeItem('kid_token')
-        if (router.currentRoute.value.path !== '/login') {
-          router.replace('/login')
-        }
+        const replay = await recover401(response.config)
+        if (replay) return replay
         return Promise.reject(new Error(data.message || '登录已失效'))
       }
       // 孩子端用轻提示而非弹窗，避免打断
@@ -35,7 +94,13 @@ http.interceptors.response.use(
     }
     return data
   },
-  (error) => {
+  async (error) => {
+    // HTTP 401（网关直接拦下、没走到业务层）
+    if (error && error.response && error.response.status === 401) {
+      const replay = await recover401(error.config)
+      if (replay) return replay
+      return Promise.reject(error)
+    }
     const msg = error.response?.data?.message || error.message || '网络异常'
     showToast(msg)
     return Promise.reject(error)

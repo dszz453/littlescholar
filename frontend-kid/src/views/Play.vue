@@ -118,6 +118,8 @@
           <div v-if="pdfError" class="pdf-error">
             <div class="emoji">📖</div>
             <p>{{ pdfError }}</p>
+            <p v-if="pdfErrorDetail" class="pdf-error-detail">{{ pdfErrorDetail }}</p>
+            <button class="pdf-reload pressable" @click="hardReload">重新加载</button>
           </div>
         </div>
 
@@ -382,6 +384,8 @@ const pdfPages = ref(0)
 const pdfLoading = ref(false)
 const pdfLoadingText = ref('正在打开绘本…')
 const pdfError = ref('')
+// 原始报错原文。对孩子不展示（看不懂），但家长截图反馈时它才是关键信息。
+const pdfErrorDetail = ref('')
 
 // 转码状态：后台在为首播转码时置位，用于给家长/孩子一个"正在优化播放"的提示
 const transcoding = ref(false)
@@ -756,6 +760,14 @@ async function openPDF(url) {
     if (seq !== pdfOpenSeq) return
     const task = lib.getDocument({
       url,
+      // ⚠️ CMap 与标准字体是**中日韩字体必需**的，别省。
+      // 不配的话 pdf.js 会刷 "The CMap baseUrl parameter must be specified"，
+      // 表现是**中文绘本"图在、字没了"** —— 中文用 CID 编码，
+      // 少了 .bcmap 就映射不出字形。纯英文绘本看不出来，所以很容易漏。
+      // 这两个目录由 vite.config.js 在构建时从 pdfjs-dist 拷进 public/。
+      cMapUrl: `${import.meta.env.BASE_URL}cmaps/`,
+      cMapPacked: true,
+      standardFontDataUrl: `${import.meta.env.BASE_URL}standard_fonts/`,
       // 关掉 pdf.js 的 eval 优化：收益只是渲染快一点，
       // 代价是"PDF 内容能动用代码执行"。给孩子的设备上不划算。
       isEvalSupported: false,
@@ -781,6 +793,8 @@ async function openPDF(url) {
   } catch (e) {
     if (seq !== pdfOpenSeq) return
     pdfLoading.value = false
+    // 原文留给家长反馈用（截图里带上它，我一眼能定位）
+    pdfErrorDetail.value = String((e && e.message) || e || '').slice(0, 180)
     pdfError.value = pdfErrorText(e)
   }
 }
@@ -858,6 +872,30 @@ function onPdfTouchEnd(e) {
   // 误判会让孩子想往下看的时候突然跳页。
   if (Math.abs(dx) < 45 || Math.abs(dx) < Math.abs(dy) * 1.2) return
   pdfGo(dx < 0 ? 1 : -1)
+}
+
+/**
+ * 彻底重载：连 Service Worker 的缓存一起清掉再刷新。
+ *
+ * 为什么需要这么一个按钮：孩子端是 PWA，SW 会**离线优先**地喂缓存。
+ * 服务端发了新版，App 里完全可能还跑着旧的那份 JS —— 表现就是
+ * "我这边明明更新了，客户端还是老样子"。这种情况下普通刷新治不了，
+ * 因为请求还没到网络就被 SW 截住了，必须先把 SW 和 Cache Storage 清掉。
+ */
+async function hardReload() {
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations()
+      await Promise.all(regs.map((r) => r.unregister()))
+    }
+    if (window.caches) {
+      const keys = await caches.keys()
+      await Promise.all(keys.map((k) => caches.delete(k)))
+    }
+  } catch (e) {
+    // 清不动也照样 reload —— 至少能拿到网络上的那一份
+  }
+  location.reload()
 }
 
 /** 把 pdf.js 的各种失败翻译成家长能看懂的话。 */
@@ -1657,6 +1695,25 @@ watch(isPlaying, (v) => {
 .pdf-error .emoji {
   font-size: 40px;
   margin-bottom: 10px;
+}
+.pdf-error-detail {
+  font-size: 11.5px;
+  color: var(--c-text-sub);
+  opacity: 0.75;
+  word-break: break-all;
+  margin: 6px auto 14px;
+  max-width: 320px;
+  line-height: 1.5;
+}
+.pdf-reload {
+  border: none;
+  background: var(--c-primary);
+  color: #fff;
+  font-size: 14.5px;
+  font-weight: 600;
+  padding: 11px 26px;
+  border-radius: 999px;
+  box-shadow: var(--shadow-sm);
 }
 .pdf-pager {
   display: flex;

@@ -104,3 +104,11 @@ temp/
 *.orig
 android/keystore.jks
 android/keystore.properties
+
+# pdf.js 的 CMap / 标准字体（构建时从 node_modules 现拷）
+frontend-kid/public/cmaps/
+frontend-kid/public/standard_fonts/
+
+# 构建时 `mv dist dist-old` 留下的旧产物
+frontend-kid/dist-old*/
+frontend-admin/dist-old*/
