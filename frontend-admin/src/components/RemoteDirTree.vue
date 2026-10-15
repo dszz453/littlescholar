@@ -231,6 +231,16 @@ watch(filterText, (v) => {
   treeRef.value?.filter(v)
 })
 
+// accounts 是父组件异步拿的：本组件挂载时它多半还是空数组，
+// 而 el-tree 的 lazy **只在挂载那一刻请求一次根节点** —— 那一次 resolve 出空数组
+// 之后就永远停在「暂无数据」，后续 accounts 到货也不会重新加载。
+// 这种坏法特别隐蔽：元素、类名、遮罩、loader 状态全都正常，就是树里一个节点都没有，
+// 只有真去数 `.el-tree-node` 才看得出来。所以列表一变就整棵重建。
+watch(
+  () => props.accounts,
+  () => reload()
+)
+
 /**
  * 重新拉整棵树。
  *

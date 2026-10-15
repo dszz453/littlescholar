@@ -238,7 +238,8 @@ func (h *AIHandler) pickFromHits(reply string, hits []model.Resource) []gin.H {
 		if len(out) >= 5 {
 			break
 		}
-		if !containsAnyFragment(reply, r.Title) {
+		// 候选集本身就是按提问检索出来的，片段要求可以短一点（4 字）
+		if !containsAnyFragment(reply, r.Title, 4) {
 			continue
 		}
 		out = append(out, resourceCard(r))

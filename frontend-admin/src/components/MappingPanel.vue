@@ -4,6 +4,7 @@
       <span class="text-secondary">
         左边是系统目录，右边是接入源。勾选两边的目录，用中间的箭头搬运：
         <b>→</b> 把网盘目录挂到系统目录下，<b>←</b> 把挂好的放回去。
+        系统目录展开后能看到它下面<b>已经挂了哪些网盘目录</b>，再展开就是网盘里的内容。
       </span>
       <div>
         <el-button
@@ -21,35 +22,59 @@
 
     <!-- ============ 三栏操作区 ============ -->
     <div class="mp-cols">
-      <!-- 左：系统目录 -->
+      <!-- 左：系统目录（已映射的网盘目录直接长在它下面） -->
       <div class="mp-col">
         <div class="mp-col-head">
           <span class="mp-col-title">系统目录</span>
           <span class="text-secondary">{{ catCheckedIds.length }} 个已选</span>
         </div>
-        <div class="mp-col-body">
+        <div class="mp-col-body" v-loading="leftLoading">
           <el-tree
             ref="catTreeRef"
-            :data="categoryTree"
+            :key="leftKey"
+            :props="leftProps"
+            :load="loadLeftNode"
+            lazy
             node-key="id"
             show-checkbox
             check-strictly
-            :props="{ label: 'name', children: 'children' }"
             :expand-on-click-node="false"
             empty-text="还没有系统目录"
             @check="onCatCheck"
           >
             <template #default="{ data }">
               <span class="mp-node">
-                <span class="mp-node-name">{{ data.name }}</span>
+                <span v-if="data.kind === 'mapping'" class="mp-icon">☁️</span>
+                <span
+                  class="mp-node-name"
+                  :class="{ 'is-mapping': data.kind === 'mapping', 'is-off': data.kind === 'mapping' && !data.enabled }"
+                >{{ data.name }}</span>
+
                 <el-tag
-                  v-if="mapCountOf(data.id)"
+                  v-if="data.kind === 'mapping'"
+                  size="small"
+                  :type="data.enabled ? 'success' : 'info'"
+                  effect="plain"
+                  class="mp-node-tag"
+                >
+                  {{ diskName(data.diskType) }}{{ data.enabled ? '' : ' · 已停用' }}
+                </el-tag>
+                <el-tag
+                  v-else-if="data.kind === 'remote'"
+                  size="small"
+                  effect="plain"
+                  class="mp-node-tag"
+                >
+                  {{ data.isDir ? '目录' : fmtSize(data.size) }}
+                </el-tag>
+                <el-tag
+                  v-else-if="data.mapCount"
                   size="small"
                   type="success"
                   effect="plain"
                   class="mp-node-tag"
                 >
-                  {{ mapCountOf(data.id) }} 条
+                  {{ data.mapCount }} 条映射
                 </el-tag>
               </span>
             </template>
@@ -59,27 +84,16 @@
 
       <!-- 中：箭头 -->
       <div class="mp-arrows">
-        <el-tooltip
-          :content="mapTip"
-          placement="top"
-          :disabled="canMap"
-        >
+        <el-tooltip :content="mapTip" placement="top" :disabled="canMap">
           <span class="mp-arrow-wrap">
-            <el-button
-              class="mp-arrow"
-              type="primary"
-              :disabled="!canMap"
-              @click="doMap"
-            >
+            <el-button class="mp-arrow" type="primary" :disabled="!canMap" @click="doMap">
               →
             </el-button>
           </span>
         </el-tooltip>
         <el-tooltip :content="unmapTip" placement="bottom" :disabled="canUnmap">
           <span class="mp-arrow-wrap">
-            <el-button class="mp-arrow" :disabled="!canUnmap" @click="doUnmap">
-              ←
-            </el-button>
+            <el-button class="mp-arrow" :disabled="!canUnmap" @click="doUnmap"> ← </el-button>
           </span>
         </el-tooltip>
         <div class="mp-opt">
@@ -106,81 +120,82 @@
       </div>
     </div>
 
-    <!-- ============ 已有映射 ============ -->
-    <div class="mp-list">
-      <div class="mp-list-head">
-        <span class="mp-col-title">已有映射（{{ mappings.length }}）</span>
-        <span class="text-secondary">
-          同步会把远端目录里的媒体文件批量登记成资源，可反复执行
-        </span>
-      </div>
+    <!-- ============ 映射明细（收起，只作同步/编辑的入口） ============ -->
+    <el-collapse v-model="openDetail" class="mp-detail">
+      <el-collapse-item name="detail">
+        <template #title>
+          <span class="mp-col-title">映射明细（{{ mappings.length }} 条）</span>
+          <span class="text-secondary mp-detail-hint">
+            同步、改名、启用开关在这里；日常增删用上面的箭头就够了
+          </span>
+        </template>
 
-      <el-table :data="mappings" v-loading="loading" size="small" empty-text="还没有映射">
-        <el-table-column label="名称" min-width="170">
-          <template #default="{ row }">
-            <div class="mp-name">{{ row.name }}</div>
-            <div class="text-secondary">
-              {{ row.account?.nickname || '账号#' + row.accountId }}
-              <el-tag v-if="row.account" size="small" effect="plain" class="ml-4">
-                {{ diskName(row.account.diskType) }}
-              </el-tag>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="远端目录" min-width="150">
-          <template #default="{ row }">
-            <span :title="row.remoteDirId">{{ row.remoteDirName || '根目录' }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="系统目录" min-width="130">
-          <template #default="{ row }">
-            <el-tag size="small" type="info" effect="plain">
-              {{ row.category?.name || '目录#' + row.categoryId }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="递归" width="64">
-          <template #default="{ row }">
-            <el-tag :type="row.recursive ? 'success' : 'info'" size="small" effect="plain">
-              {{ row.recursive ? '开' : '关' }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="启用" width="64">
-          <template #default="{ row }">
-            <el-switch :model-value="row.enabled" @change="(v) => toggleEnabled(row, v)" />
-          </template>
-        </el-table-column>
-        <el-table-column label="上次同步" min-width="170">
-          <template #default="{ row }">
-            <template v-if="row.lastSyncAt">
-              <div class="text-secondary">{{ formatTime(row.lastSyncAt) }}</div>
-              <div>
-                <span class="text-ok">+{{ row.lastSyncCreated }}</span>
-                <span class="text-secondary"> 跳过 {{ row.lastSyncSkipped }}</span>
+        <el-table :data="mappings" v-loading="loading" size="small" empty-text="还没有映射">
+          <el-table-column label="名称" min-width="170">
+            <template #default="{ row }">
+              <div class="mp-name">{{ row.name }}</div>
+              <div class="text-secondary">
+                {{ row.account?.nickname || '账号#' + row.accountId }}
+                <el-tag v-if="row.account" size="small" effect="plain" class="ml-4">
+                  {{ diskName(row.account.diskType) }}
+                </el-tag>
               </div>
-              <div v-if="row.lastSyncError" class="text-err">{{ row.lastSyncError }}</div>
             </template>
-            <span v-else class="text-secondary">未同步</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
-          <template #default="{ row }">
-            <el-button
-              link
-              type="primary"
-              size="small"
-              :loading="syncingId === row.id"
-              @click="sync(row)"
-            >
-              同步
-            </el-button>
-            <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-            <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-    </div>
+          </el-table-column>
+          <el-table-column label="远端目录" min-width="150">
+            <template #default="{ row }">
+              <span :title="row.remoteDirId">{{ row.remoteDirName || '根目录' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="系统目录" min-width="130">
+            <template #default="{ row }">
+              <el-tag size="small" type="info" effect="plain">
+                {{ row.category?.name || '目录#' + row.categoryId }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="递归" width="64">
+            <template #default="{ row }">
+              <el-tag :type="row.recursive ? 'success' : 'info'" size="small" effect="plain">
+                {{ row.recursive ? '开' : '关' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="启用" width="64">
+            <template #default="{ row }">
+              <el-switch :model-value="row.enabled" @change="(v) => toggleEnabled(row, v)" />
+            </template>
+          </el-table-column>
+          <el-table-column label="上次同步" min-width="170">
+            <template #default="{ row }">
+              <template v-if="row.lastSyncAt">
+                <div class="text-secondary">{{ formatTime(row.lastSyncAt) }}</div>
+                <div>
+                  <span class="text-ok">+{{ row.lastSyncCreated }}</span>
+                  <span class="text-secondary"> 跳过 {{ row.lastSyncSkipped }}</span>
+                </div>
+                <div v-if="row.lastSyncError" class="text-err">{{ row.lastSyncError }}</div>
+              </template>
+              <span v-else class="text-secondary">未同步</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="130" fixed="right">
+            <template #default="{ row }">
+              <el-button
+                link
+                type="primary"
+                size="small"
+                :loading="syncingId === row.id"
+                @click="sync(row)"
+              >
+                同步
+              </el-button>
+              <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-collapse-item>
+    </el-collapse>
 
     <!-- ============ 编辑映射 ============ -->
     <el-dialog v-model="dialog" title="编辑映射" width="560px">
@@ -227,18 +242,24 @@ const loading = ref(false)
 const saving = ref(false)
 const syncingId = ref(null)
 
-// 三栏选中状态
+// 左树：lazy 模式。因为它要长三种节点 —— 系统目录 / 该目录下已挂的映射 /
+// 映射展开后的远端内容 —— 后两种都依赖异步数据，用静态 data 拼不出来。
 const catTreeRef = ref(null)
-const remoteTreeRef = ref(null)
+const leftKey = ref(0)
+const leftLoading = ref(false)
 const catCheckedIds = ref([])
+// lazy 树的 isLeaf / disabled 由节点字段控制
+const leftProps = { label: 'name', isLeaf: 'isLeaf', disabled: 'disabled' }
+
+const remoteTreeRef = ref(null)
 const remoteChecked = ref([])
-// 递归开关：影响下一次 → 建出来的映射
 const recursive = ref(true)
 
+const openDetail = ref([]) // 明细默认收起
 const dialog = ref(false)
 const form = ref({})
 
-/** categoryId → 这条目录上直接挂了几个映射（不含子目录） */
+/** categoryId → 直接挂在这一层上的映射条数 */
 const mapCountByCat = computed(() => {
   const m = {}
   for (const x of mappings.value) m[x.categoryId] = (m[x.categoryId] || 0) + 1
@@ -250,19 +271,25 @@ const mappedKeys = computed(() =>
   mappings.value.map((m) => `${m.accountId}::${m.remoteDirId || ''}`)
 )
 
-// 「映射」左边必须**恰好一个**目录：一个网盘目录只能挂到一个系统目录下，
-// 挂两个的话第二个同步过去是 0 条（后端按 file_id 去重，同一份文件不会重复登记）。
-const canMap = computed(() => catCheckedIds.value.length === 1 && remoteChecked.value.length > 0)
+// 「映射」左边必须**恰好一个系统目录**：一个网盘目录挂到两个系统目录没有意义
+// （后端按 file_id 去重，第二处同步过去是 0 条）。
+const canMap = computed(() => {
+  const keys = catCheckedIds.value.map(String)
+  const catOnly = keys.filter((k) => !k.startsWith('map-'))
+  return catOnly.length === 1 && keys.length === 1 && remoteChecked.value.length > 0
+})
 const canUnmap = computed(() => catCheckedIds.value.length > 0)
 
 const mapTip = computed(() => {
   if (!remoteChecked.value.length) return '先在右边勾选要映射的网盘目录'
-  if (!catCheckedIds.value.length) return '先在左边勾选一个系统目录'
-  if (catCheckedIds.value.length > 1) return '映射时左边只能选一个目录（解绑可以多选）'
-  return '映射过去'
+  const keys = catCheckedIds.value.map(String)
+  if (!keys.length) return '先在左边勾选一个系统目录'
+  if (keys.length > 1) return '映射时左边只能选一个目录（解绑可以多选）'
+  if (keys[0].startsWith('map-')) return '左边要选「系统目录」，不是已挂的映射'
+  return '挂过去'
 })
 const unmapTip = computed(() =>
-  canUnmap.value ? '解绑并放回右边' : '先在左边勾选要解绑的目录'
+  canUnmap.value ? '解绑并放回右边' : '先在左边勾选目录或已挂的映射'
 )
 
 function diskName(t) {
@@ -272,13 +299,17 @@ function diskName(t) {
   )
 }
 
+function fmtSize(n) {
+  const v = Number(n) || 0
+  if (v >= 1024 * 1024 * 1024) return (v / 1024 / 1024 / 1024).toFixed(1) + 'G'
+  if (v >= 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + 'M'
+  if (v >= 1024) return (v / 1024).toFixed(0) + 'K'
+  return v ? v + 'B' : '文件'
+}
+
 function formatTime(t) {
   if (!t) return '-'
   return new Date(t).toLocaleString('zh-CN', { hour12: false })
-}
-
-function mapCountOf(id) {
-  return mapCountByCat.value[id] || 0
 }
 
 async function loadAll() {
@@ -292,11 +323,85 @@ async function loadAll() {
     mappings.value = m || []
     accounts.value = a || []
     categoryTree.value = c || []
+    // 映射变了，左树上挂的那些"已映射"节点也得跟着变 —— 整棵重建
+    leftKey.value += 1
+    catCheckedIds.value = []
   } catch (e) {
     /* 拦截器已提示 */
   } finally {
     loading.value = false
   }
+}
+
+/* ============ 左树的三种节点 ============ */
+
+function catNode(c) {
+  return {
+    id: c.id,
+    name: c.name,
+    kind: 'category',
+    parentId: c.parentId,
+    children: c.children || [],
+    mapCount: mapCountByCat.value[c.id] || 0,
+  }
+}
+
+function mapNode(m) {
+  return {
+    id: `map-${m.id}`,
+    name: m.remoteDirName || '根目录',
+    kind: 'mapping',
+    mappingId: m.id,
+    accountId: m.accountId,
+    remoteDirId: m.remoteDirId,
+    diskType: m.account ? m.account.diskType : '',
+    enabled: m.enabled,
+  }
+}
+
+/** 列出某个远端目录的内容（映射节点、以及它下面的子目录都用它）。 */
+async function remoteChildren(accountId, remoteDirId) {
+  try {
+    const res = await diskApi.browse(accountId, remoteDirId)
+    return (res && res.items ? res.items : []).map((it) => ({
+      // 远端 id 在不同账号下可能重名，加账号前缀保证 node-key 唯一
+      id: `r-${accountId}-${it.id}`,
+      name: it.name,
+      kind: 'remote',
+      isDir: !!it.isDir,
+      size: it.size,
+      accountId,
+      remoteDirId: it.id,
+      // 文件没有下级，别给它渲染展开箭头
+      isLeaf: !it.isDir,
+      // 远端内容只是"给你看里面有什么"，不是操作对象，不给勾选框
+      disabled: true,
+    }))
+  } catch (e) {
+    ElMessage.warning('远端目录打不开：' + ((e && e.message) || '账号可能失效或网络不通'))
+    return []
+  }
+}
+
+async function loadLeftNode(node, resolve) {
+  // 根：只放系统目录的最上层（默认收起）
+  if (node.level === 0) {
+    resolve(categoryTree.value.map(catNode))
+    return
+  }
+  const d = node.data || {}
+  if (d.kind === 'mapping' || (d.kind === 'remote' && d.isDir)) {
+    resolve(await remoteChildren(d.accountId, d.remoteDirId))
+    return
+  }
+  if (d.kind === 'remote') {
+    resolve([])
+    return
+  }
+  // 系统目录：先放子目录，再放"已经挂在这个目录上的网盘目录"
+  const kids = (d.children || []).map(catNode)
+  const maps = mappings.value.filter((m) => m.categoryId === d.id).map(mapNode)
+  resolve([...kids, ...maps])
 }
 
 function onCatCheck(_data, info) {
@@ -333,7 +438,7 @@ function withDescendants(ids) {
 
 /* ============ → 映射 ============ */
 async function doMap() {
-  const catId = catCheckedIds.value[0]
+  const catId = Number(catCheckedIds.value.map(String).filter((k) => !k.startsWith('map-'))[0])
   const targets = remoteChecked.value
   if (!catId || !targets.length) return
 
@@ -356,21 +461,18 @@ async function doMap() {
     }
   }
 
-  if (failed.length) {
-    ElMessage.warning(`有 ${failed.length} 条没建上：${failed.join('；')}`)
-  }
+  if (failed.length) ElMessage.warning(`有 ${failed.length} 条没挂上：${failed.join('；')}`)
   if (!created.length) return
 
   await loadAll()
   remoteTreeRef.value?.clearChecked()
 
-  // 建完直接同步 —— 只建映射不导入的话，孩子端还是空的，
-  // 用户会以为"映射没生效"。这里多花几秒，换掉一次困惑。
+  // 建完直接同步一次 —— 只挂映射不导资源的话孩子端还是空的，
+  // 用户会以为"没生效"。这里多花几秒，换掉一次困惑。
   const syncMsg = await syncIds(created)
-  ElMessage.success(`已建立 ${created.length} 条映射${syncMsg}`)
+  ElMessage.success(`已挂上 ${created.length} 条映射${syncMsg}`)
 }
 
-/** 同步一批映射，返回一句可拼在提示后面的话。 */
 async function syncIds(ids) {
   let add = 0
   let skip = 0
@@ -392,15 +494,23 @@ async function syncIds(ids) {
 
 /* ============ ← 解绑 ============ */
 async function doUnmap() {
-  const ids = withDescendants(catCheckedIds.value)
-  const hits = mappings.value.filter((m) => ids.has(m.categoryId))
+  const keys = catCheckedIds.value.map(String)
+  // 直接勾了"已挂的映射"节点 → 就解绑那几条
+  const directIds = keys.filter((k) => k.startsWith('map-')).map((k) => Number(k.slice(4)))
+  // 勾了系统目录 → 它（含子孙）下面的所有映射
+  const catIds = keys.filter((k) => !k.startsWith('map-')).map(Number)
+  const scope = withDescendants(catIds)
+
+  const hits = mappings.value.filter(
+    (m) => directIds.includes(m.id) || scope.has(m.categoryId)
+  )
   if (!hits.length) {
     ElMessage.info('选中的目录下没有映射')
     return
   }
 
   // 删资源不可逆，所以摆到明面上让用户选，而不是替他决定。
-  // 默认勾上：用户的直觉就是"把这个资源拿回去"，留着孤儿资源反而会被当成没生效。
+  // 默认勾上：用户的直觉就是"把这个资源拿回去"，留孤儿资源反而会被当成没生效。
   const withResources = ref(true)
   const names = hits.slice(0, 5).map((m) => m.name).join('、')
   const more = hits.length > 5 ? ` 等 ${hits.length} 条` : ''
@@ -447,18 +557,16 @@ async function doUnmap() {
     }
   }
   await loadAll()
-  catTreeRef.value?.setCheckedKeys([])
-  catCheckedIds.value = []
-
   if (failed.length) ElMessage.warning(`解绑了 ${done} 条，${failed.length} 条失败：${failed[0]}`)
   else ElMessage.success(`已解绑 ${done} 条映射${removed ? `，清理 ${removed} 个资源` : ''}`)
 }
 
-/* ============ 表格上的操作 ============ */
+/* ============ 明细里的操作 ============ */
 async function toggleEnabled(row, v) {
   try {
     await mappingApi.update(row.id, { enabled: v })
     row.enabled = v
+    leftKey.value += 1 // 左树上的"已停用"标记要跟着变
   } catch (e) {
     /* 忽略 */
   }
@@ -475,8 +583,8 @@ function openEdit(row) {
     categoryLabel: row.category?.name || '目录#' + row.categoryId,
     recursive: row.recursive,
     enabled: row.enabled,
-    // 远端与目标目录不允许改：改这两项等于换一条映射，
-    // 应该删掉重建，否则已导入的资源会挂在一个说不清的来源上。
+    // 远端与目标目录不允许改：改这两项等于换一条映射，应该删掉重建，
+    // 否则已导入的资源会挂在说不清的来源上。
     accountId: row.accountId,
     remoteDirId: row.remoteDirId,
     categoryId: row.categoryId,
@@ -503,46 +611,6 @@ async function save() {
     /* 拦截器已提示 */
   } finally {
     saving.value = false
-  }
-}
-
-async function remove(row) {
-  const withResources = ref(true)
-  try {
-    await ElMessageBox({
-      title: '删除映射',
-      type: 'warning',
-      showCancelButton: true,
-      confirmButtonText: '确定删除',
-      cancelButtonText: '取消',
-      message: h('div', [
-        h('p', { style: 'margin:0 0 12px' }, `确定删除映射「${row.name}」吗？`),
-        h(
-          ElCheckbox,
-          {
-            modelValue: withResources.value,
-            'onUpdate:modelValue': (v) => {
-              withResources.value = v
-            },
-          },
-          () => '同时删除已导入的资源'
-        ),
-        h(
-          'p',
-          { style: 'margin:8px 0 0;color:#909399;font-size:12px;line-height:1.6' },
-          '勾选后，这条映射同步进来的资源会从资源列表和孩子端一并移除（不可撤销）；不勾选则只删配置、资源保留。'
-        ),
-      ]),
-    })
-    const res = await mappingApi.remove(row.id, withResources.value)
-    const n = Number(res?.removedResources) || 0
-    const legacy = Number(res?.removedLegacy) || 0
-    if (n === 0) ElMessage.success('已删除映射')
-    else if (legacy > 0) ElMessage.success(`已删除映射，并清理 ${n} 条资源（含 ${legacy} 条历史资源）`)
-    else ElMessage.success(`已删除映射，并清理 ${n} 条资源`)
-    loadAll()
-  } catch (e) {
-    /* 取消 */
   }
 }
 
@@ -587,7 +655,7 @@ onMounted(loadAll)
   display: flex;
   align-items: stretch;
   gap: 10px;
-  margin-bottom: 18px;
+  margin-bottom: 14px;
 }
 .mp-col {
   flex: 1 1 0;
@@ -613,7 +681,7 @@ onMounted(loadAll)
   font-weight: 600;
 }
 .mp-col-body {
-  height: 420px;
+  height: 440px;
   overflow: auto;
   padding: 6px 4px;
 }
@@ -623,10 +691,22 @@ onMounted(loadAll)
   gap: 6px;
   min-width: 0;
 }
+.mp-icon {
+  flex: 0 0 auto;
+}
 .mp-node-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 已挂的映射：和系统目录在视觉上分得开，一眼能看出"这是挂进来的" */
+.mp-node-name.is-mapping {
+  color: var(--el-color-success);
+  font-weight: 500;
+}
+.mp-node-name.is-off {
+  color: var(--ls-text-secondary);
+  text-decoration: line-through;
 }
 .mp-node-tag {
   flex: 0 0 auto;
@@ -657,17 +737,17 @@ onMounted(loadAll)
   margin-top: 4px;
 }
 
-/* ============ 映射列表 ============ */
-.mp-list {
+/* ============ 映射明细 ============ */
+.mp-detail {
   border-top: 1px solid var(--ls-border, #e5e7eb);
-  padding-top: 12px;
+  border-bottom: none;
 }
-.mp-list-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
+.mp-detail :deep(.el-collapse-item__header) {
+  font-size: 13px;
   gap: 12px;
-  margin-bottom: 8px;
+}
+.mp-detail-hint {
+  font-size: 12px;
 }
 .mp-name {
   font-weight: 500;

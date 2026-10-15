@@ -394,41 +394,43 @@ func (h *AIHandler) matchResources(reply string, scopeIDs []uint64, unrestricted
 		if len(out) >= 5 {
 			break
 		}
-		// 标题中任意 2 字以上片段出现在回复里即视为命中
-		if containsAnyFragment(reply, r.Title) {
+		// 兜底扫的是全库热门，片段要求放长（6 字），否则很容易把不相关的热门
+		// 资源当成"AI 推荐的"塞给孩子 —— 这比不给卡片更糟。
+		if containsAnyFragment(reply, r.Title, 6) {
 			out = append(out, resourceCard(r))
 		}
 	}
 	return out
 }
 
-func containsAnyFragment(text, title string) bool {
-	if len(title) < 4 {
-		return len(title) > 0 && contains(text, title)
+// containsAnyFragment 判断标题的某个连续片段是否出现在文本里。
+//
+// ⚠️ 两个要点，都是踩过才知道的：
+//
+//  1. **必须按 rune 切，不能按字节**。中文一个字 3 字节，`title[i:i+n]`
+//     用字节索引切出来会是"一个半字"这种碎片 —— 它不可能出现在任何文本里，
+//     于是整套匹配对中文等于完全失效（只有 n 恰好是 3 的倍数、且 i 也从 0
+//     起步时才蒙对几次）。实测就是这样：孩子问恐龙，卡片给的却是
+//     "the big snowball"。
+//  2. **片段下限要跟着用途走**。候选集内的匹配可以用 4 个字；
+//     兜底匹配扫的是全库热门，片段太短会把"随便谁都能撞上"的标题也捞进来，
+//     所以要求 6 个字。
+//
+// 片段上限取 minFrag+2：再长就要求 AI 一字不差地引用整句，命中率反而下降。
+func containsAnyFragment(text, title string, minFrag int) bool {
+	tr := []rune(title)
+	if len(tr) < minFrag {
+		return len(tr) > 0 && strings.Contains(text, title)
 	}
-	// 取标题的连续片段做匹配
-	for n := 4; n <= len(title) && n <= 12; n += 2 {
-		for i := 0; i+ n <= len(title); i += n {
-			frag := title[i : i+n]
-			if contains(text, frag) {
+	maxN := minFrag + 2
+	for n := minFrag; n <= len(tr) && n <= maxN; n++ {
+		for i := 0; i+n <= len(tr); i++ {
+			if strings.Contains(text, string(tr[i:i+n])) {
 				return true
 			}
 		}
 	}
 	return false
-}
-
-func contains(s, sub string) bool {
-	return len(sub) > 0 && len(s) >= len(sub) && indexOf(s, sub) >= 0
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
 
 func (h *AIHandler) recordStudy(userID uint64, action, resourceTitle, categoryName string) {
