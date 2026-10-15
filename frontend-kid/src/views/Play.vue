@@ -553,6 +553,8 @@ function fmtClock(sec) {
 // resumeAt > 0 时用它作为续播点（切换画质时用得上：那会儿还没上报，
 // 库里的 lastPosition 可能是十几秒前的旧值）。
 async function load(resumeAt = 0) {
+  // 记住 PDF 地址，等 loading 关掉再渲染（原因见下面的注释）
+  let pdfURL = ''
   loading.value = true
   error.value = ''
   errorRetried = false
@@ -590,7 +592,14 @@ async function load(resumeAt = 0) {
     pendingSeek = resumeAt > 0 ? resumeAt : Number(data?.lastPosition) || 0
 
     if (isPDF.value) {
-      await openPDF(data.url)
+      // 这里**只记地址**，真正渲染放到 finally 之后。
+      //
+      // 原因：canvas 在 v-else-if="isPDF" 分支里，而它上面还有一个
+      // v-if="loading" 挡着。此刻 loading 仍是 true，整个媒体区都没挂载，
+      // 去取 pdfCanvas 只会拿到 null —— renderPdfPage 随即静默返回，
+      // 既不报错也不进错误态，表现就是"页码出来了、画布一片空白"。
+      // （这个 bug 只有真去读 canvas 像素才抓得到：接口、DOM 都存在。）
+      pdfURL = data.url
     }
     if (isImage.value) {
       // 图片无需额外处理
@@ -604,6 +613,8 @@ async function load(resumeAt = 0) {
   } finally {
     loading.value = false
   }
+  // loading 关掉之后媒体区才挂载，PDF 的 canvas 这时候才存在
+  if (pdfURL) await openPDF(pdfURL)
 }
 
 /* ---------- 转码轮询 ---------- */
@@ -775,7 +786,14 @@ async function openPDF(url) {
 }
 
 async function renderPdfPage(n) {
-  const canvas = pdfCanvas.value
+  // canvas 可能还没挂载（媒体区受 v-if="loading" 控制，时序上也许差一帧）。
+  // 等一小会儿再取，取不到就当这页没画 —— 上面的调用方已经保证过时机，
+  // 这里是兜底，避免以后有人在别处调用时又踩同一个坑。
+  let canvas = pdfCanvas.value
+  for (let i = 0; i < 20 && !canvas; i++) {
+    await new Promise((r) => setTimeout(r, 50))
+    canvas = pdfCanvas.value
+  }
   if (!pdfDoc || !canvas) return
   // 同一张 canvas 上并发 render 会直接抛错，上一个任务必须先取消
   if (pdfRenderTask) {
