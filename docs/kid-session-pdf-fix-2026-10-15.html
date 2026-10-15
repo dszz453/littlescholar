@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>孩子端「免登录」修复 + PDF/CMap 收尾 · 验收说明</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--line:#e5e7eb;--text:#1f2328;--muted:#6b7280;
+    --brand:#2563eb;--brand-soft:#eff6ff;--ok:#15803d;--ok-soft:#f0fdf4;
+    --bad:#b91c1c;--bad-soft:#fef2f2;--warn:#b45309;--warn-soft:#fffbeb;--chip:#f3f4f6}
+  *{box-sizing:border-box}
+  body{margin:0;padding:28px 20px 56px;background:var(--bg);color:var(--text);
+    font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 6px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+  .sub code{background:var(--chip);padding:1px 6px;border-radius:5px;font-size:12px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:26px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .card .k{font-size:12px;color:var(--muted)}
+  .card .v{font-size:15.5px;font-weight:650;margin-top:5px;line-height:1.35}
+  .card .n{font-size:11.5px;color:var(--muted);margin-top:3px}
+  .card.ok{background:var(--ok-soft);border-color:#bbf7d0}.card.ok .v{color:var(--ok)}
+  h2{font-size:15px;margin:30px 0 12px;padding-left:10px;border-left:3px solid var(--brand)}
+  h3{font-size:13.5px;margin:18px 0 8px;color:var(--muted);font-weight:600}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:6px 18px 16px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-weight:600;color:var(--muted);font-size:12px;background:#fafbfc}
+  tr:last-child td{border-bottom:none}
+  td.c,th.c{text-align:center;white-space:nowrap}
+  .bad{color:var(--bad);font-weight:600}.good{color:var(--ok);font-weight:600}
+  code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:12.5px}
+  pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:14px 16px;overflow:auto;font-size:12.5px;line-height:1.55}
+  ul,ol{margin:6px 0 0;padding-left:22px}li{margin:5px 0}
+  .note{background:var(--warn-soft);border:1px solid #fde68a;border-radius:10px;padding:12px 16px;font-size:13px}
+  .note b{color:var(--warn)}
+  .flow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0 4px}
+  .step{background:var(--brand-soft);border:1px solid #bfdbfe;color:#1e40af;border-radius:8px;padding:7px 11px;font-size:12.5px;font-weight:600}
+  .arrow{color:var(--muted);font-size:15px}
+  footer{margin-top:34px;color:var(--muted);font-size:12px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>孩子端「每次打开都要重新输账号密码」修复 · 验收说明</h1>
+  <div class="sub">
+    2026-10-15 · 提交 <code>64675dc</code> · 三个入口均已上线并通过真实浏览器验收（新机 <code>:8093</code> / <code>https://study.19860819.xyz:8616</code>，旧机 <code>:8091</code>）
+  </div>
+
+  <div class="cards">
+    <div class="card ok"><div class="k">登录态</div><div class="v">8 / 8 通过</div><div class="n">三个入口各跑一遍</div></div>
+    <div class="card ok"><div class="k">PDF 渲染</div><div class="v">6 / 6 通过</div><div class="n">英文 735 + 中文 1613</div></div>
+    <div class="card ok"><div class="k">映射数据</div><div class="v">293 条 · 无丢失</div><div class="n">基线快照 292</div></div>
+    <div class="card ok"><div class="k">临时账号</div><div class="v">已清零</div><div class="n">两台机器 remaining=0</div></div>
+  </div>
+
+  <h2>一、根因：两条独立问题叠加，只修一条都不够</h2>
+
+  <div class="panel">
+    <h3>① refreshToken 存了，但从来没被用过</h3>
+    <p style="margin:4px 0 0">
+      access token 有效期只有 <b>2 小时</b>（<code>config.yaml</code> → <code>jwt.access_expire_hours</code>）。
+      过期后旧代码的处理是<b>直接清 token 跳登录页</b> —— 于是"孩子隔天打开 App 必然要重输"成了常态。
+      而登录时明明已经把 <b>7 天</b>有效期的 refreshToken 写进了 <code>localStorage</code>，却一次都没被调用。
+    </p>
+    <table style="margin-top:12px">
+      <tr><th style="width:130px">环节</th><th>修复前</th><th>修复后</th></tr>
+      <tr><td>后端 <code>/api/auth/refresh</code></td><td class="good">有 ✓</td><td class="good">有 ✓</td></tr>
+      <tr><td>登录返回 <code>refreshToken</code></td><td class="good">有 ✓</td><td class="good">有 ✓</td></tr>
+      <tr><td>前端存 <code>kid_refresh_token</code></td><td class="good">存了 ✓</td><td class="good">存了 ✓</td></tr>
+      <tr><td>前端<b>用</b>它续期</td><td class="bad">从来没用过 ✗</td><td class="good">401 自动续期并重放请求 ✓</td></tr>
+    </table>
+    <div class="flow" style="margin-top:14px">
+      <span class="step">请求带过期 token</span><span class="arrow">→</span>
+      <span class="step">收到 401</span><span class="arrow">→</span>
+      <span class="step">refreshToken 换新令牌</span><span class="arrow">→</span>
+      <span class="step">原请求自动重放</span><span class="arrow">→</span>
+      <span class="step">孩子无感，留在原页面</span>
+    </div>
+    <ul>
+      <li>续期走<b>裸 axios</b> —— 走 http 实例的话 refresh 自身返回 401 又会触发拦截器，变成自己咬自己。</li>
+      <li><code>refreshing</code> 变量对并发 401 去重；<code>cfg.__retried</code> 防止无限套娃。</li>
+      <li><b>两条 401 路都兜住</b>：后端鉴权失败走 <code>HTTP 200 + body.code=401</code>（<code>util.Fail</code>），但网关也可能直接回 <code>HTTP 401</code>。</li>
+      <li>只有 refreshToken 本身（7 天）也失效、或账号被停用，才真的回登录页。</li>
+    </ul>
+  </div>
+
+  <h2>二、根因②：Service Worker 把 <code>index.html</code> 锁死在预缓存里</h2>
+
+  <div class="panel">
+    <p style="margin:4px 0 0">
+      原来 <code>navigateFallback</code> 指向 <code>index.html</code>、而它本身在预缓存清单中 →
+      <b>所有页面导航都离线优先从缓存喂</b>。孩子端装成 APK 后常年不关，正好卡死在这个模式：
+      服务端发了新版，App 里也永远跑旧的那份 JS，<b>只有手动清应用数据才能破</b>。
+    </p>
+    <p style="margin:10px 0 0;padding:10px 12px;background:var(--bad-soft);border:1px solid #fecaca;border-radius:8px;font-size:13px">
+      <b class="bad">这也是「修了却看不到效果」的元凶</b> —— 后端和前端代码都对，但新 JS 下不到孩子手上。
+    </p>
+    <table style="margin-top:12px">
+      <tr><th style="width:150px">配置</th><th>原来</th><th>现在</th></tr>
+      <tr><td><code>globIgnores</code></td><td class="bad">无（index.html 进预缓存）</td><td class="good"><code>['index.html']</code></td></tr>
+      <tr><td><code>navigateFallback</code></td><td class="bad"><code>'/index.html'</code></td><td class="good"><code>null</code></td></tr>
+      <tr><td>导航策略</td><td class="bad">预缓存优先（离线优先）</td><td class="good"><code>NetworkFirst</code>（cacheName <code>kid-pages</code>，6s 超时回退）</td></tr>
+    </table>
+    <h3>构建产物断言（线上 sw.js 实测）</h3>
+    <pre>grep -c 'url:"index.html"' sw.js   → 0    ← 已移出预缓存
+grep -c 'kid-pages'        sw.js   → 1    ← 导航网络优先规则已生成
+grep -c 'NetworkFirst'     sw.js   → 1</pre>
+  </div>
+
+  <h2>三、顺带收进上一轮 PDF 遗留（未提交的两处改动）</h2>
+  <div class="panel">
+    <ul>
+      <li><code>Play.vue</code>：pdf.js 补 <code>cMapUrl</code> / <code>cMapPacked</code> / <code>standardFontDataUrl</code> ——
+        <b>中文绘本缺 <code>.bcmap</code> 会「图在、字没了」</b>（中文走 CID 编码），纯英文绘本看不出来，极易漏。</li>
+      <li>错误态展示原始报错 + 「重新加载」按钮（清 SW + Cache Storage 再 reload）当自救入口。</li>
+      <li><code>vite.config.js</code>：<code>pdfjsStaticAssets()</code> 在 <code>buildStart</code> 从 <code>pdfjs-dist</code> 现拷
+        <b>169 个 <code>.bcmap</code> + 16 个标准字体</b> 进 <code>public/</code>（1.5MB 不进版本库）。</li>
+    </ul>
+  </div>
+
+  <h2>四、验收：真实浏览器（CDP），不是「看代码」</h2>
+
+  <h3>登录态 —— 三个入口各 8/8</h3>
+  <div class="panel">
+    <p style="margin:4px 0 8px">
+      探针的做法是关键：<b>真的登录一次拿真 refreshToken</b>，再把 <code>kid_token</code> 换成
+      「结构合法但已过期」的 JWT（前端不验签，只负责发出去）—— 这正是孩子隔天打开 App 时
+      <code>localStorage</code> 里的真实状态。然后刷新页面，看它是不是自己活过来。
+    </p>
+    <table>
+      <tr><th style="width:290px">断言</th><th class="c" style="width:70px">8093</th><th class="c" style="width:70px">8616</th><th class="c" style="width:70px">8091</th><th>说明</th></tr>
+      <tr><td>SW 已移除 index.html 预缓存</td><td class="c good">PASS</td><td class="c good">PASS</td><td class="c good">PASS</td><td>—</td></tr>
+      <tr><td>SW 导航走 NetworkFirst</td><td class="c good">PASS</td><td class="c good">PASS</td><td class="c good">PASS</td><td>—</td></tr>
+      <tr><td>真实登录成功并写入令牌</td><td class="c good">PASS</td><td class="c good">PASS</td><td class="c good">PASS</td><td>走真接口，不是塞假 token</td></tr>
+      <tr><td>localStorage 有 kid_refresh_token</td><td class="c good">PASS</td><td class="c good">PASS</td><td class="c good">PASS</td><td>—</td></tr>
+      <tr><td>没有被弹回登录页</td><td class="c good">PASS</td><td class="c good">PASS</td><td class="c good">PASS</td><td>路径停在 <code>/</code></td></tr>
+      <tr><td>access token 已被续期替换</td><td class="c good">PASS</td><td class="c good">PASS</td><td class="c good">PASS</td><td>与过期的那个不同</td></tr>
+      <tr><td>refreshToken 仍在（可继续 7 天）</td><td class="c good">PASS</td><td class="c good">PASS</td><td class="c good">PASS</td><td>—</td></tr>
+      <tr><td>确实发出了 <code>/api/auth/refresh</code></td><td class="c good">PASS</td><td class="c good">PASS</td><td class="c good">PASS</td><td>从 CDP Network 事件取证</td></tr>
+    </table>
+    <p style="margin:10px 0 0;font-size:12.5px;color:var(--muted)">
+      只断言「没跳登录页」是不够的 —— 续期失败时首页可能空壳但不跳转，看起来像成功。所以必须同时断言令牌真的换了。
+    </p>
+  </div>
+
+  <h3>PDF —— 英文 735 与中文 1613「丑小鸭」各 6/6</h3>
+  <div class="panel">
+    <table>
+      <tr><th style="width:290px">断言</th><th class="c" style="width:110px">735 英文</th><th class="c" style="width:110px">1613 中文</th><th>实测值</th></tr>
+      <tr><td>打开了播放页（没被弹走）</td><td class="c good">PASS</td><td class="c good">PASS</td><td>/play/735、/play/1613</td></tr>
+      <tr><td>canvas 已挂载</td><td class="c good">PASS</td><td class="c good">PASS</td><td>—</td></tr>
+      <tr><td>不是默认尺寸 300×150</td><td class="c good">PASS</td><td class="c good">PASS</td><td><b>461×596</b> / <b>461×325</b></td></tr>
+      <tr><td>画布上有实际内容</td><td class="c good">PASS</td><td class="c good">PASS</td><td>不透明非白像素 &gt; 0</td></tr>
+      <tr><td>没有 PDF 错误提示</td><td class="c good">PASS</td><td class="c good">PASS</td><td>—</td></tr>
+      <tr><td>页码栏正常</td><td class="c good">PASS</td><td class="c good">PASS</td><td>1 / 43、1 / 9</td></tr>
+    </table>
+    <h3>静态资源可达性</h3>
+    <pre>/cmaps/UniGB-UCS2-H.bcmap          → 200   43,366 B   ← 中文 CMap
+/standard_fonts/FoxitSerif.pfb      → 200   19,469 B
+/standard_fonts/LiberationSans-Regular.ttf → 200  139,512 B</pre>
+    <div class="note" style="margin-top:12px">
+      <b>注意</b>：<code>standard_fonts</code> 里<b>没有</b> <code>FoxitSans.pfb</code> —— 实际文件名是
+      <code>FoxitFixed / FoxitSerif / FoxitSymbol / FoxitDingbats</code>、<code>LiberationSans-*.ttf</code>。
+      拿错名字请求会得到 <code>1432</code> 字节（index.html 的大小，被 SPA fallback 兜了），很容易误判成"文件没部署"。
+    </div>
+  </div>
+
+  <h2>五、数据完整性 & 环境清理</h2>
+  <div class="panel">
+    <table>
+      <tr><th style="width:250px">项目</th><th>结果</th></tr>
+      <tr><td>资源映射条数（新机）</td><td><b>293</b> 条，无丢失（基线快照 292）</td></tr>
+      <tr><td>临时验收账号</td><td>两台机器均已删除，断言 <code>remaining = 0</code></td></tr>
+      <tr><td>「接着上次看」</td><td>线上 chunk 实测 <b>0</b> 处（已移除）</td></tr>
+      <tr><td>播放器「上一首 / 下一首」</td><td>线上 chunk 实测存在</td></tr>
+    </table>
+  </div>
+
+  <h2>六、⚠️ 需要你在平板上做一次操作</h2>
+  <div class="note">
+    <b>必须在平板上手动清一次应用数据</b>，否则这次修复看不到效果 ——
+    因为当前 App 里跑的还是<b>被旧 SW 缓存的旧 JS</b>，而这次修的正是"新代码下不去"这个鸡生蛋问题。<br><br>
+    路径：<b>设置 → 应用 → 小书童 → 存储 → 清除数据</b>（或长按图标 → 应用信息 → 存储 → 清除数据）<br>
+    之后重新打开，登录一次即可 —— 之后 7 天内都不会再要求输账号密码。<br><br>
+    以后再遇到"更新了但客户端还是老样子"，播放页错误态里有<b>「重新加载」</b>按钮（清 SW + Cache 再刷新），点一下就能自救。
+  </div>
+
+  <footer>小书童 · 孩子学习系统 &nbsp;|&nbsp; 2026-10-15 &nbsp;|&nbsp; 提交 64675dc</footer>
+</div>
+</body>
+</html>

@@ -3,20 +3,33 @@ package xyz.littlescholar.kid
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.ActivityManager
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.net.Uri
+import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.ConsoleMessage
 import android.webkit.PermissionRequest
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.ScrollView
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -50,6 +63,12 @@ class MainActivity : AppCompatActivity() {
 
     /** 设置页；为 null 表示未显示。 */
     private var setupView: ServerSetupView? = null
+
+    /**
+     * 本次启动是否要做「PWA 缓存自愈」（注销旧 SW + 清 CacheStorage）。
+     * 只在 **APK 版本号变化** 时置位，见 [healWebCacheIfUpgraded]。
+     */
+    private var pendingHeal = false
 
     /**
      * 扫码结果只**回填**到设置页的输入框，不自动连接。
@@ -103,6 +122,10 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
 
         setupWebView(root)
+
+        // 诊断：先采环境（含 WebView 内核版本），后面所有报错都会挂到它上面
+        Diagnostics.start(this)
+        healWebCacheIfUpgraded()
 
         // 让"最近任务（任务中心）"里的卡片显示「小书童」+ 应用图标 + 品牌色，
         // 而不是把网页标题或一片白当成卡片预览。不带这行的表现是：卡片上
@@ -174,7 +197,8 @@ class MainActivity : AppCompatActivity() {
                 hideSetup()
                 loadSite()
             },
-            onScan = { requestScan() }
+            onScan = { requestScan() },
+            onDiagnostics = { showDiagnostics() }
         )
         view.showError(msg)
         setupView = view
@@ -213,6 +237,87 @@ class MainActivity : AppCompatActivity() {
         root.removeView(v)
         setupView = null
     }
+
+    // ==================== 诊断 ====================
+
+    /**
+     * APK 升级后的「PWA 缓存自愈」。
+     *
+     * 为什么必须有：孩子端装成 App 后常年不关，PWA 的 Service Worker 一旦把
+     * 首页缓存住，服务端发了新版客户端也永远跑旧 JS —— 只有手动清应用数据
+     * 能破（"鸡生蛋"）。这个坑已经真实发生过一次，不能每次都靠人工记着清。
+     *
+     * 触发条件刻意限定为 **versionCode 变化**（不是每次启动都清，那样太浪费）：
+     * 只要重新装过 APK，就顺手把上一次的 SW 和 CacheStorage 抹掉。
+     *
+     * **不动 localStorage** —— 登录令牌在里面，清了孩子要重新登录，
+     * 而"免登录"正是上一轮刚修好的东西。清 SW/Cache 不影响登录态。
+     */
+    private fun healWebCacheIfUpgraded() {
+        val sp = getSharedPreferences("kid_update", Context.MODE_PRIVATE)
+        val seen = sp.getInt("seen_version", 0)
+        if (seen == BuildConfig.VERSION_CODE) return
+        sp.edit().putInt("seen_version", BuildConfig.VERSION_CODE).apply()
+
+        // seen == 0 说明是全新安装，本来就没有旧缓存要清
+        if (seen == 0) {
+            Diagnostics.add("自愈", "全新安装（v${BuildConfig.VERSION_CODE}），无需清理")
+            return
+        }
+
+        pendingHeal = true
+        webView.clearCache(true)
+        Diagnostics.add(
+            "自愈",
+            "检测到升级 v$seen → v${BuildConfig.VERSION_CODE}，首屏加载后将注销 SW 并清空 CacheStorage"
+        )
+    }
+
+    /** 打开诊断面板：先让网页自报家门（跑的是哪份 JS），再展示。 */
+    private fun showDiagnostics() {
+        Diagnostics.add("诊断", "家长打开了诊断面板")
+        if (webView.url != null) {
+            webView.evaluateJavascript(Diagnostics.SNAPSHOT_JS) { r ->
+                Diagnostics.add("快照", r ?: "(null)")
+                presentDiagnosticsDialog()
+            }
+        } else {
+            presentDiagnosticsDialog()
+        }
+    }
+
+    private fun presentDiagnosticsDialog() {
+        val body = TextView(this).apply {
+            typeface = Typeface.MONOSPACE
+            textSize = 10.5f
+            setTextIsSelectable(true)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            text = Diagnostics.dump(this@MainActivity)
+        }
+        val scroller = ScrollView(this).apply {
+            addView(body, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("诊断信息")
+            .setView(scroller)
+            .setPositiveButton("复制全部") { _, _ -> copyDiagnostics() }
+            .setNeutralButton("清空") { _, _ ->
+                Diagnostics.clear()
+                presentDiagnosticsDialog()
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    private fun copyDiagnostics() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(
+            ClipData.newPlainText("小书童诊断", Diagnostics.dump(this))
+        )
+        Toast.makeText(this, "已复制，粘贴发出来即可", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     private fun setupWebView(root: FrameLayout) {
         val s = webView.settings
@@ -267,6 +372,23 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 swipe.isRefreshing = false
+                Diagnostics.add("页面", "加载完成 $url")
+
+                // 出问题时第一个要回答的问题永远是「客户端到底跑的是哪份 JS」。
+                // 让网页自报家门并存进诊断，省得每次都靠猜。
+                view.evaluateJavascript(Diagnostics.SNAPSHOT_JS) { r ->
+                    Diagnostics.add("快照", r ?: "(null)")
+                }
+
+                // 版本升级后的自愈：注销旧 SW + 清 CacheStorage，然后重新加载。
+                // 必须放在这里 —— 这两个 API 需要页面上下文，且只能在此刻安全调用。
+                if (pendingHeal) {
+                    pendingHeal = false
+                    view.evaluateJavascript(Diagnostics.HEAL_JS) { r ->
+                        Diagnostics.add("自愈", "旧 SW / CacheStorage 已清理 $r")
+                    }
+                    view.postDelayed({ runCatching { view.reload() } }, 1500)
+                }
             }
 
             /**
@@ -276,20 +398,133 @@ class MainActivity : AppCompatActivity() {
              * "填错了能自己走回来"是这个页面的核心价值。
              * 只对**主文档**且**当前配置地址下的**失败生效，
              * 免得页面内某个子资源失败（比如某张封面图）也弹设置页。
+             *
+             * 但**记录**是对所有请求都做的：子资源失败同样有价值
+             * （封面图挂了、pdf.js 的 cmaps 取不到、直链 403 都在这里现形）。
              */
             override fun onReceivedError(
                 view: WebView,
                 request: WebResourceRequest,
-                error: android.webkit.WebResourceError
+                error: WebResourceError
             ) {
+                val code =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) error.errorCode else -1
+                val desc =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        error.description?.toString().orEmpty()
+                    } else {
+                        ""
+                    }
+                Diagnostics.add(
+                    if (request.isForMainFrame) "主文档失败" else "子资源失败",
+                    "${request.url} code=$code $desc"
+                )
+
                 if (!request.isForMainFrame) return
                 val failed = request.url.toString()
                 if (siteUrl.isEmpty() || !failed.startsWith(siteUrl)) return
                 showSetup("连不上 $siteUrl\n请检查：设备是否和服务器在同一网络、地址和端口是否写对、服务是否在运行。")
             }
+
+            /**
+             * HTTP 4xx/5xx。
+             *
+             * 这类失败**不会**走 onReceivedError（HTTP 层是通的，只是状态码不对），
+             * 所以必须单独记 —— 鉴权 401、静态资源 404、直链 403 全靠它。
+             */
+            override fun onReceivedHttpError(
+                view: WebView,
+                request: WebResourceRequest,
+                errorResponse: WebResourceResponse
+            ) {
+                Diagnostics.add(
+                    "HTTP错误",
+                    "${errorResponse.statusCode} ${errorResponse.reasonPhrase} ${request.url}"
+                )
+            }
+
+            /**
+             * SSL 证书校验失败。
+             *
+             * **不覆写这个方法时，WebView 的默认行为是静默取消请求** ——
+             * 家长和孩子只会看到一片白屏，一个字的提示都没有，极难排查。
+             * 这里是个人家庭应用、服务器也是自建的（证书可能是自签或链不全），
+             * 所以如实把错误摆出来，由家长显式决定要不要继续。
+             */
+            override fun onReceivedSslError(
+                view: WebView,
+                handler: SslErrorHandler,
+                error: SslError
+            ) {
+                Diagnostics.add("SSL错误", "primaryError=${error.primaryError} ${error.url}")
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("服务器证书有问题")
+                    .setMessage(
+                        "证书校验没通过（错误码 ${error.primaryError}）。\n\n" +
+                            "如果是你自己的服务器，可以点「继续访问」；\n" +
+                            "否则请点「取消」。"
+                    )
+                    .setCancelable(false)
+                    .setPositiveButton("继续访问") { _, _ -> handler.proceed() }
+                    .setNegativeButton("取消") { _, _ -> handler.cancel() }
+                    .show()
+            }
+
+            /**
+             * 渲染进程被系统回收。
+             *
+             * Android 8.0 起，WebView 的渲染器跑在独立沙箱进程里，内存紧张的平板上
+             * 被系统杀掉是常态。**不覆写这个方法，App 会跟着一起崩** ——
+             * 孩子的体感就是"看着看着突然退出了"，而日志里什么都没有。
+             *
+             * 返回 true 表示"我处理了"：销毁旧 WebView、换一个新的重新加载。
+             */
+            override fun onRenderProcessGone(
+                view: WebView,
+                detail: RenderProcessGoneDetail
+            ): Boolean {
+                val crashed =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) detail.didCrash() else true
+                Diagnostics.add("渲染进程", "被系统回收 didCrash=$crashed，重建 WebView")
+                Toast.makeText(this@MainActivity, "页面已重新加载", Toast.LENGTH_SHORT).show()
+
+                swipe.removeView(view)
+                runCatching { view.destroy() }
+                webView = WebView(this@MainActivity)
+                swipe.addView(
+                    webView,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                MediaBridge.attach(webView)
+                setupWebView(root)
+                loadSite()
+                return true
+            }
         }
 
         webView.webChromeClient = object : WebChromeClient() {
+            /**
+             * 页面 console 的 error/warn 全部收进诊断。
+             *
+             * 这是"看到网页真实报错"的**唯一**入口 —— 未捕获的 JS 异常在 WebView
+             * 里也会走这里（level = ERROR），页面自己 catch 住的则不会
+             * （所以 Play.vue 的错误态里也在同时把原始报错显示到界面上）。
+             * 只收 ERROR/WARNING：log/info/tip 都是噪音，会把环形缓冲冲掉。
+             */
+            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
+                val level = msg.messageLevel()
+                if (level == ConsoleMessage.MessageLevel.ERROR ||
+                    level == ConsoleMessage.MessageLevel.WARNING
+                ) {
+                    Diagnostics.add(
+                        "console/$level",
+                        "${msg.message()}  @${msg.sourceId()}:${msg.lineNumber()}"
+                    )
+                }
+                return false // 仍按默认行为输出到 logcat
+            }
+
             // 视频全屏：把自定义 View 挂到 root 上
             private var fullScreenView: View? = null
             private var customViewCallback: CustomViewCallback? = null

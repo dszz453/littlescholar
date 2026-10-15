@@ -14,11 +14,16 @@ import android.widget.TextView
 /**
  * 「填写服务器地址」设置页。
  *
- * 出现的时机有三个：
+ * 出现的时机有四个：
  *  1. 首次打开（还没存过地址）；
  *  2. 长按屏幕（家长要换地址）；
  *  3. **页面加载失败**（地址填错 / 服务器没开 / 不在同一网络）——
  *     这条最重要：没有它，孩子只会看到一片白屏，家长也不知道该改什么。
+ *  4. 从诊断面板回来（点「关闭」后不额外做处理，页面仍在栈上）。
+ *
+ * 也是**诊断信息的入口**：连不上、白屏、某个功能打不开时，家长点
+ * 「查看诊断信息」即可拿到 WebView 内核版本 + 全部报错，复制发出来。
+ * 这个入口是必需的 —— 之前几轮排查都卡在"拿不到任何报错文本"。
  *
  * 故意做得很朴素：这是个"家长用一次就再也不看"的页面，
  * 不需要为它引入布局 XML 或 Material 依赖，代码里搭出来就好。
@@ -26,7 +31,8 @@ import android.widget.TextView
 class ServerSetupView(
     context: Context,
     private val onSave: (String) -> Unit,
-    private val onScan: () -> Unit
+    private val onScan: () -> Unit,
+    private val onDiagnostics: () -> Unit
 ) : LinearLayout(context) {
 
     private val input = EditText(context)
@@ -112,6 +118,18 @@ class ServerSetupView(
             }
         }
         addView(reset)
+
+        // 诊断入口放在设置页里，而不是"长按后连点七下"之类的隐藏手势 ——
+        // 家长遇到问题时要能自己找到它。文案直说连不上时该点这里。
+        val diag = TextView(context).apply {
+            text = "查看诊断信息（连不上 / 白屏 / 某个功能打不开时点这里）"
+            textSize = 13f
+            setTextColor(Color.parseColor("#2563EB"))
+            gravity = Gravity.CENTER
+            setPadding(pad(8), pad(4), pad(8), pad(10))
+            setOnClickListener { onDiagnostics() }
+        }
+        addView(diag)
 
         errorBox.apply {
             textSize = 13.5f
