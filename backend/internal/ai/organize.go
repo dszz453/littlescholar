@@ -13,6 +13,16 @@ type OrganizeCatRef struct {
 	Direct   int    // 直属资源数
 }
 
+// OrganizeRemoteRef 提示词里用到的"远端子目录"。
+//
+// 给 AI 这份清单是「资源自动匹配」成立的前提：不给的话它只知道一个目录 id，
+// 对里面有什么一无所知，只能瞎编 remoteDirId，随后被校验全部拒掉 ——
+// 表现就是"AI 从来不给映射建议"。
+type OrganizeRemoteRef struct {
+	ID   string
+	Name string
+}
+
 // OrganizeResRef 提示词里用到的"现有资源"。
 type OrganizeResRef struct {
 	ID       uint64
@@ -37,6 +47,9 @@ type OrganizeData struct {
 	CanCreateMapping bool
 	AccountID        uint64
 	RemoteDirPrefix  string
+	// RemoteDirs 选中远端目录下的直接子目录。为空表示没能取到
+	// （账号失效 / 超时 / 用户只填了前缀），此时不让 AI 提 createMapping。
+	RemoteDirs []OrganizeRemoteRef
 
 	// Instruction 用户额外补充的要求（可空）
 	Instruction string
@@ -77,6 +90,9 @@ const OrganizeMaxResources = 300
 
 // OrganizeMaxCategories 单次送进提示词的目录上限
 const OrganizeMaxCategories = 120
+
+// OrganizeMaxRemoteDirs 单次送进提示词的远端子目录上限
+const OrganizeMaxRemoteDirs = 60
 
 // BuildOrganizePrompt 构造整理助手的提示词。
 //
@@ -152,11 +168,27 @@ func BuildOrganizePrompt(d OrganizeData) []Message {
 		fmt.Fprintf(&sb, "%d | %s | %d\n", r.ID, r.Title, r.CategoryID)
 	}
 
-	if d.CanCreateMapping {
-		fmt.Fprintf(&sb, "\n【新建映射的前提】接入源账号 ID = %d，远端目录前缀 = %q\n", d.AccountID, d.RemoteDirPrefix)
-		sb.WriteString("只有在你确信能对上真实远端路径时才提出 createMapping，字段：\n" +
-			"  remoteDirId（远端完整路径，必须以前缀开头）、remoteDirName（展示名）、\n" +
-			"  target（这条映射登记到哪个系统目录，写法同上面的引用语法）\n")
+	if d.CanCreateMapping && len(d.RemoteDirs) > 0 {
+		fmt.Fprintf(&sb, "\n【远端存储】接入源账号 ID = %d，选中的远端目录 = %q\n", d.AccountID, d.RemoteDirPrefix)
+		fmt.Fprintf(&sb, "它下面有这些子目录（remoteDirId | 名称），共 %d 个：\n", len(d.RemoteDirs))
+		for i, r := range d.RemoteDirs {
+			if i >= OrganizeMaxRemoteDirs {
+				fmt.Fprintf(&sb, "…（其余 %d 个省略）\n", len(d.RemoteDirs)-i)
+				break
+			}
+			fmt.Fprintf(&sb, "%s | %s\n", r.ID, r.Name)
+		}
+		sb.WriteString("提出 createMapping 时：\n" +
+			"  remoteDirId 只能从上面这份清单里**原样抄**，一个字都不能改，也不许自己拼；\n" +
+			"  remoteDirName 用清单里的名称；\n" +
+			"  target 写这条映射要登记到哪个系统目录（写法同上面的引用语法）。\n" +
+			"如果某个远端子目录在系统里没有对应位置，就先 createCategory 建一个、再映射过去 ——\n" +
+			"这正是「把网盘内容自动归到合适目录」的做法，鼓励这么做。\n")
+	} else if d.CanCreateMapping {
+		fmt.Fprintf(&sb, "\n【远端存储】接入源账号 ID = %d，远端目录 = %q\n", d.AccountID, d.RemoteDirPrefix)
+		sb.WriteString("**没有取到远端目录清单**（账号可能失效、超时，或只填了前缀）。\n" +
+			"这种情况下不要编造 remoteDirId，也不要提 createMapping；\n" +
+			"只在 summary / reason 里说明你无法确认远端内容即可。\n")
 	} else {
 		sb.WriteString("\n【注意】本次不提供接入源信息，请不要提出 createMapping 步骤。\n")
 	}

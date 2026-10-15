@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/littlescholar/core/internal/ai"
+		"github.com/littlescholar/core/internal/ai"
 	"github.com/littlescholar/core/internal/model"
 	"github.com/littlescholar/core/internal/service"
 	"github.com/littlescholar/core/internal/util"
@@ -70,6 +70,9 @@ type OrganizeHandler struct {
 	perm   *service.PermissionService
 	ai     *AIHandler
 	logger *zap.Logger
+	// 用来解开存储账号的凭据，好把选中远端目录的子目录列出来喂给 AI。
+	// 为 nil 时跳过这一步（单测场景），整理流程照常可用。
+	encryptor *util.Encryptor
 }
 
 func NewOrganizeHandler(db *gorm.DB, perm *service.PermissionService, aiH *AIHandler) *OrganizeHandler {
@@ -78,6 +81,12 @@ func NewOrganizeHandler(db *gorm.DB, perm *service.PermissionService, aiH *AIHan
 
 func (h *OrganizeHandler) WithLogger(l *zap.Logger) *OrganizeHandler {
 	h.logger = l
+	return h
+}
+
+// WithEncryptor 注入凭据解密器（链式，不动 NewOrganizeHandler 的签名）。
+func (h *OrganizeHandler) WithEncryptor(e *util.Encryptor) *OrganizeHandler {
+	h.encryptor = e
 	return h
 }
 
@@ -167,6 +176,7 @@ func (h *OrganizeHandler) Plan(c *gin.Context) {
 		CanCreateMapping: oc.accountID > 0,
 		AccountID:        oc.accountID,
 		RemoteDirPrefix:  oc.remotePrefix,
+		RemoteDirs:       oc.remoteDirs,
 		Instruction:      req.Instruction,
 	}), &plan); err != nil {
 		util.ServerError(c, "AI 生成方案失败: "+err.Error())
@@ -461,6 +471,10 @@ type organizeContext struct {
 	accountID  uint64
 	accountName string
 	remotePrefix string
+	// remoteDirs 选中远端目录的直接子目录；remoteDirIDs 是它们的 id 集合，
+	// 用来判断 AI 填的 remoteDirId 是不是我们给过它的那些。
+	remoteDirs  []ai.OrganizeRemoteRef
+	remoteDirIDs map[string]bool
 
 	scopeIDs map[uint64]bool
 	catByID  map[uint64]model.Category
@@ -509,6 +523,42 @@ func (h *OrganizeHandler) buildContext(categoryID, accountID uint64, remotePrefi
 		catByID:      map[uint64]model.Category{},
 		resByID:      map[uint64]model.Resource{},
 		siblingNames: map[uint64]map[string]bool{},
+		remoteDirIDs: map[string]bool{},
+	}
+
+	// 把选中远端目录的**直接子目录**列出来。
+	//
+	// 这是「自动匹配」能不能成立的关键一步：没有这份清单，AI 只知道一个
+	// 目录 id，对里面有什么一无所知，只能瞎编 remoteDirId，然后被校验全部拒掉，
+	// 用户看到的就是"它从来不建议映射"。
+	//
+	// 失败一律**不阻断**整理：退回"没有远端清单"，此时提示词会明确要求
+	// AI 不要提 createMapping —— 宁可少给建议，也不能让它编造路径。
+	if h.encryptor != nil && accountID > 0 {
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			_, cred, a, err := loadSource(h.db, h.encryptor, accountID)
+			if err != nil {
+				h.log().Warn("整理助手：加载接入源失败", zap.Error(err))
+				return
+			}
+			items, err := a.ListDir(ctx, cred, oc.remotePrefix)
+			if err != nil {
+				h.log().Warn("整理助手：列远端目录失败", zap.Error(err))
+				return
+			}
+			for _, it := range items {
+				if !it.IsDir {
+					continue
+				}
+				if len(oc.remoteDirs) >= ai.OrganizeMaxRemoteDirs {
+					break
+				}
+				oc.remoteDirs = append(oc.remoteDirs, ai.OrganizeRemoteRef{ID: it.ID, Name: it.Name})
+				oc.remoteDirIDs[it.ID] = true
+			}
+		}()
 	}
 
 	// 目录：范围内全部 + 面包屑所需的祖先
@@ -756,8 +806,8 @@ func (h *OrganizeHandler) validateSteps(steps []OrganizeStep, oc *organizeContex
 				h.invalidate(s, "缺少远端目录路径")
 				continue
 			}
-			if oc.remotePrefix != "" && !strings.HasPrefix(s.RemoteDirID, oc.remotePrefix) {
-				h.invalidate(s, fmt.Sprintf("远端路径必须以 %s 开头", oc.remotePrefix))
+			if !oc.remoteDirAllowed(s.RemoteDirID) {
+				h.invalidate(s, "这个远端目录不在给出的清单里")
 				continue
 			}
 			_, label, err := h.checkTarget(s.Target, declaredRefs, oc)
@@ -782,6 +832,31 @@ func (h *OrganizeHandler) validateSteps(steps []OrganizeStep, oc *organizeContex
 		}
 	}
 	return steps
+}
+
+// remoteDirAllowed 判断 AI 填的远端目录可不可信。
+//
+// 老写法是「必须以 remotePrefix 开头」，因为那时用户在界面上手填一个路径前缀。
+// 现在用户是在目录树里选一个具体目录，传下来的是它的 id —— 夸克是 fs_id、
+// 本地硬盘/WebDAV 是路径。fs_id 是随机数字，**父子之间没有前缀关系**，
+// 对这类源拿前缀判断等于把 AI 的建议全拒掉。
+//
+// 所以改成三条并列：
+//  1. 命中我们提供给 AI 的清单 → 放行（这是主路径）；
+//  2. 等于 selected 目录本身 → 放行（用户直接选了这一层）；
+//  3. 以它为前缀 → 放行（路径型 id 能靠前缀判断后代，覆盖本地/WebDAV 的深层目录）。
+// 既没有清单也没有前缀时不做限制，保持旧行为。
+func (oc *organizeContext) remoteDirAllowed(id string) bool {
+	if id == "" {
+		return false
+	}
+	if oc.remoteDirIDs[id] {
+		return true
+	}
+	if oc.remotePrefix == "" {
+		return len(oc.remoteDirIDs) == 0
+	}
+	return id == oc.remotePrefix || strings.HasPrefix(id, oc.remotePrefix)
 }
 
 func (h *OrganizeHandler) invalidate(s *OrganizeStep, reason string) {

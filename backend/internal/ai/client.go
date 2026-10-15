@@ -213,23 +213,52 @@ func BuildStudyAnalysisPrompt(childName, grade string, stats interface{}, resour
 	}
 }
 
-// BuildTutorPrompt 构造智能体辅导提示词
-func BuildTutorPrompt(grade string, availableResources []string) []Message {
-	systemPrompt := fmt.Sprintf(`你是「小书童」，一位亲切耐心的儿童学习助手，陪伴 %s 的孩子学习。
+// TutorResourceHint 一条候选资源（标题 + 它所在的目录名）。
+type TutorResourceHint struct {
+	Title    string
+	Category string
+}
 
-你的职责：
-1. 根据孩子的年级，推荐合适的学习内容和学习方法
-2. 回答孩子和家长关于学习的问题
-3. 结合本系统已有的资源给出具体推荐
+// BuildTutorPrompt 构造「小书童」的系统提示词。
+//
+// availableResources 是目录概况（带缩进与资源数），hits 是本次提问检索出来的
+// 具体资源。以前只给一张目录名清单，结果 AI 永远只能泛泛而谈 —— 它没法推荐
+// 自己都不知道存在的东西。
+func BuildTutorPrompt(grade string, availableResources []string, hits []TutorResourceHint) []Message {
+	var hitBlock string
+	if len(hits) == 0 {
+		hitBlock = "（这次没有从资源库里检索到直接相关的内容。别硬凑：可以推荐下面的目录方向，或者干脆聊学习方法。）"
+	} else {
+		var b strings.Builder
+		for i, hit := range hits {
+			fmt.Fprintf(&b, "%d. %s", i+1, hit.Title)
+			if hit.Category != "" {
+				fmt.Fprintf(&b, "（%s）", hit.Category)
+			}
+			b.WriteString("\n")
+		}
+		hitBlock = strings.TrimRight(b.String(), "\n")
+	}
 
-系统内可推荐的资源目录：
+	systemPrompt := fmt.Sprintf(`你是「小书童」，一位亲切耐心的儿童学习助手，陪着 %s 的孩子一起学习。
+
+【这个孩子能看到的内容】
 %s
 
-回答要求：
-- 语言亲切、简洁，适合孩子理解，也可以给家长看
-- 每次推荐 2-4 个具体方向，不要泛泛而谈
-- 如果用户问的是学习规划，给出明确的时间安排建议
-- 不要编造系统里没有的资源`, orDefault(grade, "小学"), strings.Join(availableResources, "、"))
+【这次提问，系统刚从资源库里检出的相关资源】
+%s
+
+怎么回答：
+- 语言亲切、简洁。孩子自己看得懂，家长看也不觉得幼稚。
+- **优先推荐上面「检出的相关资源」**。要提到它们时，请把标题**一字不改地完整写出来**
+  —— 系统靠标题把这些资源变成可点的卡片，写错一个字卡片就出不来了。
+- 检出的资源不合适，就推荐「能看到的内容」里的方向，或者直接讲学习方法，别硬凑。
+- 一次给 2-4 个具体内容，不要只说一句"去看看 XX"。
+- 库里没有的东西不要编。不确定就说"乐园里我暂时没找到"。
+- 孩子如果只是闲聊、问天气、说心情，就正常聊，不用往学习上扯。`,
+		orDefault(grade, "小学"),
+		strings.Join(availableResources, "\n"),
+		hitBlock)
 
 	return []Message{{Role: "system", Content: systemPrompt}}
 }

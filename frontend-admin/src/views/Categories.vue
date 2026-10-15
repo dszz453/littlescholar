@@ -110,10 +110,50 @@
         <el-form-item label="排序">
           <el-input-number v-model="form.sortOrder" :min="0" />
         </el-form-item>
+
+        <!-- 从网盘目录创建：选一个远端目录，目录名自动填上，
+             保存时顺手把映射也建好 —— 省掉「先建目录、再去资源映射加一条」两步。 -->
+        <el-form-item v-if="!editing" label="网盘目录">
+          <div class="remote-pick">
+            <el-input
+              :model-value="remote ? remote.path : ''"
+              readonly
+              placeholder="可选：选一个网盘目录，保存时一并建立映射"
+            >
+              <template #append>
+                <el-button @click="openPicker">浏览</el-button>
+              </template>
+            </el-input>
+            <el-button v-if="remote" link type="danger" @click="clearRemote">清除</el-button>
+          </div>
+          <div class="form-tip">
+            <template v-if="remote">
+              保存后会同时建立一条<b>递归映射</b>，把该目录里的媒体文件登记成资源。
+              目录名已按网盘目录名填好，可以改。
+            </template>
+            <template v-else>
+              选好网盘目录后，目录名会自动填上；不想建映射就留空。
+            </template>
+          </div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 选网盘目录：复用 RemoteDirTree，与「资源映射」页是同一棵树 -->
+    <el-dialog v-model="pickerVisible" title="选择网盘目录" width="660px" append-to-body>
+      <RemoteDirTree :accounts="accounts" style="height: 380px" @pick="onPickRemote" />
+      <div class="picked-line">
+        已选：<b>{{ remote ? remote.path : '（还没选）' }}</b>
+      </div>
+      <template #footer>
+        <el-button @click="pickerVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="!remote" @click="confirmPick">
+          就用这个目录
+        </el-button>
       </template>
     </el-dialog>
   </div>
@@ -123,7 +163,8 @@
 import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Refresh } from '@element-plus/icons-vue'
-import { categoryApi } from '@/api'
+import { categoryApi, diskApi, mappingApi } from '@/api'
+import RemoteDirTree from '@/components/RemoteDirTree.vue'
 
 const tree = ref([])
 const icons = ref([])
@@ -132,6 +173,12 @@ const editing = ref(false)
 const saving = ref(false)
 const parentName = ref('')
 const currentId = ref(null)
+
+// ============ 从网盘目录创建（可选） ============
+const accounts = ref([])
+const pickerVisible = ref(false)
+// 选中的远端目录（null = 用户没打算建映射）
+const remote = ref(null)
 
 const form = ref({
   name: '',
@@ -170,9 +217,42 @@ async function loadIcons() {
   }
 }
 
+/** 接入源列表。失败不打断建目录本身（不建映射也用得上这个弹窗）。 */
+async function loadAccounts() {
+  try {
+    accounts.value = (await diskApi.list()) || []
+  } catch (e) {
+    accounts.value = []
+  }
+}
+
+function openPicker() {
+  if (!accounts.value.length) {
+    ElMessage.warning('还没有接入源，先到「资源接入」添加一个网盘')
+    return
+  }
+  pickerVisible.value = true
+}
+
+function onPickRemote(p) {
+  remote.value = p
+}
+
+function confirmPick() {
+  if (!remote.value) return
+  // 自动填目录名。远端"根目录"没有名字，这时别覆盖用户已经填好的。
+  if (remote.value.dirName) form.value.name = remote.value.dirName
+  pickerVisible.value = false
+}
+
+function clearRemote() {
+  remote.value = null
+}
+
 function openCreate(parent) {
   editing.value = false
   currentId.value = null
+  remote.value = null
   parentName.value = parent?.name || ''
   form.value = {
     name: '',
@@ -214,13 +294,38 @@ async function save() {
       await categoryApi.update(currentId.value, form.value)
       ElMessage.success('更新成功')
     } else {
-      await categoryApi.create(form.value)
-      ElMessage.success('创建成功')
+      const created = await categoryApi.create(form.value)
+      // 建映射是"顺手做的事"，它失败**不能吞掉**：
+      // 目录已经建出来了，用户会以为映射也成了，回头发现孩子端空空如也。
+      let mappingErr = ''
+      if (remote.value && created && created.id) {
+        try {
+          await mappingApi.create({
+            name: remote.value.dirName || created.name,
+            accountId: remote.value.accountId,
+            remoteDirId: remote.value.dirId || '',
+            remoteDirName: remote.value.dirName || '',
+            categoryId: created.id,
+            recursive: true,
+            enabled: true,
+          })
+        } catch (e) {
+          mappingErr = (e && e.message) || '未知原因'
+        }
+      }
+      if (mappingErr) {
+        ElMessage.warning(`目录已创建，但映射没建上：${mappingErr}。请到「资源映射」手动补一条`)
+      } else if (remote.value) {
+        ElMessage.success('创建成功，并建好了映射（记得去「资源映射」点一次同步）')
+      } else {
+        ElMessage.success('创建成功')
+      }
     }
     dialogVisible.value = false
+    remote.value = null
     loadTree()
   } catch (e) {
-    /* 忽略 */
+    /* 拦截器已提示 */
   } finally {
     saving.value = false
   }
@@ -271,6 +376,7 @@ async function onNodeDrop(draggingNode, dropNode, dropType) {
 onMounted(() => {
   loadTree()
   loadIcons()
+  loadAccounts()
 })
 </script>
 
@@ -336,5 +442,25 @@ onMounted(() => {
 .icon-item.active {
   border-color: var(--ls-primary);
   background: #ecf5ff;
+}
+
+.remote-pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.form-tip {
+  font-size: 12px;
+  color: var(--ls-text-secondary);
+  line-height: 1.7;
+}
+
+.picked-line {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--ls-text-secondary);
+  word-break: break-all;
 }
 </style>

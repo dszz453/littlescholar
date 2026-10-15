@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/littlescholar/core/internal/ai"
 	"github.com/littlescholar/core/internal/model"
+	"github.com/littlescholar/core/internal/service"
 	"github.com/littlescholar/core/internal/util"
 	"gorm.io/gorm"
 )
@@ -16,10 +17,20 @@ import (
 type AIHandler struct {
 	db        *gorm.DB
 	encryptor *util.Encryptor
+	// 目录可见性。main 与 router 两处都会注入；为 nil 时按"不限"处理，
+	// 这样单测里 new 出来的实例仍然可用（见 ai_tutor.go 的 visibleCategoryIDs）。
+	perm *service.PermissionService
 }
 
 func NewAIHandler(db *gorm.DB, encryptor *util.Encryptor) *AIHandler {
 	return &AIHandler{db: db, encryptor: encryptor}
+}
+
+// WithPerm 注入权限服务。链式调用，与 DigestHandler.WithLogger 的用法一致 ——
+// 不直接改 NewAIHandler 签名，免得动到一堆测试。
+func (h *AIHandler) WithPerm(p *service.PermissionService) *AIHandler {
+	h.perm = p
+	return h
 }
 
 // ListConfigs 配置列表
@@ -283,15 +294,26 @@ func (h *AIHandler) Chat(c *gin.Context) {
 		})
 	}
 
-	// 取用户可访问的资源目录，作为推荐依据
-	var cats []model.Category
-	h.db.Where("level <= 2").Order("sort_order asc").Find(&cats)
-	var catNames []string
-	for _, ct := range cats {
-		catNames = append(catNames, ct.Name)
+	// 先弄清楚"这个孩子能看到什么"，再让 AI 开口。
+	//
+	// 次序很关键：可见范围既决定提示词里的目录概况，也决定检索的边界，
+	// 两处必须是同一个 scope —— 否则会出现"推荐的目录孩子点不进去"。
+	// 改之前这里写的是 `level <= 2`，既没按权限过滤，也漏掉了三级以下。
+	scopeIDs, unrestricted, err := h.visibleCategoryIDs(c)
+	if err != nil {
+		util.ServerError(c, "读取目录权限失败")
+		return
 	}
+	briefs := h.tutorBriefs(scopeIDs, unrestricted)
+	// 检索一遍再问 AI：它得先知道"库里到底有什么能对上这个问题"，
+	// 才谈得上推荐具体内容，而不是每次都回"去乐学英语看看吧"。
+	hits := h.tutorHits(userText, scopeIDs, unrestricted, 12)
 
-	messages := ai.BuildTutorPrompt(orDefaultStr(req.Grade, ""), catNames)
+	messages := ai.BuildTutorPrompt(
+		orDefaultStr(req.Grade, ""),
+		formatBriefs(briefs),
+		toHints(hits),
+	)
 
 	// 优先用请求里携带的多轮上下文（前端已把最近若干轮带上），
 	// 避免重复查库历史导致上下文不一致；否则回退到按 session 查库。
@@ -324,8 +346,13 @@ func (h *AIHandler) Chat(c *gin.Context) {
 		return
 	}
 
-	// 从回复中提取可能的资源推荐
-	recommends := h.matchResources(reply)
+	// 先从"这次检索出来的候选"里挑 AI 提到的 —— 卡片基本都来自这里，
+	// 因为上面已经把这些标题原样告诉了 AI，它提到时是照抄的。
+	recommends := h.pickFromHits(reply, hits)
+	if len(recommends) == 0 {
+		// 兜底：AI 可能提到了一个真实存在、但我们这轮没检索出来的资源
+		recommends = h.matchResources(reply, scopeIDs, unrestricted)
+	}
 
 	// 保存对话（只记本轮问答，避免与前端上下文重复）
 	h.db.Create(&model.AIChatMessage{SessionID: sessionID, Role: "user", Content: userText})
@@ -345,30 +372,31 @@ func (h *AIHandler) Chat(c *gin.Context) {
 	})
 }
 
-// matchResources 从 AI 回复中匹配系统内资源
-func (h *AIHandler) matchResources(reply string) []gin.H {
+// matchResources 兜底匹配：从「这个孩子看得到的」热门资源里找 AI 提到的。
+//
+// 注意权限：改之前这里直接查全站 view_count 前 100，没有任何过滤 ——
+// 孩子可能拿到一张"自己无权访问"的资源卡片，点进去是 404。
+func (h *AIHandler) matchResources(reply string, scopeIDs []uint64, unrestricted bool) []gin.H {
+	q := h.db.Model(&model.Resource{}).Preload("Category")
+	if !unrestricted {
+		if len(scopeIDs) == 0 {
+			return nil
+		}
+		q = q.Where("category_id IN ?", scopeIDs)
+	}
 	var resources []model.Resource
-	h.db.Order("view_count desc").Limit(100).Find(&resources)
+	if err := q.Order("view_count desc").Limit(200).Find(&resources).Error; err != nil {
+		return nil
+	}
 
-	var out []gin.H
-	seen := map[uint64]bool{}
+	out := make([]gin.H, 0, 5)
 	for _, r := range resources {
 		if len(out) >= 5 {
 			break
 		}
-		if seen[r.ID] {
-			continue
-		}
 		// 标题中任意 2 字以上片段出现在回复里即视为命中
 		if containsAnyFragment(reply, r.Title) {
-			var cat model.Category
-			h.db.First(&cat, r.CategoryID)
-			out = append(out, gin.H{
-				"id": r.ID, "title": r.Title,
-				"categoryId": r.CategoryID, "categoryName": cat.Name,
-				"cover": r.Cover, "mediaType": r.MediaType,
-			})
-			seen[r.ID] = true
+			out = append(out, resourceCard(r))
 		}
 	}
 	return out

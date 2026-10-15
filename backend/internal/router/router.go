@@ -70,7 +70,7 @@ func Setup(deps *Deps) *gin.Engine {
 	transferH := handler.NewTransferHandler(deps.DB, deps.Encryptor, deps.Pool)
 	aiH := deps.AI
 	if aiH == nil {
-		aiH = handler.NewAIHandler(deps.DB, deps.Encryptor)
+		aiH = handler.NewAIHandler(deps.DB, deps.Encryptor).WithPerm(deps.Perm)
 	}
 	planH := deps.Plan
 	if planH == nil {
@@ -82,7 +82,7 @@ func Setup(deps *Deps) *gin.Engine {
 	}
 	organizeH := deps.Organize
 	if organizeH == nil {
-		organizeH = handler.NewOrganizeHandler(deps.DB, deps.Perm, aiH)
+		organizeH = handler.NewOrganizeHandler(deps.DB, deps.Perm, aiH).WithEncryptor(deps.Encryptor)
 	}
 	studyH := handler.NewStudyHandler(deps.DB, aiH)
 	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret)

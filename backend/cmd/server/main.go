@@ -262,10 +262,10 @@ func main() {
 	//
 	// AI / Plan 两个 handler 先在这里建好再交给路由：PlanHandler 的
 	// 周奖状定时任务要在下面挂到优雅退出链上，main 必须持有同一实例。
-	aiHandler := handler.NewAIHandler(db, encryptor)
+	aiHandler := handler.NewAIHandler(db, encryptor).WithPerm(permService)
 	planHandler := handler.NewPlanHandler(db, permService, aiHandler)
 	digestHandler := handler.NewDigestHandler(db, permService, aiHandler).WithLogger(logger)
-	organizeHandler := handler.NewOrganizeHandler(db, permService, aiHandler).WithLogger(logger)
+	organizeHandler := handler.NewOrganizeHandler(db, permService, aiHandler).WithLogger(logger).WithEncryptor(encryptor)
 	if n, parseErr := strconv.Atoi(sysConf("digest_daily_limit", "")); parseErr == nil && n > 0 {
 		digestHandler.DailyLimit = n
 	}

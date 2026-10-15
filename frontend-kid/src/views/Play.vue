@@ -98,19 +98,49 @@
         </div>
       </section>
 
-      <!-- PDF：内嵌 + 新窗口打开兜底 -->
+      <!-- PDF：用 pdf.js 在页面内渲染。
+           以前是 <iframe src="blob:...pdf"> —— 桌面 Chrome 自带 PDF 阅读器，
+           所以看着没问题；但**安卓 WebView 没有 PDF 插件**，装成 App 之后
+           点开绘本就是一片空白。这正是"孩子端要支持 PDF 查看"的由来。 -->
       <section v-else-if="isPDF" class="media-area pdf-area">
-        <iframe
-          v-if="pdfBlobUrl"
-          :src="pdfBlobUrl"
-          class="pdf-frame"
-          title="绘本阅读"
-        ></iframe>
-        <div v-else class="loading pdf-wait">
-          <div class="spinner"></div>
-          <p class="pdf-wait-text">正在打开绘本…</p>
+        <div class="pdf-viewer">
+          <canvas
+            ref="pdfCanvas"
+            class="pdf-canvas"
+            :class="{ 'is-loading': pdfLoading }"
+            @touchstart.passive="onPdfTouchStart"
+            @touchend.passive="onPdfTouchEnd"
+          ></canvas>
+          <div v-if="pdfLoading" class="loading pdf-wait">
+            <div class="spinner"></div>
+            <p class="pdf-wait-text">{{ pdfLoadingText }}</p>
+          </div>
+          <div v-if="pdfError" class="pdf-error">
+            <div class="emoji">📖</div>
+            <p>{{ pdfError }}</p>
+          </div>
         </div>
-        <a class="pdf-open pressable" :href="info.url" target="_blank" rel="noopener">
+
+        <!-- 页内翻页。和外面的「上一首 / 下一首」不是一回事：
+             那两个换的是"资源"，这里翻的是"同一本绘本的页"。 -->
+        <div v-if="pdfPages > 1 && !pdfError" class="pdf-pager">
+          <button class="pdf-nav pressable" :disabled="pdfPage <= 1" @click="pdfGo(-1)">
+            ◀ 上一页
+          </button>
+          <span class="pdf-pageinfo">{{ pdfPage }} / {{ pdfPages }}</span>
+          <button class="pdf-nav pressable" :disabled="pdfPage >= pdfPages" @click="pdfGo(1)">
+            下一页 ▶
+          </button>
+        </div>
+
+        <!-- 只有真的打不开时才给这个兜底，正常情况不占地方 -->
+        <a
+          v-if="pdfError"
+          class="pdf-open pressable"
+          :href="info.url"
+          target="_blank"
+          rel="noopener"
+        >
           在新窗口打开 📖
         </a>
       </section>
@@ -344,7 +374,14 @@ const zoomed = ref(false)
 const siblings = ref([])
 const playlist = ref([])
 const showPlaylist = ref(false)
-const pdfBlobUrl = ref('')
+
+// PDF 阅读器状态（实现见下方「PDF：用 pdf.js 画到 canvas」）
+const pdfCanvas = ref(null)
+const pdfPage = ref(0)
+const pdfPages = ref(0)
+const pdfLoading = ref(false)
+const pdfLoadingText = ref('正在打开绘本…')
+const pdfError = ref('')
 
 // 转码状态：后台在为首播转码时置位，用于给家长/孩子一个"正在优化播放"的提示
 const transcoding = ref(false)
@@ -553,7 +590,7 @@ async function load(resumeAt = 0) {
     pendingSeek = resumeAt > 0 ? resumeAt : Number(data?.lastPosition) || 0
 
     if (isPDF.value) {
-      await preparePDF(data.url)
+      await openPDF(data.url)
     }
     if (isImage.value) {
       // 图片无需额外处理
@@ -639,20 +676,182 @@ function currentTime() {
 
 let pendingSeek = 0
 
-/* ---------- PDF：用 blob + objectURL 内嵌，避免跨域被拒 ---------- */
-async function preparePDF(url) {
-  if (!url) return
-  try {
-    const res = await fetch(url, { credentials: 'omit' })
-    if (!res.ok) throw new Error('fetch failed')
-    const blob = await res.blob()
-    // 强制 pdf mime，确保浏览器识别为 PDF 而非下载
-    const typed = blob.type === 'application/pdf' ? blob : new Blob([blob], { type: 'application/pdf' })
-    pdfBlobUrl.value = URL.createObjectURL(typed)
-  } catch {
-    // 失败就让 iframe 直连原地址兜底
-    pdfBlobUrl.value = url
+/* ---------- PDF：用 pdf.js 画到 canvas ---------- */
+//
+// 为什么不用 <iframe src="blob:...pdf"> 或 <embed>：
+// 那条路依赖"宿主环境自带 PDF 阅读器"。桌面 Chrome 有，所以以前看着是好的；
+// 而**安卓 WebView 没有 PDF 插件** —— App 里点开绘本就是一片空白。
+// pdf.js 是纯 JS 渲染，不依赖插件，任何 WebView 都能画出来。
+//
+// 顺带解决另一件事：不必再把整个 PDF 拉成 blob。
+// 直接指向后端的 /api/stream/:id（同源、支持 Range），
+// pdf.js 按需取页 —— 一本几十 MB 的绘本不用先全量下载。
+
+let pdfDoc = null
+let pdfRenderTask = null
+let pdfjsMod = null
+let pdfOpenSeq = 0
+
+async function loadPdfJs() {
+  if (pdfjsMod) return pdfjsMod
+  // 动态 import：只有真的打开绘本才加载这一坨（gzip 后约 400KB），
+  // 不影响首页和其它页面。用 legacy 构建是为了兼容较老的 WebView
+  // （部分学习平板的 WebView 相当旧，新构建会直接语法报错）。
+  const [lib, worker] = await Promise.all([
+    import('pdfjs-dist/legacy/build/pdf'),
+    import('pdfjs-dist/legacy/build/pdf.worker.min.js?url'),
+  ])
+  lib.GlobalWorkerOptions.workerSrc = worker.default
+  pdfjsMod = lib
+  return lib
+}
+
+/** 停掉在途的打开/渲染，清空状态。切资源、离开页面时都走它。 */
+function resetPdf() {
+  pdfOpenSeq++ // 让在途结果失效，避免"慢的那次"覆盖"新的一次"
+  if (pdfRenderTask) {
+    try {
+      pdfRenderTask.cancel()
+    } catch (e) {
+      /* 忽略 */
+    }
+    pdfRenderTask = null
   }
+  if (pdfDoc) {
+    try {
+      pdfDoc.destroy()
+    } catch (e) {
+      /* 忽略 */
+    }
+    pdfDoc = null
+  }
+  pdfPages.value = 0
+  pdfPage.value = 0
+  pdfLoading.value = false
+  pdfError.value = ''
+}
+
+async function openPDF(url) {
+  resetPdf()
+  const seq = pdfOpenSeq
+  if (!url) {
+    pdfError.value = '这个绘本没有可用的地址'
+    return
+  }
+  pdfLoading.value = true
+  pdfLoadingText.value = '正在打开绘本…'
+  try {
+    const lib = await loadPdfJs()
+    if (seq !== pdfOpenSeq) return
+    const task = lib.getDocument({
+      url,
+      // 关掉 pdf.js 的 eval 优化：收益只是渲染快一点，
+      // 代价是"PDF 内容能动用代码执行"。给孩子的设备上不划算。
+      isEvalSupported: false,
+    })
+    task.onProgress = ({ loaded, total }) => {
+      if (seq !== pdfOpenSeq || !total) return
+      pdfLoadingText.value = `正在打开绘本… ${Math.round((loaded / total) * 100)}%`
+    }
+    const doc = await task.promise
+    if (seq !== pdfOpenSeq) {
+      try {
+        doc.destroy()
+      } catch (e) {
+        /* 忽略 */
+      }
+      return
+    }
+    pdfDoc = doc
+    pdfPages.value = doc.numPages
+    pdfPage.value = 1
+    pdfLoading.value = false
+    await renderPdfPage(1)
+  } catch (e) {
+    if (seq !== pdfOpenSeq) return
+    pdfLoading.value = false
+    pdfError.value = pdfErrorText(e)
+  }
+}
+
+async function renderPdfPage(n) {
+  const canvas = pdfCanvas.value
+  if (!pdfDoc || !canvas) return
+  // 同一张 canvas 上并发 render 会直接抛错，上一个任务必须先取消
+  if (pdfRenderTask) {
+    try {
+      pdfRenderTask.cancel()
+    } catch (e) {
+      /* 忽略 */
+    }
+    pdfRenderTask = null
+  }
+  try {
+    const page = await pdfDoc.getPage(n)
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    const base = page.getViewport({ scale: 1 })
+    // 按容器宽度铺满：绘本在竖屏手机上也能看清。
+    // 用父元素宽度而不是 canvas 自身 —— canvas 此刻还是上一页的尺寸。
+    const box = canvas.parentElement
+    const avail = Math.max((box ? box.clientWidth : window.innerWidth) - 4, 120)
+    const scale = (avail / base.width) * dpr
+    const vp = page.getViewport({ scale })
+    const ctx = canvas.getContext('2d', { alpha: false })
+    canvas.width = Math.floor(vp.width)
+    canvas.height = Math.floor(vp.height)
+    // CSS 尺寸按逻辑像素写，canvas 像素按 dpr 放大 —— 高分屏才不糊
+    canvas.style.width = Math.floor(vp.width / dpr) + 'px'
+    canvas.style.height = Math.floor(vp.height / dpr) + 'px'
+    pdfRenderTask = page.render({ canvasContext: ctx, viewport: vp })
+    await pdfRenderTask.promise
+  } catch (e) {
+    // "取消"是快速翻页的正常流程，不是错误
+    if (e && e.name === 'RenderingCancelledException') return
+    pdfError.value = '这一页没能画出来'
+  } finally {
+    pdfRenderTask = null
+  }
+}
+
+function pdfGo(delta) {
+  const n = pdfPage.value + delta
+  if (n < 1 || n > pdfPages.value) return
+  pdfPage.value = n
+  renderPdfPage(n)
+}
+
+// 左右滑动翻页（触屏）
+let pdfTouchX = 0
+let pdfTouchY = 0
+
+function onPdfTouchStart(e) {
+  const t = e.changedTouches && e.changedTouches[0]
+  if (!t) return
+  pdfTouchX = t.clientX
+  pdfTouchY = t.clientY
+}
+
+function onPdfTouchEnd(e) {
+  const t = e.changedTouches && e.changedTouches[0]
+  if (!t) return
+  const dx = t.clientX - pdfTouchX
+  const dy = t.clientY - pdfTouchY
+  // 只在"明显是横向滑动"时才翻页：纵向滑动是页面滚动，
+  // 误判会让孩子想往下看的时候突然跳页。
+  if (Math.abs(dx) < 45 || Math.abs(dx) < Math.abs(dy) * 1.2) return
+  pdfGo(dx < 0 ? 1 : -1)
+}
+
+/** 把 pdf.js 的各种失败翻译成家长能看懂的话。 */
+function pdfErrorText(e) {
+  const msg = String((e && e.message) || e || '')
+  if (/Missing PDF|Invalid PDF|Unexpected server response/i.test(msg)) {
+    return '这个绘本打不开，可能是文件本身有问题'
+  }
+  if (/fetch|network|Failed to load|NetworkError/i.test(msg)) {
+    return '绘本加载失败，检查一下网络再试试'
+  }
+  return '绘本打开失败'
 }
 
 /* ---------- 媒体事件 ---------- */
@@ -1043,10 +1242,7 @@ function goBack() {
 
 /* ---------- 生命周期 ---------- */
 function cleanupMedia() {
-  if (pdfBlobUrl.value) {
-    URL.revokeObjectURL(pdfBlobUrl.value)
-    pdfBlobUrl.value = ''
-  }
+  resetPdf()
   stopReportTimer()
   const el = mediaEl()
   if (el) {
@@ -1401,18 +1597,32 @@ watch(isPlaying, (v) => {
 .pdf-area {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
-.pdf-frame {
+.pdf-viewer {
+  position: relative;
   width: 100%;
-  height: 68vh;
-  border: none;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  min-height: 180px;
+}
+.pdf-canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
   border-radius: var(--r-md);
   background: #fff;
   box-shadow: var(--shadow-sm);
 }
+/* 加载中先把上一页藏起来，避免"旧页 + 转圈"同时出现 */
+.pdf-canvas.is-loading {
+  visibility: hidden;
+}
 .pdf-wait {
-  height: 68vh;
+  position: absolute;
+  inset: 0;
+  min-height: 40vh;
   flex-direction: column;
   gap: 12px;
 }
@@ -1420,6 +1630,42 @@ watch(isPlaying, (v) => {
   margin: 0;
   font-size: 14px;
   color: var(--c-text-sub);
+}
+.pdf-error {
+  text-align: center;
+  padding: 36px 16px;
+  color: var(--c-text-sub);
+}
+.pdf-error .emoji {
+  font-size: 40px;
+  margin-bottom: 10px;
+}
+.pdf-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+}
+.pdf-nav {
+  border: none;
+  background: #fff;
+  color: var(--c-text);
+  font-size: 14.5px;
+  font-weight: 600;
+  padding: 11px 18px;
+  border-radius: 999px;
+  box-shadow: var(--shadow-sm);
+}
+.pdf-nav:disabled {
+  opacity: 0.42;
+  box-shadow: none;
+}
+.pdf-pageinfo {
+  font-size: 14px;
+  color: var(--c-text-sub);
+  font-variant-numeric: tabular-nums;
+  min-width: 64px;
+  text-align: center;
 }
 .pdf-open {
   align-self: center;

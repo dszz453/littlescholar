@@ -47,14 +47,26 @@
               />
             </el-select>
             <el-input
-              v-model="form.remoteDirPrefix"
-              placeholder="可选：远端目录前缀，如 /动画"
+              :model-value="remoteLabel"
+              readonly
+              placeholder="可选：点右侧「选目录」挑一个远端目录"
               :disabled="!form.accountId"
-            />
+            >
+              <template #append>
+                <el-button :disabled="!form.accountId" @click="openRemotePicker">
+                  选目录
+                </el-button>
+              </template>
+            </el-input>
           </div>
           <div class="hint">
-            新建映射要求 AI 能对上真实远端路径。不选接入源时，AI 只会建议目录与移动，
-            不会碰映射。
+            <template v-if="remoteLabel">
+              AI 会读取这个远端目录下的子目录，把它们对应到合适的系统目录（不够就新建）。
+            </template>
+            <template v-else>
+              选好远端目录后，AI 就能提出「哪几个网盘子目录该挂到哪个系统目录」——不选的话
+              它只会建议目录与移动，不会碰映射。
+            </template>
           </div>
         </el-form-item>
 
@@ -206,13 +218,33 @@
       </div>
     </el-card>
   </div>
+
+    <!-- 选远端目录：复用 RemoteDirTree，与「资源映射」页是同一棵树 -->
+    <el-dialog v-model="remotePickerVisible" title="选择远端目录" width="660px" append-to-body>
+      <RemoteDirTree
+        :accounts="pickedAccounts"
+        :show-toolbar="false"
+        style="height: 360px"
+        @pick="onRemotePick"
+      />
+      <div class="picked-line">
+        已选：<b>{{ pickedRemote ? pickedRemote.path : '（还没选）' }}</b>
+      </div>
+      <template #footer>
+        <el-button @click="remotePickerVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="!pickedRemote" @click="confirmRemote">
+          就用这个目录
+        </el-button>
+      </template>
+    </el-dialog>
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Check, MagicStick } from '@element-plus/icons-vue'
 import { categoryApi, diskApi, organizeApi } from '@/api'
+import RemoteDirTree from '@/components/RemoteDirTree.vue'
 
 // value 必须显式写 'id'。
 // el-tree-select 的 props.value 默认是字面量 'value'，而我们的节点字段叫 id；
@@ -229,6 +261,52 @@ const form = ref({
   remoteDirPrefix: '',
   instruction: '',
 })
+
+// ============ 远端目录选择 ============
+//
+// form.remoteDirPrefix 承载的是**远端目录 id**（夸克是 fs_id、本地硬盘是路径），
+// 提交给后端后它拿这个 id 去列子目录喂给 AI。给用户看的是路径名 remoteLabel ——
+// 没人愿意盯着一串 3.1e13 的数字确认自己选对了没。
+const remotePickerVisible = ref(false)
+const pickedRemote = ref(null)
+const remoteLabel = ref('')
+
+// 树上只列"当前选中的那个接入源"，避免在下拉里选了一个、树上却列出全部账号
+const pickedAccounts = computed(() =>
+  accounts.value.filter((a) => a.id === form.value.accountId)
+)
+
+function openRemotePicker() {
+  if (!form.value.accountId) {
+    ElMessage.warning('先选一个接入源')
+    return
+  }
+  remotePickerVisible.value = true
+}
+
+function onRemotePick(p) {
+  pickedRemote.value = p
+}
+
+function confirmRemote() {
+  const p = pickedRemote.value
+  if (!p) return
+  form.value.remoteDirPrefix = p.dirId || ''
+  // 远端根目录没有名字，这时给个能看懂的说明，别留空让人以为没选上
+  remoteLabel.value = p.isRoot ? `${p.accountName} / 根目录` : p.path
+  remotePickerVisible.value = false
+}
+
+// 换接入源 / 清空表单时，远端选择必须一起失效 ——
+// 否则会留下一个"属于上一个账号的 dirId"，提交上去 AI 拿它去列目录必然失败。
+watch(
+  () => form.value.accountId,
+  () => {
+    form.value.remoteDirPrefix = ''
+    remoteLabel.value = ''
+    pickedRemote.value = null
+  }
+)
 
 const planning = ref(false)
 const applying = ref(false)
@@ -489,5 +567,11 @@ onMounted(() => {
   margin-top: 12px;
   font-size: 12.5px;
   color: var(--ls-text-secondary);
+}
+.picked-line {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--ls-text-secondary);
+  word-break: break-all;
 }
 </style>
