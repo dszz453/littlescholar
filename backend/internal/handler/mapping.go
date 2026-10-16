@@ -201,6 +201,92 @@ func (h *MappingHandler) Update(c *gin.Context) {
 	util.OKWithMessage(c, "已保存", nil)
 }
 
+// mappingPurge 执行一次「解绑这条映射 + 移除它带来的资源」。
+//
+// ============ 为什么抽出来 ============
+//
+// 这条规则现在有两个入口：Delete（解绑一条）和 DeleteAll（解绑全部）。
+// 抄一遍的代价不是多几个字符，而是**两处迟早会跑偏** ——
+// 而偏差的表现正好是最难查的那种："单条解绑能清干净、全部解绑清不掉"。
+// 所以规则只写在这里，两个入口都走它。
+//
+// ============ 资源分两类 ============
+//
+//  1. 精确归属：mapping_id 就是这条映射的那些。资源走软删除
+//     （与「资源列表 → 批量删除」一致），删错了还能从库里捞回来。
+//
+//  2. 遗留资源：mapping_id 是后加的列，加之前导入的资源没有归属信息。
+//     这一条是整个修复能不能落地的关键 —— 线上现状就是如此，存量资源
+//     几乎全是 0/NULL，只按第 1 类清，用户点完会看到"已清理 0 条"
+//     然后孩子端一切照旧，比不改还糟。
+//
+//     判定依据是「这条映射的账号 + 目标目录」，对存量资源来说这就是它唯一的
+//     来源信息。代价是可能连带清掉**同一账号同一目录下手动导入**的资源；
+//     权衡后可以接受：真出现那种情况，说明这个目录已经被整条映射覆盖了，
+//     手动导入的那份本来就是重复的。
+//
+//     ⚠️ 必须同时兼容 NULL 和 0。AutoMigrate 给已存在的行补列用的是
+//     ALTER TABLE ADD COLUMN，**不回填默认值**，所以历史行是 NULL 而不是 0。
+//     只写 `mapping_id = 0` 在 sqlite（单测）上能过、在 postgres（线上）上
+//     一条都匹配不到 —— 这个坑已经实际踩过一次，别再改回去。
+type mappingPurge struct {
+	tx *gorm.DB
+	// dryRun 只统计不落库，给前端做二次确认的预览用 ——
+	// 批量解绑是破坏性操作，"到底会动多少东西"要能在点确定之前摆出来。
+	dryRun bool
+	// seen 记录已经处理过的 (账号, 目录) 组合，只为让**预览**与**执行**
+	// 数出同一个数：真删时第二条同账号同目录的映射再查 legacy 已经是 0 条
+	// （前一条刚把它们软删掉）；而 dryRun 不删，同一批 legacy 会被数两遍，
+	// 预览就会虚高出一个刚好多算的量。
+	seen map[[2]uint64]bool
+}
+
+// purge 清理一条映射名下的资源并解绑它。
+func (p *mappingPurge) purge(m *model.ResourceMapping) (scoped, legacy int64, err error) {
+	key := [2]uint64{m.AccountID, m.CategoryID}
+	skipLegacy := p.seen[key]
+	p.seen[key] = true
+
+	if p.dryRun {
+		if err = p.tx.Where("mapping_id = ?", m.ID).
+			Model(&model.Resource{}).Count(&scoped).Error; err != nil {
+			return
+		}
+		if !skipLegacy {
+			err = p.legacyQuery(m).Model(&model.Resource{}).Count(&legacy).Error
+		}
+		return
+	}
+
+	res := p.tx.Where("mapping_id = ?", m.ID).Delete(&model.Resource{})
+	if res.Error != nil {
+		err = res.Error
+		return
+	}
+	scoped = res.RowsAffected
+
+	if !skipLegacy {
+		lg := p.legacyQuery(m).Delete(&model.Resource{})
+		if lg.Error != nil {
+			err = lg.Error
+			return
+		}
+		legacy = lg.RowsAffected
+	}
+
+	err = p.tx.Delete(&model.ResourceMapping{}, m.ID).Error
+	return
+}
+
+// legacyQuery 无归属（mapping_id 为 NULL 或 0）且账号 + 目录都对得上的资源。
+//
+// 单独成一个方法是为了让**数**（dryRun 的 Count）与**删**用到的是同一个
+// Where —— 两份各写一遍，改了一处忘另一处，预览就会开始骗人。
+func (p *mappingPurge) legacyQuery(m *model.ResourceMapping) *gorm.DB {
+	return p.tx.Where("(mapping_id IS NULL OR mapping_id = 0) AND disk_account_id = ? AND category_id = ?",
+		m.AccountID, m.CategoryID)
+}
+
 // Delete 解绑映射。
 //
 // ============ 资源怎么办：默认一起移除，而且是**软删除** ============
@@ -226,8 +312,7 @@ func (h *MappingHandler) Update(c *gin.Context) {
 // 时若改成物理删除，会出现"删不删资源"决定了"映射是软删还是硬删"这种
 // 与语义无关的差异，日后排查问题时很难解释。
 //
-// 另有一条针对**历史资源**的兜底，见下面第 2 步：mapping_id 是后加的列，
-// 加列之前导入的资源全是 0，光按 mapping_id 清等于什么都没清。
+// 真正的清理规则（含历史资源兜底）在 mappingPurge，单条和批量共用同一套。
 func (h *MappingHandler) Delete(c *gin.Context) {
 	id, ok := util.GetUintParam(c, "id")
 	if !ok {
@@ -257,39 +342,10 @@ func (h *MappingHandler) Delete(c *gin.Context) {
 
 	var scoped, legacy int64
 	err := h.db.Transaction(func(tx *gorm.DB) error {
-		// 1) 精确归属：mapping_id 就是这条映射的那些。
-		//
-		// 资源走软删除（与「资源列表 → 批量删除」一致），
-		// 万一删错了还能从库里捞回来。
-		res := tx.Where("mapping_id = ?", m.ID).Delete(&model.Resource{})
-		if res.Error != nil {
-			return res.Error
-		}
-		scoped = res.RowsAffected
-
-		// 2) 遗留资源：mapping_id 是后加的列，加之前导入的资源没有归属信息。
-		//
-		// 这一条是整个修复能不能落地的关键。线上现状就是如此：76 条资源里
-		// 全部是历史资源，如果只按第 1 步清，用户依然会看到"删了映射资源还在"
-		// —— 只不过这次连提示语都说着"已清理 0 条"，更让人费解。
-		//
-		// 判定依据是「这条映射的账号 + 目标目录」，对存量资源来说这就是它唯一的
-		// 来源信息。代价是可能连带清掉**同一账号同一目录下手动导入**的资源；
-		// 权衡后可以接受：真出现那种情况，说明这个目录已经被整条映射覆盖了，
-		// 手动导入的那份本来就是重复的。
-		//
-		// 必须同时兼容 NULL 和 0：AutoMigrate 给已存在的行补列时用的是
-		// ALTER TABLE ADD COLUMN，**不回填默认值**，所以历史行是 NULL 而不是 0。
-		// 只写 `mapping_id = 0` 在 sqlite（单测）上能过、在 postgres（线上）上
-		// 一条都匹配不到 —— 这个坑已经实际踩过一次，别再改回去。
-		lg := tx.Where("(mapping_id IS NULL OR mapping_id = 0) AND disk_account_id = ? AND category_id = ?",
-			m.AccountID, m.CategoryID).Delete(&model.Resource{})
-		if lg.Error != nil {
-			return lg.Error
-		}
-		legacy = lg.RowsAffected
-
-		return tx.Delete(&model.ResourceMapping{}, m.ID).Error
+		p := &mappingPurge{tx: tx, seen: map[[2]uint64]bool{}}
+		s, l, e := p.purge(&m)
+		scoped, legacy = s, l
+		return e
 	})
 	if err != nil {
 		util.ServerError(c, "删除失败")
@@ -305,6 +361,94 @@ func (h *MappingHandler) Delete(c *gin.Context) {
 			removed, legacy)
 	}
 	util.OKWithMessage(c, msg, gin.H{
+		"removedResources": removed,
+		"removedScoped":    scoped,
+		"removedLegacy":    legacy,
+	})
+}
+
+// DeleteAll 解绑**全部**映射（用户第 4 条：「所有映射全部删除要重新映射」）。
+//
+// 用途很实在：映射表被折腾乱了 —— 老映射指向的远端目录早就不在了、
+// 账号换过一轮、同一个目录被挂重了十几条 —— 与其一条条找着 ✕，
+// 不如一次清空，重新来一遍。
+//
+// 这不是不可逆操作，而且是刻意让它不可逆不起来的：
+// 资源是**软删除**，把同样的目录重新映射、再同步一次，资源会原样回来
+// （复活的逻辑在 service.ImportService.Register，连 id 都不变，
+// 孩子的播放进度和收藏都还在）。这句话必须写进提示语 ——
+// 不说清楚，没人敢按这个按钮，功能等于没做。
+//
+// 两个参数，都不传就是最常用的那条路径：
+//
+//	· withResources —— 默认 1（连同资源一起移除）。写 0/false 只解绑配置。
+//	· dryRun        —— 写 1 时只统计不落库，给前端做二次确认的预览。
+//
+// 只处理**当前列表里看得到的**映射。之前已经解绑过（软删）的映射不在此列 ——
+// 它们已经解绑了，用户看不见也不该被"全部解绑"再翻出来清一遍资源。
+func (h *MappingHandler) DeleteAll(c *gin.Context) {
+	keepResources := c.Query("withResources") == "0" || c.Query("withResources") == "false"
+	dryRun := c.Query("dryRun") == "1" || c.Query("dryRun") == "true"
+
+	var list []model.ResourceMapping
+	if err := h.db.Find(&list).Error; err != nil {
+		util.ServerError(c, "查询失败")
+		return
+	}
+
+	var scoped, legacy int64
+	err := h.db.Transaction(func(tx *gorm.DB) error {
+		if len(list) == 0 {
+			return nil
+		}
+		if keepResources {
+			// 只解绑：不碰资源，也就不必逐条跑清理规则。
+			// dryRun 时连这一步都省掉（预览需要的结果已经拿到了）。
+			if dryRun {
+				return nil
+			}
+			ids := make([]uint64, 0, len(list))
+			for i := range list {
+				ids = append(ids, list[i].ID)
+			}
+			return tx.Where("id IN ?", ids).Delete(&model.ResourceMapping{}).Error
+		}
+		p := &mappingPurge{tx: tx, dryRun: dryRun, seen: map[[2]uint64]bool{}}
+		for i := range list {
+			s, l, e := p.purge(&list[i])
+			if e != nil {
+				return e
+			}
+			scoped += s
+			legacy += l
+		}
+		return nil
+	})
+	if err != nil {
+		util.ServerError(c, "解绑失败")
+		return
+	}
+
+	removed := scoped + legacy
+	msg := fmt.Sprintf("已解绑全部 %d 条映射", len(list))
+	if dryRun {
+		msg = fmt.Sprintf("将解绑全部 %d 条映射", len(list))
+	}
+	if keepResources {
+		msg += "（已导入的资源保留）"
+	} else {
+		msg += fmt.Sprintf("，并移除 %d 个资源（重新映射同步后可恢复）", removed)
+		if legacy > 0 {
+			msg += fmt.Sprintf("，其中 %d 个为历史资源", legacy)
+		}
+	}
+	if dryRun {
+		msg += " —— 这是预览，还没有执行"
+	}
+	util.OKWithMessage(c, msg, gin.H{
+		"dryRun":           dryRun,
+		"mappings":         len(list),
+		"withResources":    !keepResources,
 		"removedResources": removed,
 		"removedScoped":    scoped,
 		"removedLegacy":    legacy,

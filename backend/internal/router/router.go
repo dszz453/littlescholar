@@ -232,6 +232,9 @@ func Setup(deps *Deps) *gin.Engine {
 		admin.POST("/mappings", mappingH.Create)
 		admin.PUT("/mappings/:id", mappingH.Update)
 		admin.DELETE("/mappings/:id", mappingH.Delete)
+		// 解绑全部（?withResources=0 只解绑、?dryRun=1 只预览）。
+		// 与 /mappings/:id 不冲突：一个是无参数的集合，一个带路径参数。
+		admin.DELETE("/mappings", mappingH.DeleteAll)
 		admin.POST("/mappings/sync", mappingH.SyncAll) // 必须在 /:id 之前，否则会被当成 id
 		admin.POST("/mappings/:id/sync", mappingH.Sync)
 	}

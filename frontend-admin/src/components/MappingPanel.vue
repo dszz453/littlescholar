@@ -7,7 +7,7 @@
         <b>←</b> 放回去。
         系统目录展开能一路看到<b>已经导入的每一个资源</b>，每条映射、每个资源旁边都有 ✕ 可以单独取消。
       </span>
-      <div>
+      <div class="mp-bar-actions">
         <el-button
           :icon="RefreshRight"
           type="success"
@@ -16,6 +16,26 @@
           @click="syncAll"
         >
           全部同步
+        </el-button>
+        <!-- 导出摆在「解绑全部」左边是刻意的：这两个按钮的推荐用法是
+             先点左边留个档、再点右边。顺序本身就是提示。 -->
+        <el-button
+          size="small"
+          :icon="Download"
+          :loading="exporting"
+          :disabled="!mappings.length"
+          @click="exportSnapshot"
+        >
+          导出快照
+        </el-button>
+        <el-button
+          size="small"
+          type="danger"
+          plain
+          :disabled="!mappings.length"
+          @click="unmapAll"
+        >
+          解绑全部
         </el-button>
         <el-button :icon="Refresh" size="small" @click="loadAll" />
       </div>
@@ -281,7 +301,7 @@
 <script setup>
 import { computed, h, onMounted, ref } from 'vue'
 import { ElCheckbox, ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, RefreshRight } from '@element-plus/icons-vue'
+import { Download, Refresh, RefreshRight } from '@element-plus/icons-vue'
 import { diskApi, mappingApi, categoryApi, resourceApi } from '@/api'
 import RemoteDirTree from '@/components/RemoteDirTree.vue'
 
@@ -290,6 +310,7 @@ const accounts = ref([])
 const categoryTree = ref([])
 const loading = ref(false)
 const saving = ref(false)
+const exporting = ref(false)
 const syncingId = ref(null)
 
 // 左树：lazy 模式。因为它要长三种节点 —— 系统目录 / 该目录下已挂的映射 /
@@ -732,6 +753,105 @@ async function doUnmap() {
 }
 
 /**
+ * 解绑**全部**映射（用户第 4 条：「所有映射全部删除要重新映射」）。
+ *
+ * 映射表被折腾乱了 —— 老映射指向的远端目录早就不在、账号换过一轮、
+ * 同一个目录挂重了十几条 —— 与其一条条找着 ✕，不如一次清空重来。
+ *
+ * 三步，一步都不能省：
+ *
+ *  1. **先预览**。不拿前端的 resourceCount 自己加：那只是"有来源标记"
+ *     的那部分，历史资源（mapping_id 为 NULL 的那批，线上占绝大多数）
+ *     前端根本看不见，自己加必然少算，等于给用户一个骗人的数。
+ *     后端的 dryRun 在同一套清理规则上算，报出来就是真删会动的数字。
+ *
+ *  2. **手打确认词**。不是走形式 —— 这个按钮一次清整张映射表，
+ *     误点的代价是孩子端所有资源突然消失。同时把"资源是软删除、
+ *     重新映射能复活"写在最显眼处，否则没人敢按，功能等于没做。
+ *
+ *  3. 执行时把 withResources 传明白，别依赖默认值 —— 默认值将来若再反转
+ *     （它在 2026-10-16 反转过一次），这里会跟着悄悄变语义。
+ */
+async function unmapAll() {
+  if (!mappings.value.length) {
+    ElMessage.info('本来就没有映射')
+    return
+  }
+
+  let preview
+  try {
+    preview = (await mappingApi.removeAll({ dryRun: true })) || {}
+  } catch (e) {
+    return // 拦截器已提示
+  }
+
+  const withRes = ref(true)
+  const WORD = '全部解绑'
+  try {
+    await ElMessageBox({
+      title: '解绑全部映射',
+      type: 'warning',
+      showCancelButton: true,
+      confirmButtonText: '确定解绑全部',
+      cancelButtonText: '取消',
+      inputPlaceholder: `输入「${WORD}」才能确认`,
+      inputValidator: (v) => (v === WORD ? true : `请原样输入「${WORD}」`),
+      // ⚠️ 这里的文案一律是**静态**的，不要在 h() 里读 withRes.value。
+      // ElMessageBox 的 message 是一次性渲染的 VNode，不会因为 ref 变化重渲染，
+      // 读它只会得到一个永远停在初始值的数字。
+      message: h('div', { style: 'line-height:1.7;font-size:13.5px' }, [
+        h('p', { style: 'margin:0 0 10px' }, [
+          '将解绑全部 ',
+          h('b', [String(preview.mappings || 0)]),
+          ' 条映射。',
+        ]),
+        h(
+          ElCheckbox,
+          {
+            modelValue: withRes.value,
+            'onUpdate:modelValue': (v) => {
+              withRes.value = v
+            },
+          },
+          () => `同时移除已导入的资源（${preview.removedResources || 0} 个）`
+        ),
+        h('p', { style: 'margin:8px 0 0;color:#909399;font-size:12px' }, [
+          '移除是',
+          h('b', ['软删除']),
+          '：把同样的目录重新映射、再同步一次，资源会原样回来（连 id 都不变，'
+            + '孩子的播放进度和收藏都还在）。所以清空之后请记得重新映射一遍。',
+        ]),
+        preview.removedLegacy
+          ? h(
+              'p',
+              { style: 'margin:6px 0 0;color:#909399;font-size:12px' },
+              `其中 ${preview.removedLegacy} 个是没有来源标记的历史资源`
+                + '（按账号 + 目录认出来的），重新映射后同样能回来。'
+            )
+          : null,
+      ]),
+    })
+  } catch (e) {
+    return // 取消
+  }
+
+  let res
+  try {
+    res = await mappingApi.removeAll({ keepResources: !withRes.value })
+  } catch (e) {
+    return // 拦截器已提示
+  }
+  await loadAll()
+
+  const removed = Number(res && res.removedResources) || 0
+  if (withRes.value && removed) {
+    ElMessage.success(`已解绑全部映射，移除 ${removed} 个资源（重新映射同步后可恢复）`)
+  } else {
+    ElMessage.success('已解绑全部映射（资源保留）')
+  }
+}
+
+/**
  * 左树上那条 ✕：只解绑**这一条**映射。
  *
  * 后端按 mapping_id 精确清理，所以同一个系统目录下别的映射导入的资源
@@ -783,6 +903,101 @@ async function removeResource(data) {
   } catch (e) {
     /* 拦截器已提示 */
   }
+}
+
+/* ============ 快照导出 ============ */
+
+/**
+ * 把当前所有映射（连同每条映射导入的资源清单）导成一份 JSON 留档。
+ *
+ * 为什么值得单独做一个按钮：「解绑全部」动的是整张映射表。资源虽然是软删除、
+ * 重新映射能复活，但「**曾经有哪些远端目录被映射到哪个系统目录**」这个信息
+ * 只存在于映射表里 —— 删之前不落一份，重挂就只能靠翻记录和记忆。
+ * 所以它和「解绑全部」并排放，顺序本身也在提示：先留档，再动手。
+ *
+ * 为什么连资源清单一起导：重新映射后能对回来什么，取决于远端目录还在不在。
+ * 这份清单（标题 + fileId）是「当时到底导进来了哪些」的唯一记录 ——
+ * 只导映射本身，事后没法判断「少的那几集是本来就没有、还是同步没跑到」。
+ */
+async function exportSnapshot() {
+  if (!mappings.value.length) {
+    ElMessage.info('还没有映射，没什么可导出的')
+    return
+  }
+  exporting.value = true
+  try {
+    const rows = []
+    for (const m of mappings.value) {
+      rows.push({
+        id: m.id,
+        name: m.name,
+        accountId: m.accountId,
+        accountNickname: m.account ? m.account.nickname : '',
+        diskType: m.account ? m.account.diskType : '',
+        remoteDirId: m.remoteDirId || '',
+        remoteDirName: m.remoteDirName || '',
+        categoryId: m.categoryId,
+        categoryName: m.category ? m.category.name : '',
+        recursive: !!m.recursive,
+        enabled: !!m.enabled,
+        lastSyncAt: m.lastSyncAt || null,
+        resourceCount: m.resourceCount || 0,
+        resources: await snapshotResources(m.id),
+      })
+    }
+    const dump = {
+      kind: 'littlescholar.mapping-snapshot',
+      exportedAt: new Date().toISOString(),
+      note:
+        '解绑全部映射前的留档。resources 是每条映射当前导入的资源；'
+        + '按 accountId + remoteDirId + categoryId 重新建映射并同步，这些资源会原样回来（id 不变）。',
+      count: rows.length,
+      mappings: rows,
+    }
+    downloadJson(dump, `映射快照-${stamp()}.json`)
+    const total = rows.reduce((n, r) => n + r.resources.length, 0)
+    ElMessage.success(`已导出 ${rows.length} 条映射、${total} 个资源`)
+  } catch (e) {
+    ElMessage.warning('导出失败：' + ((e && e.message) || '未知原因'))
+  } finally {
+    exporting.value = false
+  }
+}
+
+/** 拉全一条映射导入的资源。分页走，pageSize 200 是后端 GetPage 的上限。 */
+async function snapshotResources(mappingId) {
+  const out = []
+  // 50 页 × 200 = 一万条封顶。够用，也避免远端某处对不上时分页转不出去。
+  for (let page = 1; page <= 50; page++) {
+    const res = await resourceApi.list({ mappingId, page, pageSize: 200 })
+    const list = (res && res.list) || []
+    for (const r of list) {
+      out.push({ id: r.id, title: r.title, fileId: r.fileId, ext: r.ext, size: r.totalSize })
+    }
+    const total = Number(res && res.total) || 0
+    if (!list.length || out.length >= total) break
+  }
+  return out
+}
+
+function downloadJson(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  // 立刻 revoke 在个别浏览器上会把下载截断，延后一拍再放。
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+/** 文件名用本地时间到分钟，同一天导两次也不会互相覆盖。 */
+function stamp() {
+  const d = new Date()
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`
 }
 
 /* ============ 明细里的操作 ============ */
@@ -871,7 +1086,20 @@ onMounted(loadAll)
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  /* 按钮多了，窄屏放不下就整块换行，别把说明文字压成一列单字 */
+  flex-wrap: wrap;
   margin-bottom: 12px;
+}
+.mp-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+/* Element Plus 给相邻 el-button 自带的 margin-left 会和上面的 flex gap
+   叠加，不抵消掉的话按钮间距会一宽一窄。 */
+.mp-bar-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
 }
 
 /* ============ 三栏 ============ */

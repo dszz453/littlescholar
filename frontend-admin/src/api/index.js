@@ -129,6 +129,20 @@ export const mappingApi = {
     http.delete(`/admin/mappings/${id}`, {
       params: keepResources ? { withResources: 0 } : {},
     }),
+  // 解绑**全部**映射（用户第 4 条）。
+  //
+  //   · dryRun: true        → 只统计不落库，给二次确认做预览
+  //   · keepResources: true → 只解绑配置，资源留在原处（?withResources=0）
+  //
+  // 预览和真删走的是后端**同一套**清理规则（mappingPurge），所以预览报出来的
+  // 数字就是真删会动的数字 —— 单测专门锁了这条，改后端时别让它们分叉。
+  removeAll: (opts = {}) =>
+    http.delete('/admin/mappings', {
+      params: {
+        ...(opts.keepResources ? { withResources: 0 } : {}),
+        ...(opts.dryRun ? { dryRun: 1 } : {}),
+      },
+    }),
   sync: (id) => http.post(`/admin/mappings/${id}/sync`),
   syncAll: () => http.post('/admin/mappings/sync'),
 }
