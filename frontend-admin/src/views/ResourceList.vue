@@ -168,6 +168,19 @@
           style="width: 220px"
           @keyup.enter="loadLib"
         />
+        <!-- 设置共享：把资源变成"链接 + 提取码"，孩子端才能转存到自己网盘。
+             放在这一页是刻意的 —— 「已收录资源」是唯一一处平铺列出所有资源
+             的地方，用户在这里最容易看出"哪些还没共享"。 -->
+        <el-button
+          size="small"
+          type="primary"
+          plain
+          :disabled="!unsharedLib.length"
+          :loading="sharingLib"
+          @click="shareLibBatch"
+        >
+          设置共享（{{ unsharedLib.length }}）
+        </el-button>
         <el-button :icon="Refresh" @click="loadLib">刷新</el-button>
       </div>
       <el-table
@@ -185,8 +198,49 @@
         <el-table-column label="大小" width="100">
           <template #default="{ row }">{{ formatSize(row.size) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="80" fixed="right">
+        <!-- 共享状态。
+             孩子端点开一个动画能不能"转存到自己网盘后加速"，完全取决于
+             资源上有没有 share_url —— 而这件事以前在后台**完全看不见**，
+             只能等孩子端报一句"资源没有分享链接"。 -->
+        <el-table-column label="共享" width="150">
           <template #default="{ row }">
+            <template v-if="row.shareUrl">
+              <el-tag size="small" type="success" effect="plain">已共享</el-tag>
+              <el-button
+                v-if="row.passcode"
+                link
+                type="primary"
+                size="small"
+                title="复制提取码"
+                @click="copyWithToast(row.passcode, '提取码已复制')"
+              >
+                {{ row.passcode }}
+              </el-button>
+            </template>
+            <el-tag v-else size="small" type="info" effect="plain">未共享</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="130" fixed="right">
+          <template #default="{ row }">
+            <el-button
+              v-if="!row.shareUrl"
+              link
+              type="primary"
+              size="small"
+              :loading="sharingLib"
+              @click="shareLibOne(row)"
+            >
+              共享
+            </el-button>
+            <el-button
+              v-else
+              link
+              type="primary"
+              size="small"
+              @click="openShareLink(row)"
+            >
+              打开链接
+            </el-button>
             <el-button link type="danger" size="small" @click="removeLib(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -287,7 +341,8 @@ import {
   Select,
   Files,
 } from '@element-plus/icons-vue'
-import { diskApi, mappingApi, categoryApi, resourceApi } from '@/api'
+import { diskApi, mappingApi, categoryApi, resourceApi, shareApi } from '@/api'
+import { copyWithToast } from '@/utils/clipboard'
 const accounts = ref([])
 const accountId = ref(null)
 const items = ref([])
@@ -628,6 +683,74 @@ async function removeLib(row) {
   } catch (e) {
     /* 取消 */
   }
+}
+
+/* ============ 设置共享 ============ */
+
+const sharingLib = ref(false)
+
+/**
+ * 当前列表里"还没共享、且有能力共享"的资源。
+ *
+ * 为什么要把没有 fileId 的排掉：手工收录的资源没有网盘文件 ID，
+ * 后端会直接拒绝。把它们算进"待共享"的计数里，用户点完会看到
+ * "失败 N 条"，而他根本无从知道 N 是从哪来的。
+ */
+const unsharedLib = computed(() =>
+  libItems.value.filter((r) => !r.shareUrl && r.fileId)
+)
+
+async function shareLibBatch() {
+  const ids = unsharedLib.value.map((r) => r.id)
+  if (!ids.length) return
+  try {
+    await ElMessageBox.confirm(
+      `为这 ${ids.length} 个资源创建分享链接？孩子端扫的是另一个网盘账号，` +
+        '必须靠这条链接才能把动画转存过去加速播放。',
+      '设置共享',
+      { type: 'info', confirmButtonText: '创建' }
+    )
+  } catch (e) {
+    return
+  }
+  await shareLib(ids)
+}
+
+async function shareLibOne(row) {
+  await shareLib([row.id])
+}
+
+async function shareLib(ids) {
+  sharingLib.value = true
+  try {
+    const res = await shareApi.create({ resourceIds: ids, expireDays: 30 })
+    // ⚠️ 成败按 **failed** 判，不能按"有没有抛异常"：
+    // 网盘拒绝、资源是本地硬盘、缺 fileId 这些情况后端都回 code=0 + failed>0，
+    // 只看异常会把整批失败显示成成功，用户然后去孩子端发现一个都播不了。
+    const failed = res.failed || 0
+    const created = res.created || 0
+    if (failed && !created) {
+      const first = (res.failures && res.failures[0] && res.failures[0].error) || ''
+      ElMessage.error(first ? `创建失败：${first}` : '创建分享失败，请稍后重试')
+    } else if (failed) {
+      ElMessage.warning(`成功 ${created} 条，失败 ${failed} 条`)
+    } else {
+      ElMessage.success(res.message || `成功 ${created} 条`)
+    }
+    await loadLib()
+  } catch (e) {
+    /* 拦截器已提示 */
+  } finally {
+    sharingLib.value = false
+  }
+}
+
+/** 打开分享链接。 */
+function openShareLink(row) {
+  if (!row.shareUrl) return
+  // noopener：不把 window.opener 交给外部站点。分享链接指向网盘，
+  // 属于第三方页面，没必要给它一个回头操作后台的把手。
+  window.open(row.shareUrl, '_blank', 'noopener')
 }
 </script>
 

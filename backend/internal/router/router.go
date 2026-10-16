@@ -92,6 +92,7 @@ func Setup(deps *Deps) *gin.Engine {
 	transcodeH := handler.NewTranscodeHandler(deps.DB, deps.Transcode)
 	aliveH := handler.NewAliveHandler(deps.DB, deps.Alive)
 	mappingH := handler.NewMappingHandler(deps.DB, deps.Encryptor)
+	shareH := handler.NewShareHandler(deps.DB, deps.Encryptor)
 
 	api := r.Group("/api")
 
@@ -253,6 +254,19 @@ func Setup(deps *Deps) *gin.Engine {
 		admin.DELETE("/mappings", mappingH.DeleteAll)
 		admin.POST("/mappings/sync", mappingH.SyncAll) // 必须在 /:id 之前，否则会被当成 id
 		admin.POST("/mappings/:id/sync", mappingH.Sync)
+
+		// 设置共享：把后台网盘账号里的资源变成一条分享链接（链接 + 提取码），
+		// 回写到 resources.share_url / passcode。
+		//
+		// 存在的理由：孩子端 PRO 用的是**家长自己的**网盘账号，与后台
+		// 映射用的账号不是同一个，两者之间唯一的合法通道就是分享链接。
+		// 没有这一步，PRO 拿到的资源详情里 shareUrl 永远是空的，只能
+		// 一路退回小书童的原地址（"资源没有分享链接"），加速形同不存在。
+		admin.POST("/shares", shareH.Create) // ?dryRun=1 只预览
+		// 校验已建的分享对孩子端是否真的可用（分享根目录里能否按 fileId 找到）。
+		// 这是整条链路里唯一"看着全对、其实全错"的环节，所以要能单独跑。
+		admin.POST("/shares/verify", shareH.Verify)
+		admin.DELETE("/shares", shareH.Clear)
 	}
 
 	// ============ C 端（需登录 + 账号有效）============

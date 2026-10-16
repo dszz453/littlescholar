@@ -147,6 +147,57 @@ export const mappingApi = {
   syncAll: () => http.post('/admin/mappings/sync'),
 }
 
+// 设置共享：把后台网盘账号里的资源变成**分享链接 + 提取码**。
+//
+// 为什么这一步是必需的一环：资源是映射进后台那个网盘账号的，
+// 而孩子端 PRO 用的是家长自己扫码接入的**另一个**账号 —— 两个账号之间
+// 唯一的合法通道就是分享链接。没有它，孩子端拿到的资源详情里 shareUrl
+// 永远是空的，只能一路退回小书童的原地址，"加速"形同不存在。
+export const shareApi = {
+  // opts: { resourceId } | { resourceIds: [] } | { mappingId }
+  //       + expireDays（0/省略=默认 30 天，-1=永久）
+  //       + passcode（留空自动生成）
+  //       + force（连已共享过的一起重做）
+  //       + dryRun（只预览，不打网盘接口、不落库）
+  create: (opts = {}) =>
+    http.post(
+      '/admin/shares',
+      {
+        resourceId: opts.resourceId || 0,
+        resourceIds: opts.resourceIds || [],
+        mappingId: opts.mappingId || 0,
+        expireDays: opts.expireDays,
+        passcode: opts.passcode || '',
+        force: !!opts.force,
+      },
+      { params: opts.dryRun ? { dryRun: 1 } : {} }
+    ),
+  // 校验已建的分享对孩子端是否**真的**可用。
+  //
+  // 回答的是整条链路里唯一"看着全对、其实全错"的问题：分享根目录里
+  // 能不能按 **fileId** 找到这个资源。孩子端 PRO 就是按 fileId 挑文件的，
+  // 对不上时它只会说"分享里没有找到指定的文件" —— 而后台看起来一切正常。
+  verify: (opts = {}) =>
+    http.post('/admin/shares/verify', {
+      resourceId: opts.resourceId || 0,
+      resourceIds: opts.resourceIds || [],
+      mappingId: opts.mappingId || 0,
+    }),
+  // 清除库里的分享信息（不动网盘上那条分享本身）。
+  clear: (opts = {}) =>
+    http.delete('/admin/shares', {
+      params: {
+        ...(opts.resourceId ? { resourceId: opts.resourceId } : {}),
+        ...(opts.mappingId ? { mappingId: opts.mappingId } : {}),
+        // 后端按逗号分隔解析：数组走 axios 序列化会变成 ids[]=1&ids[]=2，
+        // 那种形态那边收不到，清理会静默地一条都不动。
+        ...(opts.resourceIds && opts.resourceIds.length
+          ? { resourceIds: opts.resourceIds.join(',') }
+          : {}),
+      },
+    }),
+}
+
 export const transferApi = {
   create: (data) => http.post('/admin/transfer', data),
   batch: (data) => http.post('/admin/transfer/batch', data),

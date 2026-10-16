@@ -2,8 +2,10 @@ package adapter
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // DiskType 网盘类型
@@ -182,6 +184,127 @@ type ShareBrowser interface {
 	// ListShareDir 列出分享内指定目录的内容。
 	// pdirFid 为空或 "0" 表示分享根目录。
 	ListShareDir(ctx context.Context, cred *Credential, shareURL, passcode, pdirFid string) (*ShareEntry, error)
+}
+
+// ============ 创建分享（反方向）============
+
+// ShareExpirePermanent 表示"永久有效"。
+//
+// 语义放在适配器层统一，是因为各家网盘的"永久"取值完全不一样
+// （夸克是 expired_type=1，百度是 period=0 …）。上层的
+// ShareCreateOptions.ExpireDays 用**天数**这一个口径表达意图，
+// 由适配器翻译成自家参数 —— 否则每个调用方都需要知道夸克的 1~7
+// 分别代表多少天，迟早会有人写错。
+const ShareExpirePermanent = -1
+
+// ShareResult 创建分享的结果。
+//
+// Passcode 一定是**真实可用**的那一个 —— 适配器在返回前会用它与
+// ShareURL 做一次解锁验证。这不是洁癖：提取码由服务端生成、
+// 或服务端忽略了调用方提交的值，这两种情况都真实存在，
+// 而症状是"后台显示已共享、孩子端一到转存就说提取码错误"，
+// 排查时完全看不出问题出在创建环节。
+type ShareResult struct {
+	ShareURL string `json:"shareUrl"`
+	Passcode string `json:"passcode"`
+	ShareID  string `json:"shareId"`
+	// ExpireAt 过期时间戳（秒）。0 = 永久有效。
+	ExpireAt int64 `json:"expireAt"`
+}
+
+// ShareCreateOptions 创建分享的可选项。
+type ShareCreateOptions struct {
+	// Title 分享标题（在网盘上显示的名字），空则用适配器默认值。
+	Title string
+	// Passcode 期望的提取码。为空 = 由适配器生成（推荐，
+	// 因为多数网盘对提取码字符集有要求，自己拼一串容易撞上非法字符）。
+	Passcode string
+	// ExpireDays 有效期天数：>0 = 具体天数；0 = 用适配器默认值；
+	// ShareExpirePermanent = 永久。
+	//
+	// 为什么用天数而不是直接暴露各家参数：夸克是 expired_type 的
+	// 1~7（1=永久, 2=1天, 3=7天, 4=30天 …），百度是 period 的
+	// 0/1/7/30。让 UI 记住两套编号只会制造 bug。
+	ExpireDays int
+}
+
+// ShareCreator 是 DiskAdapter 的**可选**能力：把**自己网盘里的**
+// 文件/目录变成一条分享链接。
+//
+// 方向与 ShareBrowser / SaveToDir 相反 —— 那两个是"把别人的分享
+// 搬进我的盘"，这个是"把我盘里的东西分享出去"。本项目的用法：
+// 资源是映射进后台网盘账号的，孩子用的是**另一个**账号扫码接入，
+// 两者之间唯一的合法通道就是一条分享链接。
+//
+// 同样做成可选接口而不是塞进 DiskAdapter：WebDAV / 本地硬盘
+// 根本没有"分享"这个概念，不该被逼着实现一个恒返回 error 的方法。
+type ShareCreator interface {
+	// CreateShare 为 fileIDs 创建**一条**分享（多个 fid 会在分享根
+	// 目录里并列出现）。
+	//
+	// 为什么是一次多文件而不是逐个文件一条分享：夸克这类网盘的
+	// /share 接口本来就收 fid_list，一次分享一个目录下的几十个文件
+	// 只需一次调用；逐个建分享会瞬间打出几十个请求，直接撞上限流。
+	// 而且上层按"一个映射目录一条分享"回写，语义也更自然。
+	CreateShare(ctx context.Context, cred *Credential, fileIDs []string, opt ShareCreateOptions) (*ShareResult, error)
+}
+
+// ShareCreatorOf 取某个网盘类型的"创建分享"能力。
+//
+// 不支持时返回的是一句能直接显示给用户的话，而不是原生的
+// 类型断言失败 —— 后台的按钮点下去要有个说法。
+func ShareCreatorOf(t DiskType) (ShareCreator, error) {
+	a, err := Get(t)
+	if err != nil {
+		return nil, err
+	}
+	sc, ok := a.(ShareCreator)
+	if !ok {
+		name := DiskTypeNames[t]
+		if name == "" {
+			name = string(t)
+		}
+		return nil, fmt.Errorf("%s暂不支持在后台创建分享", name)
+	}
+	return sc, nil
+}
+
+// sharePasscodeAlphabet 提取码字符集。
+//
+// 刻意剔掉容易看错、听错的字符（0/O、1/l/I），因为提取码的常态是
+// 家长在手机上看一眼、再到另一台设备上手动敲进去。少这几个字符
+// 对熵的影响可以忽略，对"一次就敲对"的影响很大。
+const sharePasscodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+
+// RandomPasscode 生成 n 位提取码。
+//
+// 用 crypto/rand 而不是 math/rand：提取码是访问凭据，虽然不是
+// 高价值密钥，但没必要在一个有真随机源的地方留一个可预测的口子。
+//
+// 用取模拒绝而不是直接 `% len(alphabet)`：直接取模会让靠前的字符
+// 出现概率偏高（256 不是字符集大小的整数倍），这种偏斜对 4 位码来说
+// 影响不大，但修掉它只要三行，没有留着的理由。
+func RandomPasscode(n int) string {
+	if n <= 0 {
+		n = 4
+	}
+	const (
+		limit = 256 - (256 % len(sharePasscodeAlphabet)) // 大于等于它的一律丢弃
+	)
+	out := make([]byte, 0, n)
+	buf := make([]byte, 1)
+	for len(out) < n {
+		if _, err := rand.Read(buf); err != nil {
+			// crypto/rand 失败等于系统级故障。退化成固定串而不是 panic：
+			// 后台至少还能把分享建出来，用户看得到链接，也就知道去哪查。
+			return strings.Repeat("a", n)
+		}
+		if int(buf[0]) >= limit {
+			continue
+		}
+		out = append(out, sharePasscodeAlphabet[int(buf[0])%len(sharePasscodeAlphabet)])
+	}
+	return string(out)
 }
 
 // DirectLink 直链信息

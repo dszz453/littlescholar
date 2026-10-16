@@ -6,6 +6,8 @@
         <b>←</b> 挂过来（勾目录 = 建一条映射并递归导入；勾文件 = 只导入这一个），
         <b>→</b> 放回去。
         系统目录展开能一路看到<b>已经导入的每一个资源</b>，每条映射、每个资源旁边都有 ✕ 可以单独取消。
+        资源旁边的<b>「共享」</b>用来创建分享链接 —— 孩子端用的是另一个网盘账号，
+        必须靠这条链接才能把动画转存过去加速播放。
       </span>
       <div class="mp-bar-actions">
         <el-button
@@ -118,6 +120,19 @@
                 >
                   {{ catMapCount(data) }} 条映射
                 </el-tag>
+                <!-- 资源是否已共享。孩子端点开一个动画能不能"转存到自己网盘后加速"，
+                     完全取决于资源上有没有分享链接 —— 而这件事以前在后台**完全看不见**，
+                     只能等孩子端报"资源没有分享链接"。所以状态必须显式标出来。 -->
+                <el-tag
+                  v-if="data.kind === 'resource' && data.shareUrl"
+                  size="small"
+                  type="success"
+                  effect="plain"
+                  class="mp-node-tag"
+                  title="已有分享链接，孩子端可以转存后加速播放"
+                >
+                  已共享
+                </el-tag>
                 <span v-if="data.kind === 'resource'" class="mp-size">
                   {{ fmtSize(data.size) }}
                 </span>
@@ -127,12 +142,26 @@
                      不拦住的话点一次 ✕ 会顺带把节点展开/收起。 -->
                 <button
                   v-if="data.kind === 'mapping'"
+                  class="mp-act mp-act-share"
+                  title="为这条映射下的所有资源创建分享链接（孩子端才能转存到自己的网盘）"
+                  @click.stop="openShare('mapping', data)"
+                >共享</button>
+                <button
+                  v-if="data.kind === 'mapping'"
                   class="mp-act"
                   title="解绑这条映射"
                   @click.stop="unmapOne(data)"
                 >✕</button>
                 <button
-                  v-else-if="data.kind === 'resource'"
+                  v-if="data.kind === 'resource'"
+                  class="mp-act mp-act-share"
+                  :title="data.shareUrl
+                    ? '查看这条资源的分享链接与提取码'
+                    : '为它创建分享链接，孩子端才能转存到自己网盘并加速播放'"
+                  @click.stop="openShare('resource', data)"
+                >{{ data.shareUrl ? '链接' : '共享' }}</button>
+                <button
+                  v-if="data.kind === 'resource'"
                   class="mp-act"
                   title="把这个资源移出目录（其他资源不受影响）"
                   @click.stop="removeResource(data)"
@@ -306,6 +335,84 @@
         <el-button type="primary" :loading="saving" @click="save">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- ============ 设置共享 ============ -->
+    <!--
+      为什么"建分享"要单独做一个弹层、而不是一个安静的按钮：
+      这一步跨越了两个网盘账号（后台映射用的账号 ↔ 孩子端扫码的账号），
+      用户唯一能看到的结果就是链接和提取码，所以他需要**看到**它们、
+      能复制、能确认有效期 —— 而不是收到一句"操作成功"。
+    -->
+    <el-dialog v-model="shareDialog" :title="shareTitle" width="600px">
+      <div class="sh-body">
+        <p class="sh-lead">
+          <template v-if="shareTarget.kind === 'mapping'">
+            为这条映射下的<b>全部资源</b>创建一条分享链接。孩子端扫的是另一个网盘账号，
+            必须靠这条链接才能把这些动画转存过去、然后加速播放。
+          </template>
+          <template v-else>
+            <b>{{ shareTarget.name }}</b> 的分享链接。孩子端用它把这一条转存到自己的网盘，
+            再走直链加速播放。
+          </template>
+        </p>
+
+        <el-form label-width="88px" class="sh-form">
+          <el-form-item label="有效期">
+            <el-radio-group v-model="shareForm.expireDays" size="small">
+              <el-radio-button :value="30">30 天</el-radio-button>
+              <el-radio-button :value="-1">永久</el-radio-button>
+            </el-radio-group>
+            <!-- 只给这两档不是偷懒：夸克 expired_type 的中间几档在不同
+                 参考资料里编号互相矛盾，猜错的后果是链接在用户没预期的
+                 时候失效，且要到失效那天才发现。 -->
+            <span class="sh-hint">只提供已验证的两档</span>
+          </el-form-item>
+          <el-form-item label="提取码">
+            <el-input
+              v-model="shareForm.passcode"
+              size="small"
+              placeholder="留空自动生成"
+              maxlength="8"
+              style="width:180px"
+            />
+            <span class="sh-hint">留空时由网盘生成 4 位码</span>
+          </el-form-item>
+          <el-form-item v-if="shareTarget.kind === 'mapping'" label="已有分享">
+            <el-checkbox v-model="shareForm.force" size="small">
+              重新生成（否则只补没共享过的）
+            </el-checkbox>
+            <!-- 默认"只补缺"是可逆性考虑：老链接可能已经给过人、
+                 或已经让孩子端转过存，每次点按钮都重做一遍等于把它们作废。 -->
+          </el-form-item>
+        </el-form>
+
+        <div v-if="shareResult" class="sh-result">
+          <div class="sh-line">
+            <span class="sh-k">链接</span>
+            <el-input v-model="shareResult.shareUrl" size="small" readonly />
+            <el-button size="small" @click="copyText(shareResult.shareUrl)">复制</el-button>
+          </div>
+          <div class="sh-line">
+            <span class="sh-k">提取码</span>
+            <el-input v-model="shareResult.passcode" size="small" readonly style="width:120px" />
+            <el-button size="small" @click="copyText(shareResult.passcode)">复制</el-button>
+          </div>
+          <p class="sh-summary">{{ shareResult.summary }}</p>
+        </div>
+      </div>
+      <template #footer>
+        <el-button v-if="shareTarget.kind === 'resource' && shareTarget.hasShare" @click="clearShare">
+          清除共享
+        </el-button>
+        <el-button v-if="shareResult" :loading="shareVerifying" @click="verifyShare">
+          验证共享
+        </el-button>
+        <el-button @click="shareDialog = false">关闭</el-button>
+        <el-button type="primary" :loading="shareBusy" @click="doShare">
+          {{ shareResult ? '再生成一次' : '创建分享' }}
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -313,7 +420,8 @@
 import { computed, h, nextTick, onMounted, ref } from 'vue'
 import { ElCheckbox, ElMessage, ElMessageBox } from 'element-plus'
 import { Download, Refresh, RefreshRight } from '@element-plus/icons-vue'
-import { diskApi, mappingApi, categoryApi, resourceApi } from '@/api'
+import { diskApi, mappingApi, categoryApi, resourceApi, shareApi } from '@/api'
+import { copyWithToast } from '@/utils/clipboard'
 import RemoteDirTree from '@/components/RemoteDirTree.vue'
 
 const mappings = ref([])
@@ -608,6 +716,11 @@ async function mappingResources(mappingId) {
       mediaType: r.mediaType,
       ext: r.ext,
       size: r.totalSize,
+      // 共享状态：孩子端 PRO 能不能转存、能不能加速，全看这两个字段有没有值。
+      // 放到节点上是为了让"这个资源没有分享链接"在树上直接可见 ——
+      // 否则只能等到孩子端点开某个动画、看到"资源没有分享链接"才知道。
+      shareUrl: r.shareUrl || '',
+      passcode: r.passcode || '',
       isLeaf: true,
     }))
     // 截断了必须说出来，否则"怎么少了几集"会被当成同步没跑完。
@@ -1218,6 +1331,197 @@ async function syncAll() {
   }
 }
 
+/* ============ 设置共享 ============ */
+
+/**
+ * 把后台网盘账号里的资源变成一条分享链接。
+ *
+ * 这一步为什么必须有：资源是映射进**后台那个**网盘账号的，而孩子端 PRO
+ * 扫的是**家长自己的**账号。两个账号之间没有别的通道 —— 孩子端拿到的
+ * 资源详情里如果没有 shareUrl，它就只会退回小书童的原地址，
+ * 界面上表现为"能播但一点不加速"，而且看不出任何错误。
+ *
+ * 分享的粒度刻意是**一条映射一次**而不是一条资源一次：
+ * 网盘的建分享接口本来就收 fid 列表，一次调用就能覆盖整个目录；
+ * 逐条建分享会瞬间打出几十个请求撞上限流，也会把用户的"我的分享"
+ * 列表塞满几十条孤立链接（见后端 shareChunkSize 的注释）。
+ */
+const shareDialog = ref(false)
+const shareBusy = ref(false)
+const shareTarget = ref({ kind: 'mapping', id: 0, name: '', hasShare: false })
+const shareForm = ref({ expireDays: 30, passcode: '', force: false })
+const shareResult = ref(null)
+
+const shareTitle = computed(() =>
+  shareTarget.value.kind === 'mapping'
+    ? `设置共享 · ${shareTarget.value.name || '这条映射'}`
+    : `设置共享 · ${shareTarget.value.name || '资源'}`
+)
+
+function openShare(kind, data) {
+  shareResult.value = null
+  shareForm.value = { expireDays: 30, passcode: '', force: false }
+  shareTarget.value = {
+    kind,
+    id: kind === 'mapping' ? data.mappingId : data.resourceId,
+    name: data.name,
+    hasShare: !!(data && data.shareUrl),
+    // 单条资源可能已经有链接，直接把现值摆出来，省一次点击
+    shareUrl: (data && data.shareUrl) || '',
+    passcode: (data && data.passcode) || '',
+  }
+  if (kind === 'resource' && data.shareUrl) {
+    shareResult.value = {
+      shareUrl: data.shareUrl,
+      passcode: data.passcode || '',
+      summary: '这条资源已经有分享链接，孩子端已在用它。',
+    }
+  }
+  shareDialog.value = true
+}
+
+async function doShare() {
+  const t = shareTarget.value
+  shareBusy.value = true
+  try {
+    const req = {
+      expireDays: shareForm.value.expireDays,
+      passcode: shareForm.value.passcode,
+      force: shareForm.value.force,
+    }
+    if (t.kind === 'mapping') req.mappingId = t.id
+    else req.resourceId = t.id
+
+    const res = await shareApi.create(req)
+
+    // ⚠️ 成功与否按 **failed** 判，不是按 HTTP 通不通。
+    // 后端在"资源是 WebDAV / 缺 fileId / 网盘拒绝"这些情况下都会回
+    // code=0 + failed>0 —— 只看有没有抛异常，会把整批失败显示成成功。
+    const failed = res.failed || 0
+    const created = res.created || 0
+    if (failed && !created) {
+      ElMessage.error(res.failures && res.failures.length
+        ? `创建失败：${res.failures[0].error}`
+        : '创建分享失败，请稍后重试')
+      shareResult.value = {
+        shareUrl: '',
+        passcode: '',
+        summary: `失败 ${failed} 条`+(res.failures && res.failures.length ? `：${res.failures[0].error}` : ''),
+      }
+      return
+    }
+
+    let shareUrl = ''
+    let passcode = ''
+    let summary = res.message || ''
+    if (t.kind === 'resource') {
+      // 单条：把链接取回来直接给用户看，省得再去树上点一次
+      const r = await resourceApi.detail(t.id)
+      shareUrl = (r && r.shareUrl) || ''
+      passcode = (r && r.passcode) || ''
+    } else {
+      // 批量：链接是同一条（整批资源共用一个分享），从第一条有分享的资源上取。
+      // 取不到就只报数字，不编造一个链接出来。
+      const r = await resourceApi.list({ mappingId: t.id, pageSize: 1 })
+      const first = (r && r.list && r.list[0]) || null
+      if (first && first.shareUrl) {
+        shareUrl = first.shareUrl
+        passcode = first.passcode || ''
+      }
+      summary = `成功 ${created} 条，跳过 ${skippedOf(res)} 条已共享，失败 ${failed} 条`
+    }
+    if (failed) summary += `（有 ${failed} 条失败）`
+
+    shareResult.value = { shareUrl, passcode, summary }
+    ElMessage.success(summary)
+    // 树上的「已共享」角标要跟着变。这里用**局部刷新**而不是重建整棵树 ——
+    // 用户可能正展开着某一级目录找下一个要处理的东西。
+    await refreshLeftTree()
+  } catch (e) {
+    /* 拦截器已提示 */
+  } finally {
+    shareBusy.value = false
+  }
+}
+
+function skippedOf(res) {
+  return res && typeof res.skipped === 'number' ? res.skipped : 0
+}
+
+/**
+ * 验证共享：把"孩子端到底能不能用这条分享"问清楚。
+ *
+ * 为什么值得单独给一个按钮：加速失败的表现是"能播、但不加速"，
+ * 而原因可能有三层 —— 没建分享 / 分享里的 fileId 对不上 / 账号登录态失效。
+ * 这三层在界面上长得一模一样。验证接口会逐条回答，家长自己就能判断
+ * 是该重新设置共享，还是该重新扫码接入账号。
+ */
+const shareVerifying = ref(false)
+
+async function verifyShare() {
+  const t = shareTarget.value
+  shareVerifying.value = true
+  try {
+    const req = t.kind === 'mapping' ? { mappingId: t.id } : { resourceId: t.id }
+    const res = await shareApi.verify(req)
+    const found = res.found || 0
+    const missing = res.missing || 0
+    if (!missing) {
+      ElMessage.success(`校验通过：${found} 条资源在分享里都能按 fileId 找到`)
+    } else {
+      const first = (res.items || []).find((x) => !x.found && x.note)
+      ElMessage.warning(
+        `${found} 条通过、${missing} 条未通过` + (first ? `：${first.note}` : '')
+      )
+    }
+  } catch (e) {
+    /* 拦截器已提示 */
+  } finally {
+    shareVerifying.value = false
+  }
+}
+
+async function clearShare() {
+  const t = shareTarget.value
+  try {
+    await ElMessageBox({
+      title: '清除共享',
+      type: 'warning',
+      showCancelButton: true,
+      confirmButtonText: '清除',
+      cancelButtonText: '取消',
+      message: h('div', { style: 'line-height:1.7;font-size:13.5px' }, [
+        h('p', { style: 'margin:0 0 8px' }, '清除后台记录里的分享链接与提取码？'),
+        h('p', { style: 'margin:0;color:#909399;font-size:12px' },
+          '只清后台这一份记录，不会去删除网盘上那条分享本身。'
+          + '清除后孩子端就转存不了这一条了（已转存成功的仍可播放）。'),
+      ]),
+    })
+  } catch (e) {
+    return
+  }
+  try {
+    await shareApi.clear({ resourceId: t.id })
+    ElMessage.success('已清除')
+    shareDialog.value = false
+    await refreshLeftTree()
+  } catch (e) {
+    /* 拦截器已提示 */
+  }
+}
+
+/**
+ * 复制到剪贴板。
+ *
+ * 具体实现抽到 utils/clipboard.js：**必须**带 execCommand 兜底，
+ * 因为后台很可能跑在 http（非 https）下，那种来源里 navigator.clipboard
+ * 是 undefined，直接 await 会抛 TypeError —— 现象是"点了复制没反应"，
+ * 而复制分享链接恰恰是这个界面最高频的操作。
+ */
+async function copyText(text) {
+  await copyWithToast(text)
+}
+
 onMounted(loadAll)
 </script>
 
@@ -1346,6 +1650,51 @@ onMounted(loadAll)
 .mp-act:hover {
   color: #fff;
   background: #f56c6c;
+}
+
+/* 「共享」按钮与 ✕ 同形但不同色：两者挨着，靠得太近的破坏性操作
+   必须一眼能区分，不能都长一个样。 */
+.mp-act-share:hover {
+  color: #fff;
+  background: #409eff;
+}
+
+/* ============ 设置共享弹层 ============ */
+.sh-lead {
+  margin: 0 0 14px;
+  font-size: 13.5px;
+  line-height: 1.75;
+}
+.sh-form {
+  margin-bottom: 4px;
+}
+.sh-hint {
+  margin-left: 10px;
+  font-size: 12px;
+  color: var(--ls-text-secondary, #909399);
+}
+.sh-result {
+  margin-top: 6px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--ls-fill-light, #f5f7fa);
+}
+.sh-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.sh-k {
+  flex: 0 0 42px;
+  font-size: 12px;
+  color: var(--ls-text-secondary, #909399);
+}
+.sh-summary {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ls-text-secondary, #909399);
 }
 
 /* ============ 中间箭头 ============ */

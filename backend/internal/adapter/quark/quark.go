@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,17 @@ const (
 	// 「夸克扫码总是提示过期」的直接原因。
 	qrTTL = 180 * time.Second
 )
+
+// driveBase 云盘接口的基地址，默认就是 `baseURL`。
+//
+// 之所以在常量之外再包一层变量：创建分享那条链路（建任务 → 取 share_id
+// → 兑换 share_url → 回验提取码）必须能被单测指向 httptest 服务器，
+// 而常量没法替换 —— 测试会静默打到真实的 drive-pc.quark.cn 上，
+// 表现为"单测偶尔失败、还带着网络抖动"，而不是一眼看出没隔离。
+//
+// 只有走 `URL:` 字段的请求用这个变量；扫码那几条 CAS 接口用的是
+// uop.quark.cn，与它无关，仍走各自常量。
+var driveBase = baseURL
 
 func init() {
 	adapter.Register(New())
@@ -324,7 +336,7 @@ func (q *Quark) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 	}
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     baseURL + "/file/sort",
+		URL:     driveBase + "/file/sort",
 		Headers: q.headers(cred.Cookie),
 		Query: map[string]string{
 			"pr":       "ucpro",
@@ -370,7 +382,7 @@ func (q *Quark) MakeDir(ctx context.Context, cred *adapter.Credential, parentID,
 	}
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     baseURL + "/file",
+		URL:     driveBase + "/file",
 		Headers: q.headers(cred.Cookie),
 		Query:   map[string]string{"pr": "ucpro", "fr": "pc"},
 		Body: map[string]interface{}{
@@ -393,7 +405,7 @@ func (q *Quark) MakeDir(ctx context.Context, cred *adapter.Credential, parentID,
 func (q *Quark) DeleteFile(ctx context.Context, cred *adapter.Credential, fileIDs []string) error {
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     baseURL + "/file/delete",
+		URL:     driveBase + "/file/delete",
 		Headers: q.headers(cred.Cookie),
 		Query:   map[string]string{"pr": "ucpro", "fr": "pc"},
 		Body:    map[string]interface{}{"action_type": 2, "filelist": fileIDs, "exclude_fids": []string{}},
@@ -405,7 +417,7 @@ func (q *Quark) DeleteFile(ctx context.Context, cred *adapter.Credential, fileID
 func (q *Quark) Rename(ctx context.Context, cred *adapter.Credential, fileID, newName string) error {
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     baseURL + "/file/rename",
+		URL:     driveBase + "/file/rename",
 		Headers: q.headers(cred.Cookie),
 		Query:   map[string]string{"pr": "ucpro", "fr": "pc"},
 		Body:    map[string]interface{}{"fid": fileID, "file_name": newName},
@@ -491,7 +503,7 @@ func (q *Quark) listShareFiles(ctx context.Context, cred *adapter.Credential, pw
 	}
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     baseURL + "/share/sharepage/detail",
+		URL:     driveBase + "/share/sharepage/detail",
 		Headers: q.headers(cred.Cookie),
 		Query: map[string]string{
 			"pr":            "ucpro",
@@ -574,7 +586,7 @@ func (q *Quark) getShareToken(ctx context.Context, cred *adapter.Credential, pwd
 	}
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     baseURL + "/share/sharepage/token",
+		URL:     driveBase + "/share/sharepage/token",
 		Headers: q.headers(cred.Cookie),
 		Query:   map[string]string{"pr": "ucpro", "fr": "pc"},
 		Body:    map[string]interface{}{"pwd_id": pwdID, "passcode": passcode},
@@ -634,7 +646,7 @@ func (q *Quark) SaveToDir(ctx context.Context, cred *adapter.Credential, share *
 	}
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     baseURL + "/share/sharepage/save",
+		URL:     driveBase + "/share/sharepage/save",
 		Headers: q.headers(cred.Cookie),
 		Query:   map[string]string{"pr": "ucpro", "fr": "pc"},
 		Body: map[string]interface{}{
@@ -705,7 +717,7 @@ func (q *Quark) waitTask(ctx context.Context, cred *adapter.Credential, taskID s
 		}
 		_, err := q.http.DoJSON(ctx, &adapter.Request{
 			Method:  "GET",
-			URL:     baseURL + "/task",
+			URL:     driveBase + "/task",
 			Headers: q.headers(cred.Cookie),
 			Query: map[string]string{
 				"pr": "ucpro", "fr": "pc",
@@ -743,6 +755,233 @@ func (q *Quark) Transfer(ctx context.Context, cred *adapter.Credential, shareURL
 		return nil, err
 	}
 	return q.SaveToDir(ctx, cred, share, targetDirID)
+}
+
+// ============ 创建分享（后台「设置共享」）============
+
+// 夸克 expired_type 里只用**两份参考实现一致**的那两个取值。
+//
+// ⚠️ 中间几档（1 天 / 7 天 / 60 天 / 100 天 / 180 天）在不同实现里的
+// 编号互相矛盾（一份文档写 2=1天，另一份写 2=7天），而照抄错一档的
+// 后果是链接在用户没预期的时刻失效 —— 且只有到失效那天才会发现。
+// 本项目只需要"30 天"与"永久"这两个语义，就不去碰那些不确定的编号。
+// 将来要加别的时长，先拿真实账号验一遍再往 quarkExpireTable 里加。
+const (
+	quarkExpire30Days    = 4
+	quarkExpirePermanent = 1
+)
+
+// quarkExpireTable 天数 -> expired_type。只列验证过的档位。
+var quarkExpireTable = map[int]int{30: quarkExpire30Days}
+
+// CreateShare 在**自己的**网盘里为 fileIDs 建一条分享，返回链接与提取码。
+//
+// 三步链路（少一步都拿不到最终链接，且中间态都"看起来成功"）：
+//
+//	POST /share            建分享任务 -> data.task_id
+//	GET  /task?task_id=..  取任务结果 -> data.share_id
+//	POST /share/password   兑换      -> data.share_url（可能带 data.passcode）
+//
+// 关键约定：
+//
+//   - url_type=2 是**私密链接**，即带提取码的那种；url_type=1 是公开链接，
+//     不需要提取码。本项目要的是"链接 + 分享码"，所以固定用 2。
+//   - 提取码只在第 1 步提交；第 3 步只传 share_id。分两处传同一个值
+//     等于给自己制造两套口径，服务端忽略其中之一时根本看不出来。
+//   - 返回**之前**会用 passcode 真去解锁一次。服务端可能忽略我们提交的
+//     提取码、自己生成一个（参考实现里就明确写着"由服务端自动生成后
+//     返回"），这时若只把我们提交的值存进库，后台会显示一条"已共享、
+//     码却是错的"资源 —— 现象是孩子端一转存就报提取码错误，而
+//     后台那一页看着一切正常。
+func (q *Quark) CreateShare(ctx context.Context, cred *adapter.Credential, fileIDs []string, opt adapter.ShareCreateOptions) (*adapter.ShareResult, error) {
+	fids := make([]string, 0, len(fileIDs))
+	for _, f := range fileIDs {
+		if s := strings.TrimSpace(f); s != "" {
+			fids = append(fids, s)
+		}
+	}
+	if len(fids) == 0 {
+		return nil, fmt.Errorf("没有要分享的文件")
+	}
+
+	title := strings.TrimSpace(opt.Title)
+	if title == "" {
+		title = "小书童资源"
+	}
+	passcode := strings.TrimSpace(opt.Passcode)
+	if passcode == "" {
+		passcode = adapter.RandomPasscode(4)
+	}
+
+	// 有效期：默认 30 天，可选永久。其余天数直接拒绝而不是"就近取一档" ——
+	// 悄悄把 7 天变成 30 天看着无害，但用户以为链接 7 天后失效、
+	// 于是没做任何续期安排，实际却是另一种行为，属于骗人的默认值。
+	expType := quarkExpire30Days
+	var expireAt int64 = time.Now().Add(30 * 24 * time.Hour).Unix()
+	if opt.ExpireDays == adapter.ShareExpirePermanent {
+		expType, expireAt = quarkExpirePermanent, 0
+	} else if opt.ExpireDays > 0 {
+		t, ok := quarkExpireTable[opt.ExpireDays]
+		if !ok {
+			return nil, fmt.Errorf("夸克网盘暂不支持 %d 天的分享有效期，请选 30 天或永久", opt.ExpireDays)
+		}
+		expType = t
+		expireAt = time.Now().Add(time.Duration(opt.ExpireDays) * 24 * time.Hour).Unix()
+	}
+
+	// ① 建分享任务
+	var createResp struct {
+		Status  int    `json:"status"`
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			TaskID  string `json:"task_id"`
+			ShareID string `json:"share_id"`
+		} `json:"data"`
+	}
+	_, err := q.http.DoJSON(ctx, &adapter.Request{
+		Method:  "POST",
+		URL:     driveBase + "/share",
+		Headers: q.headers(cred.Cookie),
+		Query:   map[string]string{"pr": "ucpro", "fr": "pc", "uc_param_str": ""},
+		Body: map[string]interface{}{
+			"fid_list":     fids,
+			"title":        title,
+			"url_type":     2,
+			"expired_type": expType,
+			"passcode":     passcode,
+		},
+	}, &createResp)
+	if err != nil {
+		return nil, err
+	}
+	if createResp.Status != 200 || createResp.Code != 0 {
+		return nil, fmt.Errorf("创建分享失败: status=%d code=%d msg=%s",
+			createResp.Status, createResp.Code, createResp.Message)
+	}
+
+	shareID := createResp.Data.ShareID
+	if shareID == "" {
+		if createResp.Data.TaskID == "" {
+			return nil, fmt.Errorf("创建分享失败：服务端既没返回 share_id 也没返回 task_id")
+		}
+		if shareID, err = q.waitShareID(ctx, cred, createResp.Data.TaskID); err != nil {
+			return nil, err
+		}
+	}
+
+	// ② 用 share_id 兑换出可访问的分享链接
+	var pwResp struct {
+		Status  int    `json:"status"`
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			ShareURL  string `json:"share_url"`
+			Passcode  string `json:"passcode"`
+			ExpiredAt int64  `json:"expired_at"`
+		} `json:"data"`
+	}
+	_, err = q.http.DoJSON(ctx, &adapter.Request{
+		Method:  "POST",
+		URL:     driveBase + "/share/password",
+		Headers: q.headers(cred.Cookie),
+		Query:   map[string]string{"pr": "ucpro", "fr": "pc", "uc_param_str": ""},
+		Body:    map[string]interface{}{"share_id": shareID},
+	}, &pwResp)
+	if err != nil {
+		return nil, err
+	}
+	shareURL := strings.TrimSpace(pwResp.Data.ShareURL)
+	if pwResp.Status != 200 || pwResp.Code != 0 || shareURL == "" {
+		return nil, fmt.Errorf("创建分享失败：未取到分享链接（status=%d code=%d msg=%s）",
+			pwResp.Status, pwResp.Code, pwResp.Message)
+	}
+	// 服务端回了提取码就以它为准 —— 那是真正生效的那个。
+	if p := strings.TrimSpace(pwResp.Data.Passcode); p != "" {
+		passcode = p
+	}
+	// 服务端回了过期时刻就以它为准：我们请求的是"30 天"，而服务端
+	// 可能因为账号等级把有效期压短，显示我们算出来的值就是在骗人。
+	if pwResp.Data.ExpiredAt > 0 {
+		expireAt = pwResp.Data.ExpiredAt
+	}
+
+	// ③ 回验：这条链接 + 这个提取码，真的能解锁吗？
+	pwdID := extractPwdID(shareURL)
+	if pwdID == "" {
+		return nil, fmt.Errorf("分享已创建，但链接形态无法识别，请到网盘里手动确认：%s", shareURL)
+	}
+	if _, err := q.getShareToken(ctx, cred, pwdID, passcode); err != nil {
+		return nil, fmt.Errorf("分享已创建，但用提取码 %s 解锁失败，未写入库（避免存下一个用不了的链接）：%w", passcode, err)
+	}
+
+	return &adapter.ShareResult{
+		ShareURL: shareURL,
+		Passcode: passcode,
+		ShareID:  shareID,
+		ExpireAt: expireAt,
+	}, nil
+}
+
+// waitShareID 轮询分享任务，等出 share_id。
+//
+// 与转存的 waitTask 分开写而不是复用：两者取的结果字段不同
+// （这里要 share_id，那边只看成功/失败），而且这里的失败重试策略
+// 也不一样 —— 复用会把两件事的语义搅在一起，将来改一边就伤另一边。
+func (q *Quark) waitShareID(ctx context.Context, cred *adapter.Credential, taskID string) (string, error) {
+	deadline := time.Now().Add(45 * time.Second)
+	var lastMsg string
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(time.Duration(600+attempt*400) * time.Millisecond):
+		}
+		var resp struct {
+			Status  int    `json:"status"`
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Data    struct {
+				Status  int    `json:"status"`
+				ShareID string `json:"share_id"`
+				Message string `json:"message"`
+			} `json:"data"`
+			Metadata struct {
+				MissingCapacity int64 `json:"missing_capacity"`
+			} `json:"metadata"`
+		}
+		_, err := q.http.DoJSON(ctx, &adapter.Request{
+			Method:  "GET",
+			URL:     driveBase + "/task",
+			Headers: q.headers(cred.Cookie),
+			Query: map[string]string{
+				"pr": "ucpro", "fr": "pc",
+				"task_id": taskID, "retry_index": strconv.Itoa(attempt),
+			},
+		}, &resp)
+		if err != nil {
+			continue
+		}
+		if resp.Data.ShareID != "" {
+			return resp.Data.ShareID, nil
+		}
+		// data.status：2=成功，3=失败。顶层 code 非 0 同样是终态失败。
+		if resp.Data.Status == 3 || resp.Code != 0 {
+			msg := resp.Data.Message
+			if msg == "" {
+				msg = resp.Message
+			}
+			return "", fmt.Errorf("%s", adapter.TaskErrorText("夸克网盘", resp.Code, msg,
+				resp.Metadata.MissingCapacity, 0))
+		}
+		if m := resp.Data.Message; m != "" {
+			lastMsg = m
+		}
+	}
+	if lastMsg == "" {
+		lastMsg = "任务超时"
+	}
+	return "", fmt.Errorf("创建分享的任务未在预期时间内完成: %s", lastMsg)
 }
 
 // ============ 播放 / 下载 ============
@@ -846,7 +1085,7 @@ func (q *Quark) fetchLink(ctx context.Context, cookie, fileID string) (*adapter.
 	}
 	_, err := q.http.DoJSON(ctx, &adapter.Request{
 		Method:  "POST",
-		URL:     baseURL + "/file/download",
+		URL:     driveBase + "/file/download",
 		Headers: q.headers(cookie),
 		Query:   map[string]string{"pr": "ucpro", "fr": "pc"},
 		Body:    map[string]interface{}{"fids": []string{fileID}},

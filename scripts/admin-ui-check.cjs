@@ -76,8 +76,24 @@ const MAPPINGS = [
 const RESOURCES = [
   { id: 11, mappingId: 1, title: '第01集', ext: 'mp4', mediaType: 'video', totalSize: 10485760, fileId: 'f11' },
   { id: 12, mappingId: 1, title: '第02集', ext: 'mp4', mediaType: 'video', totalSize: 10485760, fileId: 'f12' },
-  { id: 13, mappingId: 2, title: 'RAZ-A', ext: 'pdf', mediaType: 'pdf', totalSize: 5242880, fileId: 'f13' },
+  // 这一条故意做成"已共享"：界面上必须能看出区别（差一个「已共享」角标、
+  // 按钮文案也从「共享」变成「链接」）。全都不共享的话，两种形态里
+  // 只有一种被测到，另一种出错也看不出来。
+  {
+    id: 13, mappingId: 2, title: 'RAZ-A', ext: 'pdf', mediaType: 'pdf',
+    totalSize: 5242880, fileId: 'f13',
+    shareUrl: 'https://pan.quark.cn/s/existing', passcode: 'a1b2',
+  },
 ];
+
+// 设置共享的返回。数字刻意与 RESOURCES 里"未共享"的条数（2 条）一致 ——
+// 编一个对不上的数字，界面上那句汇总就成了没人能核对的噪音。
+const SHARE_CREATED = {
+  dryRun: false, total: 2, created: 2, skipped: 0, failed: 0,
+  groups: [{ accountId: 4, accountName: '家长夸克', diskType: 'quark', planned: 2, created: 2, skipped: 0, failed: 0 }],
+  failures: [],
+  message: '成功 2 条，跳过 0 条，失败 0 条',
+};
 
 // 预览与执行都报 5 个资源，其中 2 个是历史资源
 const PURGE_STATS = {
@@ -126,6 +142,30 @@ function mockFor(method, pathAndQuery) {
     const mid = Number(url.searchParams.get('mappingId')) || 0;
     const list = RESOURCES.filter((r) => r.mappingId === mid);
     return { code: 0, data: { list, total: list.length, page: 1, pageSize: 200 } };
+  }
+  // 单条资源详情：设置共享成功后前端要用它把**真实**的链接/提取码回显出来。
+  if (/^\/api\/admin\/resources\/\d+$/.test(p)) {
+    const id = Number(p.split('/').pop());
+    const r = RESOURCES.find((x) => x.id === id) || RESOURCES[0];
+    return { code: 0, data: { ...r, shareUrl: 'https://pan.quark.cn/s/created001', passcode: 'k3m9' } };
+  }
+  if (p === '/api/admin/shares' && method === 'POST') {
+    // 建完之后，这些资源在后续列表里就**该有**分享链接了。
+    // 不模拟这一步的话，界面上的"回显链接"永远测不到 ——
+    // 而它恰恰是用户唯一能核对的东西。
+    // （这里不解析请求体去区分范围：拦截层拿不到 body，
+    //   而对这几条断言来说"建完就有了"已经足够。）
+    for (const r of RESOURCES) {
+      r.shareUrl = 'https://pan.quark.cn/s/created001';
+      r.passcode = 'k3m9';
+    }
+    return { code: 0, data: SHARE_CREATED };
+  }
+  if (p === '/api/admin/shares/verify') {
+    return {
+      code: 0,
+      data: { checked: 2, found: 2, missing: 0, unshared: 0, items: [], truncated: false },
+    };
   }
   // 其余一律给空对象：避免某个次要请求报错、弹全局提示干扰断言。
   // ⚠️ 兜底必须是 `{}` 而不是 `null` —— 页面里到处是 `res.xxx` 这种取值，
@@ -496,6 +536,7 @@ async function main() {
   // 于是 afterCount 恒为 0 —— 用户就得一级一级把目录重新点开。
   eq('刷新后展开的节点数不变（不再整棵重建）', afterCount, beforeCount);
   eq('刷新后展开的还是原来那个目录', afterName, beforeName);
+  await shot('f-tree-expanded.png', true);
 
   // ============ 概览页：版本项 ============
   //
@@ -525,6 +566,117 @@ async function main() {
     truthy(`构建信息渲染出来了（${build}）`, build.includes('a1b2c3d'));
   }
   await shot('e-dashboard.png', true);
+
+  // ============ 设置共享 ============
+  //
+  // 这一节的必要性：整条"孩子端加速播放"链路上，后台唯一要做的事就是
+  // **给资源建一条分享链接**。而这一步的失败方式极其隐蔽 ——
+  // 分享建成了、链接也能打开，但孩子端是按 fileId 在分享里挑文件的，
+  // 对不上时它只会说"分享里没有找到指定的文件"，后台看起来一切正常。
+  // 所以这里必须真点、真渲染，并且断言**回显出来的链接不是空的**：
+  // 只断言"弹层打开了"的话，一个永远显示空白输入框的坏法也能过。
+  console.log('[10] 设置共享：入口 → 弹层 → 回显链接与提取码');
+  await cmd('Page.navigate', { url: base + '/resources/mapping' });
+  if (!await waitFor(
+    `!!document.querySelector('.mp-cols > .mp-col:first-child .el-tree-node__expand-icon')`
+  )) {
+    no('映射页没渲染出来，后面的共享断言全部跳过');
+  } else {
+    // 展开「英语」→ 两条映射节点出现
+    await evaluate(`
+      (function(){
+        var ic = document.querySelector('.mp-cols > .mp-col:first-child .el-tree-node__expand-icon');
+        if (ic) ic.click();
+      })()
+    `);
+    await sleep(700);
+
+    // 按名字点某个映射节点上的那颗按钮。
+    // ⚠️ 必须用 :scope > 逐层限定：el-tree 的节点是嵌套的，
+    // 直接 node.querySelector('.mp-node-name') 会先命中**子节点**，
+    // 于是"点牛津树"变成"点了它下面的第一条资源"。
+    //
+    // 找不到时把**实际看到的节点名**一起返回：这类"选择器没命中"
+    // 的断言如果只说"没点到"，排查的人只能靠猜。
+    const clickNodeBtn = (name, sel) => `
+      (function(){
+        var nodes = document.querySelectorAll('.mp-cols > .mp-col:first-child .el-tree-node');
+        var seen = [];
+        for (var i = 0; i < nodes.length; i++) {
+          var nm = nodes[i].querySelector(':scope > .el-tree-node__content .mp-node-name');
+          if (!nm) continue;
+          var t = nm.textContent.trim();
+          seen.push(t);
+          if (t === ${JSON.stringify(name)}) {
+            var b = nodes[i].querySelector(':scope > .el-tree-node__content ' + ${JSON.stringify(sel)});
+            if (b) { b.click(); return { ok: true, seen: seen }; }
+            return { ok: false, why: '节点找到了但没有 ' + ${JSON.stringify(sel)}, seen: seen };
+          }
+        }
+        return { ok: false, why: '没找到名为 ' + ${JSON.stringify(name)} + ' 的节点', seen: seen };
+      })()
+    `;
+
+    truthy('映射节点上有「共享」入口', await evaluate(`
+      document.querySelectorAll('.mp-cols > .mp-col:first-child .mp-act-share').length >= 2
+    `));
+
+    const clickRes = await evaluate(clickNodeBtn('牛津树', '.mp-act-share'));
+    truthy(
+      '点开了「牛津树」这条映射的共享',
+      clickRes && clickRes.ok
+    );
+    if (!clickRes || !clickRes.ok) {
+      console.log(`      · 实际看到的节点：${JSON.stringify((clickRes && clickRes.seen) || [])}`);
+      console.log(`      · 原因：${(clickRes && clickRes.why) || '未知'}`);
+    }
+    if (!await waitFor(`!!document.querySelector('.sh-body')`)) {
+      no('共享弹层没打开');
+    } else {
+      const title = ((await evaluate(
+        `(document.querySelector('.el-dialog__title') || {}).textContent || ''`
+      )) || '').trim();
+      truthy(`弹层标题带上了目标名（${title}）`, title.includes('设置共享') && title.includes('牛津树'));
+
+      const radios = await evaluate(`
+        Array.from(document.querySelectorAll('.sh-form .el-radio-button__inner')).map(function(e){
+          return e.textContent.trim();
+        })
+      `);
+      eq('有效期只给已验证的两档', (radios || []).join('/'), '30 天/永久');
+      truthy('有自动生成提取码的输入框', await evaluate(
+        `!!document.querySelector('.sh-form input[placeholder="留空自动生成"]')`
+      ));
+      truthy('映射批量时有「重新生成」开关', await evaluate(`
+        (document.body.textContent || '').indexOf('重新生成') >= 0
+      `));
+
+      // 创建
+      await evaluate(`
+        (function(){
+          var btns = document.querySelectorAll('.el-dialog__footer button');
+          var b = btns[btns.length - 1];
+          if (b) b.click();
+        })()
+      `);
+      if (!await waitFor(`!!document.querySelector('.sh-result input')`, 6000)) {
+        no('创建后没有回显结果区');
+      } else {
+        const link = ((await evaluate(`document.querySelector('.sh-result input').value`)) || '');
+        const code = ((await evaluate(`
+          (document.querySelectorAll('.sh-result input')[1] || {}).value || ''
+        `)) || '');
+        // 这两条是本节的核心：界面上必须给出**真的**链接与提取码。
+        truthy(`回显了分享链接（${link}）`, link.indexOf('pan.quark.cn') >= 0);
+        truthy(`回显了提取码（${code}）`, !!code);
+
+        truthy('有「验证共享」入口', await evaluate(`
+          (document.body.textContent || '').indexOf('验证共享') >= 0
+        `));
+      }
+      await shot('g-share-dialog.png', true);
+    }
+  }
 
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   console.log(`截图目录：${OUT}`);
