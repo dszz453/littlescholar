@@ -788,18 +788,25 @@ async function unmapAll() {
   const withRes = ref(true)
   const WORD = '全部解绑'
   try {
-    await ElMessageBox({
-      title: '解绑全部映射',
-      type: 'warning',
-      showCancelButton: true,
-      confirmButtonText: '确定解绑全部',
-      cancelButtonText: '取消',
-      inputPlaceholder: `输入「${WORD}」才能确认`,
-      inputValidator: (v) => (v === WORD ? true : `请原样输入「${WORD}」`),
-      // ⚠️ 这里的文案一律是**静态**的，不要在 h() 里读 withRes.value。
-      // ElMessageBox 的 message 是一次性渲染的 VNode，不会因为 ref 变化重渲染，
-      // 读它只会得到一个永远停在初始值的数字。
-      message: h('div', { style: 'line-height:1.7;font-size:13.5px' }, [
+    // ⚠️⚠️ 必须用 `ElMessageBox.prompt`，**不能**写成 `ElMessageBox({...})`。
+    //
+    // Element Plus 里这两句判断都只认 prompt 变体：
+    //   · 校验：`if (props.boxType === 'prompt' && action === 'confirm' && !validate()) return`
+    //     （在 index.vue 的 handleAction 里）
+    //   · 输入框：`showInput` 只由 `MessageBox.prompt` 自动带上，或在 options 里显式传；
+    //     `inputType` 只是 props（默认 'text'），**不决定渲染与否**。
+    //
+    // 写成普通 `ElMessageBox({...})` 的后果非常隐蔽：弹窗看着一切正常 ——
+    // 标题、说明、勾选框、两个按钮全都在，**只是没有输入框**，
+    // 而 inputValidator 也永远不会被调用。于是「手打确认词」这层防护
+    // 静默失效，用户点一下确定就直接清空整张映射表。
+    //
+    // 这个坑是 scripts/admin-ui-check.cjs 截图抓出来的（截图里弹窗没有输入框）。
+    // 那个脚本现在有两条硬断言守着：输入框必须存在、空着点确定弹窗必须不关。
+    await ElMessageBox.prompt(
+      // 文案一律**静态**：ElMessageBox 的 message 是一次性渲染的 VNode，
+      // 在里面读 withRes.value 只会拿到初始值，不会随勾选更新。
+      h('div', { style: 'line-height:1.7;font-size:13.5px' }, [
         h('p', { style: 'margin:0 0 10px' }, [
           '将解绑全部 ',
           h('b', [String(preview.mappings || 0)]),
@@ -830,7 +837,16 @@ async function unmapAll() {
             )
           : null,
       ]),
-    })
+      '解绑全部映射',
+      {
+        type: 'warning',
+        showCancelButton: true,
+        confirmButtonText: '确定解绑全部',
+        cancelButtonText: '取消',
+        inputPlaceholder: `输入「${WORD}」才能确认`,
+        inputValidator: (v) => (v === WORD ? true : `请原样输入「${WORD}」`),
+      }
+    )
   } catch (e) {
     return // 取消
   }
