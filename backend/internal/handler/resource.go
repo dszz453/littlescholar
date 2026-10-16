@@ -149,6 +149,13 @@ func (h *ResourceHandler) checkLinks(ctx context.Context, items []service.CheckL
 func (h *ResourceHandler) List(c *gin.Context) {
 	page, pageSize := util.GetPage(c)
 	categoryID := util.GetUintQuery(c, "categoryId", 0)
+	// mappingId：「资源映射」页左树展开一条映射时，列出它**这一条**导入的资源。
+	//
+	// 为什么按 mapping_id 而不是按 (账号 + 远端目录) 现推：同一个远端目录
+	// 完全可能被先后映射两次（线上发生过：夸克一次、WebDAV 又一次），
+	// 按目录推会把另一条映射的资源也算进来 —— 用户点开「牛津树-夸克」
+	// 却看到 WebDAV 那份重名的，然后以为"取消单个没生效"。
+	mappingID := util.GetUintQuery(c, "mappingId", 0)
 	keyword := c.Query("keyword")
 	diskType := c.Query("diskType")
 	status := c.Query("status")
@@ -192,6 +199,9 @@ func (h *ResourceHandler) List(c *gin.Context) {
 	}
 	if keyword != "" {
 		q = q.Where("title "+likeOp(h.db)+" ?", "%"+keyword+"%")
+	}
+	if mappingID > 0 {
+		q = q.Where("mapping_id = ?", mappingID)
 	}
 	if diskType != "" {
 		q = q.Where("disk_type = ?", diskType)
@@ -403,9 +413,9 @@ func (h *ResourceHandler) Create(c *gin.Context) {
 		Cover:       req.Cover,
 		MediaType:   orDefaultMedia(req.MediaType),
 		// 手工建的资源也要记扩展名：转码判定靠它，不能只在导入链路上写。
-		Ext:         service.ExtOfName(req.Title),
-		Tags:        model.StringArray(req.Tags),
-		Status:      model.ResourceStatusUnknown,
+		Ext:    service.ExtOfName(req.Title),
+		Tags:   model.StringArray(req.Tags),
+		Status: model.ResourceStatusUnknown,
 	}
 	if err := h.db.Create(res).Error; err != nil {
 		util.ServerError(c, "创建失败")

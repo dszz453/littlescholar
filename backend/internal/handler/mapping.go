@@ -57,7 +57,62 @@ func (h *MappingHandler) List(c *gin.Context) {
 		util.ServerError(c, "查询失败")
 		return
 	}
+	h.fillResourceCounts(list)
 	util.OK(c, list)
+}
+
+// fillResourceCounts 给每条映射补上"当前导入了几个资源"。
+//
+// 用一次 GROUP BY 而不是逐条 Count —— 映射页每次加载都会调它，
+// 逐条查在映射多起来之后就是几十次往返。
+//
+// ⚠️ 聚合结果**必须用 Rows() 手工按序扫**，不能写成
+//
+//	Select("mapping_id, COUNT(*) AS n").Scan(&[]struct{...})
+//
+// 那种写法在本仓库踩过坑：一旦列名和自定义结构的字段名对不上，gorm 是
+// **静默丢弃**该列（不报错、不警告），拿到一片零值。而且 sqlite（单测）
+// 与 postgres（线上）对列名大小写的处理不同，症状正好是
+// "单测全绿、线上整列为 0"。见 project memory 的后端铁律第 3 条。
+//
+// 还有一处同样致命：必须 Model(&model.Resource{}) 而不是 Table("resources")。
+// 只有 Model() 会自动补 `deleted_at IS NULL` —— 用 Table() 会把用户刚刚
+// 「取消」掉的资源也数进去，列表里明明写着 26、点进去只有 20。
+func (h *MappingHandler) fillResourceCounts(list []model.ResourceMapping) {
+	if len(list) == 0 {
+		return
+	}
+	ids := make([]uint64, 0, len(list))
+	for i := range list {
+		ids = append(ids, list[i].ID)
+	}
+
+	rows, err := h.db.Model(&model.Resource{}).
+		Select("mapping_id, COUNT(*)").
+		Where("mapping_id IN ?", ids).
+		Group("mapping_id").Rows()
+	if err != nil {
+		log.Printf("[mapping] 统计映射资源数失败: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	counts := make(map[uint64]int64, len(list))
+	for rows.Next() {
+		var id uint64
+		var n int64
+		if err := rows.Scan(&id, &n); err != nil {
+			log.Printf("[mapping] 读取映射资源数失败: %v", err)
+			return
+		}
+		counts[id] = n
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[mapping] 遍历映射资源数失败: %v", err)
+	}
+	for i := range list {
+		list[i].ResourceCount = counts[list[i].ID]
+	}
 }
 
 type mappingRequest struct {
@@ -146,14 +201,23 @@ func (h *MappingHandler) Update(c *gin.Context) {
 	util.OKWithMessage(c, "已保存", nil)
 }
 
-// Delete 删除映射。
+// Delete 解绑映射。
 //
-// 默认只删映射本身，已导入的资源保留 —— 删资源不可逆，不该被
-// 一个"取消配置"的动作顺带触发。
+// ============ 资源怎么办：默认一起移除，而且是**软删除** ============
 //
-// 但只删映射会留下一批用户**已经不想要**的孤儿资源：线上真实发生过，
-// 用户删掉映射后孩子端依然列着那 26 集，看着像"删除没生效"。
-// 所以这里提供一个显式开关 ?withResources=1，让调用方选择连带清理。
+// 2026-10-16 用户拍板：解绑映射时，由这条映射导入的资源走**软删除**。
+// 这条决定的直接后果有两个，都在下面实现了：
+//
+//  1. 默认值反转。原先是"默认只删映射、资源保留"，理由是"删资源不可逆"。
+//     资源改成软删除之后这个理由不成立了：既然能恢复，就该默认做用户
+//     直觉上要的那件事 —— 把资源一起拿掉。保留孤儿资源反而出过事故：
+//     用户删掉映射后孩子端依然列着那 26 集，只能读成"删除没生效"。
+//     仍然可以用 `?withResources=0` 显式要求"只解绑、资源留着"。
+//
+//  2. 软删除这一刀要**能被同步正确对待**。资源留着软删行，下次同步
+//     如果重新 INSERT，就会堆垃圾行、并且换掉资源 id（孩子的收藏和
+//     播放进度全断）。复活的逻辑在 service.ImportService.Register 里，
+//     那里有完整说明 —— 改这里时别把那条路径踩断。
 //
 // 用 Unscoped 查映射是刻意的：对一条**之前只删了映射**的记录，这样还能再补一次
 // 「连带清理资源」，不必回滚重建映射。
@@ -171,14 +235,15 @@ func (h *MappingHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	withResources := c.Query("withResources") == "1" || c.Query("withResources") == "true"
+	// 只有显式写 0/false 才是"资源留着"；不传 = 一起移除。
+	keepResources := c.Query("withResources") == "0" || c.Query("withResources") == "false"
 
-	if !withResources {
+	if keepResources {
 		if err := h.db.Delete(&model.ResourceMapping{}, id).Error; err != nil {
 			util.ServerError(c, "删除失败")
 			return
 		}
-		util.OKWithMessage(c, "已删除映射（已导入的资源保留）", nil)
+		util.OKWithMessage(c, "已解绑映射（已导入的资源保留）", nil)
 		return
 	}
 
@@ -231,9 +296,13 @@ func (h *MappingHandler) Delete(c *gin.Context) {
 		return
 	}
 	removed := scoped + legacy
-	msg := fmt.Sprintf("已删除映射，并清理 %d 条已导入的资源", removed)
+	// 措辞用「移除」而不是「删除」，并把**可恢复**写进提示：
+	// 这里是软删除，重新映射后同步会把资源原样带回来。
+	// 说成"彻底删了"会让用户不敢用这个按钮。
+	msg := fmt.Sprintf("已解绑映射，并移除 %d 个资源（重新映射同步后可恢复）", removed)
 	if legacy > 0 {
-		msg = fmt.Sprintf("已删除映射，并清理 %d 条已导入的资源（其中 %d 条为历史资源）", removed, legacy)
+		msg = fmt.Sprintf("已解绑映射，并移除 %d 个资源（其中 %d 个为历史资源；重新映射同步后可恢复）",
+			removed, legacy)
 	}
 	util.OKWithMessage(c, msg, gin.H{
 		"removedResources": removed,

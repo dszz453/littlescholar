@@ -45,6 +45,17 @@ type ResourceMapping struct {
 
 	Account  *DiskAccount `gorm:"foreignKey:AccountID" json:"account,omitempty"`
 	Category *Category    `gorm:"foreignKey:CategoryID" json:"category,omitempty"`
+
+	// ResourceCount 这条映射**当前**导入了多少条资源（不含已软删除的）。
+	//
+	// 只读、不进库（gorm:"-"）：它是列表接口现算出来的，存下来只会给自己
+	// 制造不一致 —— 资源可以被单条移除、可以被批量删、还能被映射重建时
+	// 改变归属，任何一处漏更新，列表上的数字就开始骗人。
+	//
+	// 存在的意义是让「资源映射」页左树在**展开之前**就能标出
+	// "这条映射底下有多少个资源"。没有它，用户只能一个个点开看，
+	// 而"这条映射到底倒进来东西没有"恰恰是他最想确认的事。
+	ResourceCount int64 `gorm:"-" json:"resourceCount"`
 }
 
 func (ResourceMapping) TableName() string { return "resource_mappings" }

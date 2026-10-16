@@ -2,9 +2,10 @@
   <div class="mapping-panel">
     <div class="mp-bar">
       <span class="text-secondary">
-        左边是系统目录，右边是接入源。勾选两边的目录，用中间的箭头搬运：
-        <b>→</b> 把网盘目录挂到系统目录下，<b>←</b> 把挂好的放回去。
-        系统目录展开后能看到它下面<b>已经挂了哪些网盘目录</b>，再展开就是网盘里的内容。
+        左边是系统目录，右边是接入源。左边勾系统目录、右边勾要挂进来的内容，用中间的箭头搬运：
+        <b>→</b> 挂过来（勾目录 = 建一条映射并递归导入；勾文件 = 只导入这一个），
+        <b>←</b> 放回去。
+        系统目录展开能一路看到<b>已经导入的每一个资源</b>，每条映射、每个资源旁边都有 ✕ 可以单独取消。
       </span>
       <div>
         <el-button
@@ -22,13 +23,17 @@
 
     <!-- ============ 三栏操作区 ============ -->
     <div class="mp-cols">
-      <!-- 左：系统目录（已映射的网盘目录直接长在它下面） -->
+      <!-- 左：系统目录（已映射的网盘目录直接长在它下面，再往下是它导入的资源） -->
       <div class="mp-col">
         <div class="mp-col-head">
           <span class="mp-col-title">系统目录</span>
           <span class="text-secondary">{{ catCheckedIds.length }} 个已选</span>
         </div>
         <div class="mp-col-body" v-loading="leftLoading">
+          <!-- ⚠️ 左树保持 check-strictly（不联动）。用户 2026-10-16 明确：
+               "勾选上级默认全勾"只作用在**右侧**资源树。左树这边的勾选是
+              "选一个系统目录"，联动只会把它的子孙目录一起带进勾选集，
+              而 canMap 要求恰好一个目录 —— 一联动就永远挂不上去。 -->
           <el-tree
             ref="catTreeRef"
             :key="leftKey"
@@ -44,12 +49,23 @@
           >
             <template #default="{ data }">
               <span class="mp-node">
-                <span v-if="data.kind === 'mapping'" class="mp-icon">☁️</span>
+                <span class="mp-icon">{{ nodeIcon(data) }}</span>
                 <span
                   class="mp-node-name"
-                  :class="{ 'is-mapping': data.kind === 'mapping', 'is-off': data.kind === 'mapping' && !data.enabled }"
+                  :class="{
+                    'is-mapping': data.kind === 'mapping',
+                    'is-off': data.kind === 'mapping' && !data.enabled,
+                    'is-resource': data.kind === 'resource',
+                  }"
+                  :title="data.remotePath || data.name"
                 >{{ data.name }}</span>
 
+                <!-- ⚠️ 这几颗标签一律用**独立的 v-if**，不要写成 v-else-if 链。
+                     写成链条时，只要前面某一环是 v-if（比如上面那两颗 mapping 的），
+                     后面的 v-else-if 就挂在**最近的那一个** v-if 上 ——
+                     于是 kind === 'category' 时整条链全 false，
+                     "N 条映射"永远不显示。这种错编译不报、页面上只是"少了个角标"，
+                     极容易一直留着。 -->
                 <el-tag
                   v-if="data.kind === 'mapping'"
                   size="small"
@@ -60,15 +76,16 @@
                   {{ diskName(data.diskType) }}{{ data.enabled ? '' : ' · 已停用' }}
                 </el-tag>
                 <el-tag
-                  v-else-if="data.kind === 'remote'"
+                  v-if="data.kind === 'mapping' && data.resourceCount"
                   size="small"
+                  type="info"
                   effect="plain"
                   class="mp-node-tag"
                 >
-                  {{ data.isDir ? '目录' : fmtSize(data.size) }}
+                  {{ data.resourceCount }} 个资源
                 </el-tag>
                 <el-tag
-                  v-else-if="data.mapCount"
+                  v-if="data.kind === 'category' && data.mapCount"
                   size="small"
                   type="success"
                   effect="plain"
@@ -76,6 +93,25 @@
                 >
                   {{ data.mapCount }} 条映射
                 </el-tag>
+                <span v-if="data.kind === 'resource'" class="mp-size">
+                  {{ fmtSize(data.size) }}
+                </span>
+
+                <!-- 单个取消：挂错了就地下掉，不必去下面那张明细表里找。
+                     ⚠️ 必须 .stop —— el-tree 的行点击会冒泡到节点上，
+                     不拦住的话点一次 ✕ 会顺带把节点展开/收起。 -->
+                <button
+                  v-if="data.kind === 'mapping'"
+                  class="mp-act"
+                  title="解绑这条映射"
+                  @click.stop="unmapOne(data)"
+                >✕</button>
+                <button
+                  v-else-if="data.kind === 'resource'"
+                  class="mp-act"
+                  title="把这个资源移出目录（其他资源不受影响）"
+                  @click.stop="removeResource(data)"
+                >✕</button>
               </span>
             </template>
           </el-tree>
@@ -105,7 +141,10 @@
       <div class="mp-col">
         <div class="mp-col-head">
           <span class="mp-col-title">接入源目录</span>
-          <span class="text-secondary">{{ remoteChecked.length }} 个已选</span>
+          <!-- 这里显示的是**裁剪后**的待挂项数，不是树上勾了几个格子。
+              勾一个父目录会把子孙一起勾上（联动），但真正要建的映射只有
+              父目录那一条 —— 显示格子数会让人以为要建十几条。 -->
+          <span class="text-secondary">{{ remoteChecked.length }} 项待挂</span>
         </div>
         <div class="mp-col-body">
           <RemoteDirTree
@@ -114,6 +153,7 @@
             :mapped-keys="mappedKeys"
             :show-toolbar="false"
             multiple
+            include-files
             @check="onRemoteCheck"
           />
         </div>
@@ -152,6 +192,16 @@
               <el-tag size="small" type="info" effect="plain">
                 {{ row.category?.name || '目录#' + row.categoryId }}
               </el-tag>
+            </template>
+          </el-table-column>
+          <!-- 已导入的资源数（后端现算，不含软删的）。
+              它是"这条映射到底干活了没有"最直接的证据 ——
+               没有它，用户只能解绑时才知道倒进来几条。 -->
+          <el-table-column label="资源" width="70" align="center">
+            <template #default="{ row }">
+              <span :class="row.resourceCount ? 'text-ok' : 'text-secondary'">
+                {{ row.resourceCount || 0 }}
+              </span>
             </template>
           </el-table-column>
           <el-table-column label="递归" width="64">
@@ -232,7 +282,7 @@
 import { computed, h, onMounted, ref } from 'vue'
 import { ElCheckbox, ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, RefreshRight } from '@element-plus/icons-vue'
-import { diskApi, mappingApi, categoryApi } from '@/api'
+import { diskApi, mappingApi, categoryApi, resourceApi } from '@/api'
 import RemoteDirTree from '@/components/RemoteDirTree.vue'
 
 const mappings = ref([])
@@ -356,29 +406,81 @@ function mapNode(m) {
     remoteDirId: m.remoteDirId,
     diskType: m.account ? m.account.diskType : '',
     enabled: m.enabled,
+    // 后端列表接口现算出来的（gorm:"-"），左树在**展开之前**就能标出
+    // "这条映射倒进来几个资源"。没有它，用户只能一条条点开看。
+    resourceCount: m.resourceCount || 0,
   }
 }
 
-/** 列出某个远端目录的内容（映射节点、以及它下面的子目录都用它）。 */
-async function remoteChildren(accountId, remoteDirId) {
+/**
+ * 目录与资源用**不同图标**（用户第 2 条明确要求）。
+ *
+ * 光靠缩进区分是不够的：映射点开之后，一行"01.mp4"和一行子目录
+ * 在视觉上几乎一样，而它们一个是资源、一个是远端目录，能做的操作完全不同。
+ */
+function nodeIcon(data) {
+  if (data.kind === 'mapping') return '☁️'
+  if (data.kind === 'resource') return mediaIcon(data)
+  if (data.kind === 'note') return '⋯'
+  return '🗂'
+}
+
+function mediaIcon(data) {
+  const ext = String(data.ext || '').toLowerCase()
+  if (data.mediaType === 'video') return '🎬'
+  if (data.mediaType === 'audio') return '🎵'
+  if (data.mediaType === 'image') return '🖼️'
+  if (data.mediaType === 'pdf') return '📕'
+  if (/^(mp4|mkv|avi|mov|wmv|flv|rmvb|rm|ts|m3u8|webm|m4v|mpg|mpeg|3gp)$/.test(ext)) return '🎬'
+  if (/^(mp3|wav|flac|aac|m4a|ogg|wma|ape)$/.test(ext)) return '🎵'
+  if (ext === 'pdf') return '📕'
+  return '📄'
+}
+
+/**
+ * 展开一条映射：列出它**当前导入的资源**。
+ *
+ * ============ 左树为什么不再往下钻远端目录 ============
+ *
+ * 早先映射节点展开的是"远端目录里有什么"（还能继续往下钻）。用户
+ * 2026-10-16 要的是"左树显示到具体播放资源"—— 即**已经进来的东西**，
+ * 而不是"对面还有什么"。这两件事长在同一棵树上会互相打架：
+ * 一个回答"库里有什么"，一个回答"网盘里有什么"，混在一起之后
+ * 用户看到一集视频根本分不清"已经导进来了"还是"只是网盘里有"。
+ *
+ * 远端长什么样，右边那棵树一直在给，而且现在还多了勾到单文件的能力。
+ *
+ * 顺带解决了另一个诉求：孩子端点开的每一集都能在这里对上账 ——
+ * 看得到，也能单独下掉。
+ */
+async function mappingResources(mappingId) {
   try {
-    const res = await diskApi.browse(accountId, remoteDirId)
-    return (res && res.items ? res.items : []).map((it) => ({
-      // 远端 id 在不同账号下可能重名，加账号前缀保证 node-key 唯一
-      id: `r-${accountId}-${it.id}`,
-      name: it.name,
-      kind: 'remote',
-      isDir: !!it.isDir,
-      size: it.size,
-      accountId,
-      remoteDirId: it.id,
-      // 文件没有下级，别给它渲染展开箭头
-      isLeaf: !it.isDir,
-      // 远端内容只是"给你看里面有什么"，不是操作对象，不给勾选框
-      disabled: true,
+    // pageSize 上限就是 200（见 util.GetPage），这里要的就是一次尽量多拿。
+    const res = await resourceApi.list({ mappingId, pageSize: 200 })
+    const items = (res && res.list) || []
+    const nodes = items.map((r) => ({
+      id: `res-${r.id}`,
+      name: r.title || `资源#${r.id}`,
+      kind: 'resource',
+      resourceId: r.id,
+      mappingId,
+      mediaType: r.mediaType,
+      ext: r.ext,
+      size: r.totalSize,
+      isLeaf: true,
     }))
+    // 截断了必须说出来，否则"怎么少了几集"会被当成同步没跑完。
+    if (res && res.total > items.length) {
+      nodes.push({
+        id: `res-more-${mappingId}`,
+        name: `…还有 ${res.total - items.length} 个资源，请在下面的明细表里查看`,
+        kind: 'note',
+        isLeaf: true,
+      })
+    }
+    return nodes
   } catch (e) {
-    ElMessage.warning('远端目录打不开：' + ((e && e.message) || '账号可能失效或网络不通'))
+    ElMessage.warning('读取这条映射的资源失败：' + ((e && e.message) || '未知原因'))
     return []
   }
 }
@@ -390,11 +492,11 @@ async function loadLeftNode(node, resolve) {
     return
   }
   const d = node.data || {}
-  if (d.kind === 'mapping' || (d.kind === 'remote' && d.isDir)) {
-    resolve(await remoteChildren(d.accountId, d.remoteDirId))
+  if (d.kind === 'mapping') {
+    resolve(await mappingResources(d.mappingId))
     return
   }
-  if (d.kind === 'remote') {
+  if (d.kind !== 'category') {
     resolve([])
     return
   }
@@ -436,15 +538,29 @@ function withDescendants(ids) {
   return keep
 }
 
-/* ============ → 映射 ============ */
+/* ============ → 挂过去 ============ */
+//
+// 右树现在能勾到**文件**，于是这个按钮要处理两类目标，走两条完全不同的路：
+//
+//   · 目录 → 建一条**映射**（持久绑定，以后每次同步都按它重扫）；
+//   · 文件 → 直接登记成**一条资源**（一次性，不属于任何映射）。
+//
+// 为什么文件不走映射：映射的语义是"这个远端目录对应这个系统目录"。
+// 一条只指向单个文件的映射会让"同步"变成一个说不清的动作（远端那个文件
+// 改名或消失之后，这条映射每次同步都要报一次错）。用户要的只是
+// "这一集我要"，登记一条资源就够 —— 而且它 mapping_id=0，
+// 将来解绑同目录的映射时也不会被误伤。
 async function doMap() {
   const catId = Number(catCheckedIds.value.map(String).filter((k) => !k.startsWith('map-'))[0])
   const targets = remoteChecked.value
   if (!catId || !targets.length) return
 
+  const dirs = targets.filter((t) => !t.isFile)
+  const files = targets.filter((t) => t.isFile)
+
   const created = []
   const failed = []
-  for (const t of targets) {
+  for (const t of dirs) {
     try {
       const res = await mappingApi.create({
         name: t.dirName || t.path,
@@ -461,16 +577,46 @@ async function doMap() {
     }
   }
 
-  if (failed.length) ElMessage.warning(`有 ${failed.length} 条没挂上：${failed.join('；')}`)
-  if (!created.length) return
+  // 单文件：按账号分组调一次导入接口（一次请求登记一批，别一个文件一趟）。
+  let fileAdded = 0
+  const byAccount = new Map()
+  for (const f of files) {
+    if (!byAccount.has(f.accountId)) byAccount.set(f.accountId, [])
+    byAccount.get(f.accountId).push(f)
+  }
+  for (const [accountId, list] of byAccount) {
+    try {
+      const r = await resourceApi.importFromDisk({
+        categoryId: catId,
+        accountId,
+        items: list.map((f) => ({
+          fileId: f.dirId,
+          title: f.dirName,
+          size: f.size,
+          isDir: false,
+        })),
+        recursive: false,
+      })
+      fileAdded += Number(r && r.created) || 0
+      if (r && r.message) failed.push(r.message)
+    } catch (e) {
+      failed.push(`单文件导入失败（${(e && e.message) || '失败'}）`)
+    }
+  }
+
+  if (failed.length) ElMessage.warning(`有 ${failed.length} 项没挂上：${failed.join('；')}`)
+  if (!created.length && !fileAdded) return
 
   await loadAll()
   remoteTreeRef.value?.clearChecked()
 
   // 建完直接同步一次 —— 只挂映射不导资源的话孩子端还是空的，
   // 用户会以为"没生效"。这里多花几秒，换掉一次困惑。
-  const syncMsg = await syncIds(created)
-  ElMessage.success(`已挂上 ${created.length} 条映射${syncMsg}`)
+  const syncMsg = created.length ? await syncIds(created) : ''
+  const parts = []
+  if (created.length) parts.push(`${created.length} 条映射`)
+  if (fileAdded) parts.push(`${fileAdded} 个文件`)
+  ElMessage.success(`已挂上 ${parts.join('、')}${syncMsg}`)
 }
 
 async function syncIds(ids) {
@@ -493,6 +639,80 @@ async function syncIds(ids) {
 }
 
 /* ============ ← 解绑 ============ */
+
+/**
+ * 解绑前问一句。返回值：
+ *   null  → 用户取消
+ *   true  → 连同已导入的资源一起移除（默认）
+ *   false → 只解绑配置，资源留着
+ *
+ * 默认值定成"一起移除"是刻意的：资源走**软删除**（用户 2026-10-16 拍板），
+ * 重新映射再同步就能原样回来（连 id 都不变），所以没什么可犹豫的。
+ * 早先默认"只解绑"，理由是"删资源不可逆" —— 那个理由已经不成立了。
+ */
+async function askUnmap(hits, title) {
+  const withRes = ref(true)
+  const names = hits.slice(0, 5).map((m) => m.name).join('、')
+  const more = hits.length > 5 ? ` 等 ${hits.length} 条` : ''
+  try {
+    await ElMessageBox({
+      title: title || '解绑映射',
+      type: 'warning',
+      showCancelButton: true,
+      confirmButtonText: '确定解绑',
+      cancelButtonText: '取消',
+      message: h('div', [
+        h('p', { style: 'margin:0 0 12px' }, `将解绑 ${hits.length} 条映射：${names}${more}`),
+        h(
+          ElCheckbox,
+          {
+            modelValue: withRes.value,
+            'onUpdate:modelValue': (v) => {
+              withRes.value = v
+            },
+          },
+          () => '同时移除已导入的资源'
+        ),
+        h(
+          'p',
+          { style: 'margin:8px 0 0;color:#909399;font-size:12px;line-height:1.6' },
+          h('span', [
+            '移除是',
+            h('b', ['软删除']),
+            '：以后把同样的目录重新映射、再同步一次，资源会原样回来（连 id 都不变，'
+              + '孩子的播放进度和收藏都还在）。不勾选则只解绑配置、资源留在原处。',
+          ])
+        ),
+      ]),
+    })
+  } catch (e) {
+    return null // 取消
+  }
+  return withRes.value
+}
+
+async function unmap(hits, title) {
+  const withResources = await askUnmap(hits, title)
+  if (withResources === null) return
+
+  let done = 0
+  let removed = 0
+  const failed = []
+  for (const m of hits) {
+    try {
+      // keepResources = !withResources（见 api/index.js 里对参数反转的说明）
+      const res = await mappingApi.remove(m.id, !withResources)
+      done++
+      removed += Number(res && res.removedResources) || 0
+    } catch (e) {
+      failed.push((e && e.message) || '失败')
+    }
+  }
+  await loadAll()
+  if (failed.length) ElMessage.warning(`解绑了 ${done} 条，${failed.length} 条失败：${failed[0]}`)
+  else ElMessage.success(`已解绑 ${done} 条映射${removed ? `，移除 ${removed} 个资源（可恢复）` : ''}`)
+}
+
 async function doUnmap() {
   const keys = catCheckedIds.value.map(String)
   // 直接勾了"已挂的映射"节点 → 就解绑那几条
@@ -508,57 +728,61 @@ async function doUnmap() {
     ElMessage.info('选中的目录下没有映射')
     return
   }
+  await unmap(hits)
+}
 
-  // 删资源不可逆，所以摆到明面上让用户选，而不是替他决定。
-  // 默认勾上：用户的直觉就是"把这个资源拿回去"，留孤儿资源反而会被当成没生效。
-  const withResources = ref(true)
-  const names = hits.slice(0, 5).map((m) => m.name).join('、')
-  const more = hits.length > 5 ? ` 等 ${hits.length} 条` : ''
+/**
+ * 左树上那条 ✕：只解绑**这一条**映射。
+ *
+ * 后端按 mapping_id 精确清理，所以同一个系统目录下别的映射导入的资源
+ * 一条都不会被牵连 —— 这正是用户第 2 条要的"取消单个，同文件夹其他资源保留"。
+ */
+async function unmapOne(data) {
+  const m = mappings.value.find((x) => x.id === data.mappingId)
+  if (!m) return
+  await unmap([m], '解绑这条映射')
+}
+
+/**
+ * 把**一个**资源移出系统目录（软删除），同一条映射导入的其他资源不受影响。
+ *
+ * 早先只能整体解绑：想让孩子端少一集，只能把整条映射拆掉重来，
+ * 于是同目录里其他几十集也跟着消失。这就是用户第 2 条要解决的问题。
+ *
+ * 走后端的资源批量删除接口，和「资源列表 → 删除」是同一条路 ——
+ * 不另造一套"取消"语义，免得两处行为迟早不一致。
+ */
+async function removeResource(data) {
+  // 资源来自哪里，决定了"移出之后还会不会回来"，这一点必须如实说：
+  //   · 目录映射同步进来的（mappingId > 0）→ 下次同步会把它**复活**回来；
+  //   · 手工 / 单文件导入的（mappingId = 0）→ 没有任何映射会重新导入它。
+  // 不说清楚，用户点完发现它又回来了，只会认为按钮坏了。
+  const fromMapping = !!data.mappingId
   try {
     await ElMessageBox({
-      title: '解绑映射',
+      title: '移出资源',
       type: 'warning',
       showCancelButton: true,
-      confirmButtonText: '确定解绑',
+      confirmButtonText: '移出',
       cancelButtonText: '取消',
-      message: h('div', [
-        h('p', { style: 'margin:0 0 12px' }, `将解绑 ${hits.length} 条映射：${names}${more}`),
-        h(
-          ElCheckbox,
-          {
-            modelValue: withResources.value,
-            'onUpdate:modelValue': (v) => {
-              withResources.value = v
-            },
-          },
-          () => '同时移除已导入的资源'
-        ),
-        h(
-          'p',
-          { style: 'margin:8px 0 0;color:#909399;font-size:12px;line-height:1.6' },
-          '勾选后，这些映射同步进来的资源会从资源列表和孩子端一并移除（不可撤销）；不勾选则只解绑配置、资源保留。'
-        ),
+      message: h('div', { style: 'line-height:1.7;font-size:13.5px' }, [
+        h('p', { style: 'margin:0 0 8px' }, `把「${data.name}」移出系统目录？`),
+        h('p', { style: 'margin:0;color:#909399;font-size:12px' }, fromMapping
+          ? '它是由这一条映射同步进来的，同一条映射的其他资源不受影响。'
+            + '但它下次同步会重新出现 —— 要它彻底不回来，请解绑左树上对应的映射。'
+          : '它是单独导入的，移出后不会随同步回来。'),
       ]),
     })
   } catch (e) {
-    return // 取消
+    return
   }
-
-  let done = 0
-  let removed = 0
-  const failed = []
-  for (const m of hits) {
-    try {
-      const res = await mappingApi.remove(m.id, withResources.value)
-      done++
-      removed += Number(res && res.removedResources) || 0
-    } catch (e) {
-      failed.push((e && e.message) || '失败')
-    }
+  try {
+    await resourceApi.batchDelete([data.resourceId])
+    ElMessage.success(fromMapping ? '已移出（下次同步会重新出现）' : '已移出')
+    await loadAll()
+  } catch (e) {
+    /* 拦截器已提示 */
   }
-  await loadAll()
-  if (failed.length) ElMessage.warning(`解绑了 ${done} 条，${failed.length} 条失败：${failed[0]}`)
-  else ElMessage.success(`已解绑 ${done} 条映射${removed ? `，清理 ${removed} 个资源` : ''}`)
 }
 
 /* ============ 明细里的操作 ============ */
@@ -690,11 +914,18 @@ onMounted(loadAll)
   align-items: center;
   gap: 6px;
   min-width: 0;
+  width: 100%;
 }
 .mp-icon {
   flex: 0 0 auto;
+  width: 17px;
+  text-align: center;
 }
 .mp-node-name {
+  /* ⚠️ 不能写成 flex:1 —— 那会把右边那颗 el-tag 一起推到行尾。
+     名字保持"够用就好、超出省略"，让 ✕ 用 margin-left:auto 单独靠右。 */
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -708,9 +939,44 @@ onMounted(loadAll)
   color: var(--ls-text-secondary);
   text-decoration: line-through;
 }
+/* 资源：比目录轻一档，一眼看出它是最末一级、不是可展开的目录 */
+.mp-node-name.is-resource {
+  color: #4a5a6a;
+  font-weight: 400;
+}
 .mp-node-tag {
   flex: 0 0 auto;
   transform: scale(0.88);
+}
+/* 资源行的大小 */
+.mp-size {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--ls-text-secondary, #909399);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 节点上的 ✕（解绑这条映射 / 移出这个资源）。
+   靠 margin-left:auto 顶到行尾，平时是浅灰、悬停才变红 ——
+   它是"删除类"操作，但不该在一棵满是数据的树上一直喊。 */
+.mp-act {
+  flex: 0 0 auto;
+  margin-left: auto;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: #c8cdd4;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color .15s, background .15s;
+}
+.mp-act:hover {
+  color: #fff;
+  background: #f56c6c;
 }
 
 /* ============ 中间箭头 ============ */

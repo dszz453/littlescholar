@@ -9,6 +9,19 @@ plugins {
 // 所以换个地址**不需要重新打包**。想改预填值用 -PsiteUrl=xxx。
 def siteUrl = project.hasProperty('siteUrl') ? project.siteUrl : 'https://study.19860819.xyz:8616'
 
+// ============ 应用名与版本号（产物文件名要用）============
+//
+// 与 PRO 端同一套规矩（用户 2026-10-16 要求）：
+// 产物文件名 = 应用名 + 版本号，例如 `小书童-1.3.0.apk`。
+//
+// 抽成变量是为了让产物名与包里的 versionName **只有一个来源** ——
+// 两处各写一遍，迟早在某次升版本时漏改一处，于是分发给家长的那个包
+// 名字写着 1.2.0、装上去是 1.3.0，排查问题时全乱。
+def appVersionName = '1.3.0'
+def appVersionCode = 10300 // = 10000×1 + 100×3 + 0
+// 产物的显示名（不含 .apk）。标配客户端就叫「小书童」，不带后缀。
+def appArtifactBase = '小书童'
+
 // ============ release 签名 ============
 // 口令放在 android/keystore.properties（**已 gitignore，不要提交**）。
 // 文件不存在时 release 照样能构建，只是产出未签名 APK —— 方便别人 clone
@@ -32,12 +45,13 @@ android {
         // **每改动一次，版本号升 0.1**（1.1.0 → 1.2.0 → 1.3.0 …）。
         // versionCode = 10000×major + 100×minor + patch，保证单调递增。
         // ⚠️ versionCode 不递增时覆盖安装会直接失败，系统只回一句"应用未安装"。
-        versionCode 10200        // 1.2.0
+        versionCode appVersionCode
         // 版本历史（倒序）：
+        //   1.3.0  产物文件名带上「名字 + 版本」
         //   1.2.0  息屏播放保活：前台服务终于被启动了 + WiFi 锁
         //         （此前 MediaPlaybackService 从未被调用，是一段死代码）
         //   1.1.0  升级自愈 + 诊断面板
-        versionName '1.2.0'
+        versionName appVersionName
 
         // 注入到 BuildConfig.SITE_URL，供 MainActivity 使用
         buildConfigField 'String', 'SITE_URL', "\"${siteUrl}\""
@@ -87,6 +101,22 @@ android {
     packagingOptions {
         resources {
             excludes += ['META-INF/*.kotlin_module', 'META-INF/DEPENDENCIES']
+        }
+    }
+}
+
+// ============ 产物文件名：名字 + 版本（用户 2026-10-16 要求）============
+//
+// 目标：`小书童-1.3.0.apk`（debug 版是 `小书童-1.3.0-debug.apk`）。
+// 理由与 PRO 端同一条：分发给家长的文件夹里不该出现一堆
+// `app-release(1).apk`，看名字就得知道这是哪一版。
+//
+// ⚠️ AGP 8 的 `outputFileName` 是 `Property<String>`，只能 `.set(...)`。
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        def suffix = variant.buildType == 'release' ? '' : "-${variant.buildType}"
+        variant.outputs.each { output ->
+            output.outputFileName.set("${appArtifactBase}-${appVersionName}${suffix}.apk")
         }
     }
 }

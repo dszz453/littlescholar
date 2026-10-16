@@ -116,11 +116,18 @@ export const mappingApi = {
   list: (params) => http.get('/admin/mappings', { params: params || {} }),
   create: (data) => http.post('/admin/mappings', data),
   update: (id, data) => http.put(`/admin/mappings/${id}`, data),
-  // withResources=true 时连带清理这条映射同步进来的资源。
-  // 不传则只删映射本身（已导入的资源保留）。
-  remove: (id, withResources) =>
+  // 解绑映射。
+  //
+  // ⚠️ 参数含义在 2026-10-16 **反转**过一次：
+  //   · 不传            → 连同这条映射导入的资源一起移除（默认，资源是软删除）
+  //   · keepResources=true → 只解绑配置，资源留在原处（?withResources=0）
+  //
+  // 原来的语义正好相反（默认保留资源），理由是"删资源不可逆"。资源改成
+  // 软删除之后那条理由不成立了：既然能恢复，就该默认做用户直觉上要的事 ——
+  // 把资源一起拿掉。保留孤儿资源反而出过事故（删了映射孩子端还在列那 26 集）。
+  remove: (id, keepResources) =>
     http.delete(`/admin/mappings/${id}`, {
-      params: withResources ? { withResources: 1 } : {},
+      params: keepResources ? { withResources: 0 } : {},
     }),
   sync: (id) => http.post(`/admin/mappings/${id}/sync`),
   syncAll: () => http.post('/admin/mappings/sync'),

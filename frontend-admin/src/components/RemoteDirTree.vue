@@ -21,7 +21,6 @@
         lazy
         node-key="key"
         :show-checkbox="multiple"
-        :check-strictly="multiple"
         highlight-current
         :expand-on-click-node="false"
         :default-expanded-keys="defaultExpanded"
@@ -30,11 +29,12 @@
       >
         <template #default="{ data }">
           <span class="rdt-node">
-            <span class="rdt-icon">{{ data.isAccount ? '☁️' : '📁' }}</span>
+            <span class="rdt-icon">{{ nodeIcon(data) }}</span>
             <span class="rdt-name" :title="data.name">{{ data.name }}</span>
             <el-tag v-if="data.isAccount" size="small" effect="plain" class="rdt-tag">
               {{ diskName(data.diskType) }}
             </el-tag>
+            <span v-else-if="data.isFile" class="rdt-size">{{ fmtSize(data.size) }}</span>
             <el-tag v-if="isMapped(data)" size="small" type="success" effect="plain" class="rdt-tag">
               已映射
             </el-tag>
@@ -84,6 +84,14 @@ const props = defineProps({
    * 而映射页要一次把好几个网盘目录映射到同一个系统目录。
    */
   multiple: { type: Boolean, default: false },
+  /**
+   * 是否把**文件**也列出来（默认为否，只看目录）。
+   *
+   * 只有「资源映射」页会打开它：那里要把某一集单独挂进系统目录，
+   * 而目录级的映射解决不了"这个文件夹里我只想要这一集"。
+   * 建目录弹窗和 AI 整理助手都要的是目录，打开它只会让它们多出一堆噪音行。
+   */
+  includeFiles: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['pick', 'check'])
@@ -116,20 +124,48 @@ function diskName(t) {
 }
 
 function isMapped(data) {
-  if (!data || data.isAccount) return false
+  if (!data || data.isAccount || data.isFile) return false
   return props.mappedKeys.includes(`${data.accountId}::${data.dirId}`)
 }
 
-/** 把一份 FileItem 列表转成树节点。 */
+/** 节点图标：账号 / 目录 / 文件（文件再按类型细分，一眼看出能不能播）。 */
+function nodeIcon(data) {
+  if (data.isAccount) return '☁️'
+  if (!data.isFile) return '📁'
+  const n = String(data.name || '').toLowerCase()
+  if (/\.(mp4|mkv|avi|mov|wmv|flv|rmvb|rm|ts|m3u8|webm|m4v|mpg|mpeg|3gp)$/.test(n)) return '🎬'
+  if (/\.(mp3|wav|flac|aac|m4a|ogg|wma|ape)$/.test(n)) return '🎵'
+  if (/\.pdf$/.test(n)) return '📄'
+  if (/\.(jpg|jpeg|png|gif|webp|bmp)$/.test(n)) return '🖼️'
+  return '📄'
+}
+
+function fmtSize(n) {
+  const v = Number(n) || 0
+  if (!v) return ''
+  if (v >= 1024 * 1024 * 1024) return (v / 1024 / 1024 / 1024).toFixed(1) + 'G'
+  if (v >= 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + 'M'
+  if (v >= 1024) return (v / 1024).toFixed(0) + 'K'
+  return v + 'B'
+}
+
+/**
+ * 把一份 FileItem 列表转成树节点。
+ *
+ * includeFiles 打开时文件也进来，且 isLeaf=true —— 文件没有下级，
+ * 不这么标的话 el-tree 会给每一集都画一个展开箭头，点开却是空的。
+ */
 function toNodes(accountId, items) {
   return (items || [])
-    .filter((i) => i.isDir)
+    .filter((i) => i.isDir || props.includeFiles)
     .map((i) => ({
       key: `${accountId}::${i.id}`,
       name: i.name,
       accountId,
       dirId: i.id,
-      isLeaf: false,
+      size: i.size,
+      isFile: !i.isDir,
+      isLeaf: !i.isDir,
     }))
 }
 
@@ -174,10 +210,14 @@ function onNodeClick(data, node, comp) {
   // 多选模式下，点整行就等于勾选/取消 —— 让用户必须精确点到那个小方框
   // 是没必要的折磨（树干区域那么宽）。
   if (props.multiple) {
-    const key = data.key
-    const now = (comp && comp.checkedKeys) || []
+    // ⚠️ deep 必须传 true。多选现在是**联动**的（见 onCheck 的注释），
+    // 而 deep=false 只改自己那一个格子：父节点勾上了、子孙却没动，
+    // el-tree 内部立刻处于"父子不一致"的状态，再点一下还会把状态
+    // 解回去 —— 表现就是"点这一行没反应"。
+    const n = treeRef.value?.getNode(data.key)
+    const isOn = !!(n && n.checked)
     try {
-      treeRef.value.setChecked(key, !now.includes(key), false)
+      treeRef.value.setChecked(data.key, !isOn, true)
     } catch (e) {
       /* 忽略 */
     }
@@ -187,14 +227,44 @@ function onNodeClick(data, node, comp) {
   emit('pick', describe(data, node))
 }
 
-/** 多选回传：把勾上的节点转成 [{accountId, dirId, dirName, path}] */
+/**
+ * 多选回传。
+ *
+ * ============ 为什么不再用 check-strictly ============
+ *
+ * 原先多选走的是严格模式（父子互不牵连）。用户 2026-10-16 明确要求
+ * 「勾选上级目录时下级默认全勾」—— 这才是符合直觉的做法：想整个挂过去
+ * 的时候，本来就不该再手动把每个子目录点一遍。
+ *
+ * 但联动立刻带来一个新问题：勾中父级之后，**它的子孙也全在
+ * checkedNodes 里**。原样提交就是给每个子目录各建一条映射 ——
+ * 后端按 file_id 去重，第二条开始全是"新增 0"，用户看到的是一串废话，
+ * 左树也会长出七八条指向同一个目录的映射，收都收不起来。
+ *
+ * 所以这里做一次**最小覆盖集**裁剪：只保留"祖先没有被勾中"的节点。
+ * 一条父目录的递归映射本来就覆盖了它的所有子孙。
+ */
 function onCheck(_data, info) {
   if (!props.multiple) return
+  const checkedKeys = new Set(((info && info.checkedKeys) || []).map(String))
   const nodes = ((info && info.checkedNodes) || []).filter((d) => !d.isAccount)
-  const items = nodes.map((d) => {
+
+  const items = []
+  for (const d of nodes) {
     const node = treeRef.value?.getNode(d.key)
-    return describe(d, node)
-  })
+    let covered = false
+    let cur = node && node.parent
+    while (cur) {
+      const pd = cur.data
+      if (pd && checkedKeys.has(String(pd.key))) {
+        covered = true
+        break
+      }
+      cur = cur.parent
+    }
+    if (covered) continue
+    items.push(describe(d, node))
+  }
   emit('check', items)
 }
 
@@ -214,6 +284,10 @@ function describe(data, node) {
     dirId: data.isAccount ? '' : data.dirId,
     dirName: data.isAccount ? '' : data.name,
     isRoot: !!data.isAccount,
+    // 文件与目录的区分由父组件决定走哪条路：
+    // 目录 → 建映射（可递归）；文件 → 直接登记成一条资源。
+    isFile: !!data.isFile,
+    size: data.size || 0,
     path: parts.join(' / '),
   }
 }
@@ -307,5 +381,12 @@ defineExpose({ reload, picked, clearChecked })
 .rdt-tag {
   flex: 0 0 auto;
   transform: scale(0.9);
+}
+/* 文件行的大小：目录不需要（它没有大小），有它就够判断"这一集是不是我要的" */
+.rdt-size {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  color: var(--ls-text-secondary, #909399);
+  font-variant-numeric: tabular-nums;
 }
 </style>

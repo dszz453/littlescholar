@@ -274,32 +274,74 @@ func NewImportService(db *gorm.DB) *ImportService { return &ImportService{db: db
 // mappingID 记录这批资源由哪条映射导入（0 = 手动导入/搜索收录）。
 // 它决定了"删除映射"时能不能精确地连带清理资源，所以调用方务必传对：
 // 同步链路传 m.ID，手动导入传 0。
+//
+// ============ 软删除的闭环（2026-10-16）============
+//
+// 资源是**软删除**的（`Base.DeletedAt`），所以库里可能同时存在
+// 「同账号 + 同 fileId 的软删行」。这里必须把那种行**复活**，而不是
+// 再 INSERT 一条新的 —— 这是用户"取消映射用软删除"这个决定的下半场，
+// 缺了它软删除就只是个占位的空话。
+//
+// 不复活会出两个真实故障：
+//
+//  1. **库被垃圾行撑爆**。"删映射 → 重新映射 → 同步"是用户明确要走的路
+//     （第 4 条要求：全部映射删掉后要重新映射），每走一轮就多一份
+//     同 fileId 的死行。走三轮之后同一个文件在库里躺四行，
+//     再排查"孩子端怎么多了 26 集"时根本对不上号。
+//
+//  2. **孩子的痕迹全断**。收藏、播放进度、播放记录都挂在资源 id 上，
+//     重新 INSERT 意味着换了个 id —— 资源"回来了"，但读到一半的位置、
+//     收藏的标记全没了。复活后 id 不变，一切照旧。
+//
+// 代价是明确的：**软删的资源会随下一次同步回来**。这是刻意的取舍 ——
+// 软删除本身表达的语义就是"可以恢复"，而真正"我不想要这个目录了"
+// 应该通过取消映射来表达（映射没了，同步不会再来）。
+//
+// 复活的资源计入 created：从用户视角"资源回来了"和"新增了资源"
+// 是同一件事（孩子端都是凭空多出一集），没必要为此多一个返回值
+// 去改两个调用点 + 同步结果结构 + 三处前端文案。
 func (s *ImportService) Register(acc *model.DiskAccount, categoryID, mappingID uint64, targets []DiskImportTarget) (int, int, error) {
 	if len(targets) == 0 {
 		return 0, 0, nil
 	}
 
 	// 去重：先一次性查出已存在的 fileId 再比对，避免循环里逐条查库。
+	//
+	// ⚠️ Unscoped() 是必须的 —— 默认作用域会补 `deleted_at IS NULL`，
+	// 于是软删的那些行"查不到"，下面的复活分支永远走不到，
+	// 表现就是"软删除看起来生效了，其实只是多堆一行垃圾"。
 	fileIDs := make([]string, 0, len(targets))
 	for _, t := range targets {
 		fileIDs = append(fileIDs, t.FileID)
 	}
-	var existing []string
-	s.db.Model(&model.Resource{}).
+	var existing []model.Resource
+	s.db.Unscoped().Model(&model.Resource{}).
 		Where("disk_account_id = ? AND file_id IN ?", acc.ID, fileIDs).
-		Pluck("file_id", &existing)
-	existed := make(map[string]bool, len(existing))
-	for _, f := range existing {
-		existed[f] = true
+		Find(&existing)
+
+	// 同一个 fileId 在库里可能既有活行又有死行（历史遗留），
+	// 活行优先：有活行就按"已存在"跳过，不动死行。
+	alive := make(map[string]bool, len(existing))
+	dead := make(map[string]uint64, len(existing))
+	for i := range existing {
+		r := &existing[i]
+		if r.DeletedAt.Valid {
+			if _, ok := dead[r.FileID]; !ok {
+				dead[r.FileID] = r.ID
+			}
+			continue
+		}
+		alive[r.FileID] = true
 	}
 
 	accID := acc.ID
-	created, skipped := 0, 0
+	created, skipped, restored := 0, 0, 0
 	for _, t := range targets {
-		if existed[t.FileID] {
+		if alive[t.FileID] {
 			skipped++
 			continue
 		}
+
 		// 标题去掉扩展名，列表更干净；全空了才退回原名。
 		// 扩展名本身不能丢 —— 单独存进 Ext，转码判定全靠它。
 		ext := ExtOfName(t.Title)
@@ -307,6 +349,38 @@ func (s *ImportService) Register(acc *model.DiskAccount, categoryID, mappingID u
 		if strings.TrimSpace(title) == "" {
 			title = t.Title
 		}
+
+		// ---- 复活一条软删的资源（见函数头注释）----
+		if id, ok := dead[t.FileID]; ok {
+			// ⚠️ 这里必须 Unscoped()：不加的话 gorm 会给 UPDATE 补上
+			// `AND deleted_at IS NULL`，于是**一行都更新不到**，
+			// 而 RowsAffected=0 又不会报错 —— 复活静默失败，
+			// 表现和"跳过了"完全一样，只能靠单测钉住。
+			err := s.db.Unscoped().Model(&model.Resource{}).Where("id = ?", id).
+				Updates(map[string]interface{}{
+					"deleted_at":   nil,
+					"category_id":  categoryID,
+					"mapping_id":   mappingID,
+					"title":        title,
+					"media_type":   GuessMediaType(t.Title),
+					"ext":          ext,
+					"owner_dir_id": path.Dir(t.FileID),
+					"file_count":   1,
+					"total_size":   t.Size,
+					"status":       model.ResourceStatusAlive,
+				}).Error
+			if err != nil {
+				log.Printf("[import] 复活资源失败 %s: %v", t.FileID, err)
+				skipped++
+				continue
+			}
+			delete(dead, t.FileID)
+			alive[t.FileID] = true
+			created++
+			restored++
+			continue
+		}
+
 		res := &model.Resource{
 			CategoryID:    categoryID,
 			Title:         title,
@@ -329,6 +403,12 @@ func (s *ImportService) Register(acc *model.DiskAccount, categoryID, mappingID u
 			continue
 		}
 		created++
+	}
+	if restored > 0 {
+		// 单独记一条日志：同步结果里"新增 26"看不出其中有几条是复活，
+		// 而这两件事在排查时意义完全不同（复活 = 之前删过）。
+		log.Printf("[import] 复活已软删资源 %d 条（account=%d category=%d mapping=%d）",
+			restored, acc.ID, categoryID, mappingID)
 	}
 	return created, skipped, nil
 }
