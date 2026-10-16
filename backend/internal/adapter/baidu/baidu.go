@@ -33,6 +33,13 @@ type Baidu struct {
 	// form 还是 JSON 这件事肉眼看不出来，只有线上才会以"分享已失效"的形式爆出来。
 	panBase string
 
+	// passportBase 登录域（getqrcode / unicast）。默认 passportURL。
+	//
+	// 和 panBase 是同一个理由：扫码这段的坑全在"query 里到底带了什么参数"
+	// （tpl 有没有、gid 两端是否一致），只靠读代码看不出来，而一旦错了
+	// 表现是"扫了码没反应"——离真正的原因很远。所以单测必须能接住这两个请求。
+	passportBase string
+
 	// bdstoken 缓存：写操作全都要它，但每个请求都去换一遍太浪费。
 	tokenMu sync.Mutex
 	tokens  map[string]tokenEntry
@@ -69,6 +76,14 @@ func (b *Baidu) pan() string {
 // 如果这里另外写死 panURL，测试会悄悄打到真实的 pan.baidu.com 上，
 // 既慢又会让"测试通过"变得没有意义。
 func (b *Baidu) api() string { return b.pan() + "/api" }
+
+// pp 登录域（getqrcode / unicast / qrcode）的基地址（测试可替换）。
+func (b *Baidu) pp() string {
+	if b.passportBase == "" {
+		return passportURL
+	}
+	return b.passportBase
+}
 
 // flexInt64 兼容"同一个字段有时是数字、有时是字符串"。
 //
@@ -112,8 +127,10 @@ func (b *Baidu) Type() adapter.DiskType { return adapter.DiskBaidu }
 func (b *Baidu) Name() string           { return "百度网盘" }
 
 const (
-	panURL   = "https://pan.baidu.com"
-	passport = "https://passport.baidu.com"
+	panURL = "https://pan.baidu.com"
+	// passportURL 登录域（二维码与通道轮询都在这个域下）。
+	// 默认值由 Baidu.pp() 返回，单测可替换 —— 见 passportBase 字段的说明。
+	passportURL = "https://passport.baidu.com"
 )
 
 const ua = "netdisk;P2SP;2.2.60.26"
@@ -195,15 +212,34 @@ func (b *Baidu) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 		ImgURL string `json:"imgurl"`
 		Img    string `json:"img"`
 	}
+	// ⚠️ gid 必须**贯穿"生成"与"轮询"两端**。
+	//
+	// 百度用 (channel_id, gid) 定位一次扫码会话：getqrcode 时登记，unicast 时
+	// 查询。这里生成的 gid 要跟着 sessionID 一起回传，轮询时原样带上 ——
+	// 否则第二次请求是一台"陌生的设备"去问别人刚建的通道。
+	//
+	// 之前每次调用 gid() 现生成、轮询侧则完全不带，两端口径就没对上过。
+	g := gid()
+
 	_, err := b.http.DoJSON(ctx, &adapter.Request{
 		Method:  "GET",
-		URL:     passport + "/v2/api/getqrcode",
+		URL:     b.pp() + "/v2/api/getqrcode",
 		Headers: map[string]string{"User-Agent": webUA},
 		Query: map[string]string{
 			"lp":          "pc",
 			"qrloginfrom": "pc",
-			"gid":         gid(),
+			"gid":         g,
 			"apiver":      "v3",
+			// tpl 必须显式给 —— 与百度登录页实测的参数完全一致：
+			//
+			//	https://passport.baidu.com/v2/api/getqrcode
+			//	  ?lp=pc&qrloginfrom=pc&gid=…&tpl=netdisk&apiver=v3&…
+			//
+			// 之前这里**没有 tpl**，于是这次扫码在百度侧挂的是"默认模板"，
+			// 而轮询侧却在用 tpl=netdisk 问。两端口径不一致的后果不是报错，
+			// 而是**手机确认之后网盘侧永远等不到那个通道** —— 用户看到的就是
+			// "扫了码没反应 / 登不上去"，且后台和客户端一起坏（同一份实现）。
+			"tpl": "netdisk",
 		},
 	}, &devResp)
 	if err != nil {
@@ -227,30 +263,70 @@ func (b *Baidu) GetQRCode(ctx context.Context) (*adapter.QRCode, error) {
 	// （形如 passport.baidu.com/v2/api/qrcode?sign=…），要补 https://。
 	qrContent := devResp.ImgURL
 	if qrContent == "" {
-		qrContent = passport + "/v2/api/qrcode?sign=" + url.QueryEscape(devResp.Sign) +
+		qrContent = b.pp() + "/v2/api/qrcode?sign=" + url.QueryEscape(devResp.Sign) +
 			"&lp=pc&qrloginfrom=pc"
 	} else if !strings.HasPrefix(qrContent, "http") {
 		qrContent = "https://" + qrContent
 	}
 
-	// 百度没有内联 base64 图，imgurl 本身就是一个"返回 PNG"的地址，
-	// 直接交给前端当 <img src> 用即可。
-	image := devResp.Img
-	if image == "" {
-		image = qrContent
+	// ⚠️ 只有**自包含**的图片（base64 / data URL）才放进 Image。
+	//
+	// 这里曾经写的是 `image = qrContent`（把 passport.baidu.com 的**外链**塞进
+	// Image 字段），于是上层 handler 判断"驱动自带图片"就跳过了 qrgen，
+	// 前端直接 <img src="https://passport.baidu.com/v2/api/qrcode?sign=…">。
+	//
+	// 那样做把二维码的**可用性**押在了"客户端能直连 passport.baidu.com"上：
+	// 离线、内网、被墙、或浏览器策略稍严一点，图就是一片空白 ——
+	// 而同一张卡片上还写着"请用手机扫描二维码"。
+	// 夸克/UC 一直只回 Content（由 qrgen 渲染成内嵌 data URL），所以它们从没
+	// 出过这个问题 —— "夸克能登、百度不能"的差异就在这里。
+	//
+	// 百度实测**不返回** img 字段，所以正常情况下这里就是空，
+	// 由 handler 用 Content 渲染二维码。
+	image := ""
+	if isInlineImage(devResp.Img) {
+		image = devResp.Img
 	}
 
 	return &adapter.QRCode{
-		SessionID: "baidu_" + channelID,
+		// sessionID 里带上 gid：轮询时必须用**同一个** gid（见 GetQRCode 头的说明）。
+		// 用 `|` 分隔而不是 `_`，因为 gid 形如 `EFF6C3F-…`，本身就可能带连字符。
+		SessionID: "baidu_" + channelID + "|" + g,
 		Content:   qrContent,
 		Image:     image,
 		ExpiresIn: 180,
 	}, nil
 }
 
+// isInlineImage 判断驱动给的是**自包含**图片（可以直接塞进 <img src>），
+// 还是"再去某个网址取图"的外链。
+//
+// 外链一律不算 —— 见 GetQRCode 里那段说明。
+func isInlineImage(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "data:image/") {
+		return true
+	}
+	// 纯 base64：没有协议头、也没有斜杠。带斜杠/冒号的都是 URL 或 HTML。
+	if strings.Contains(s, "://") || strings.ContainsAny(s, "/<>") {
+		return false
+	}
+	return true
+}
+
 // PollQRCode 轮询扫码状态
 func (b *Baidu) PollQRCode(ctx context.Context, sessionID string) (*adapter.LoginResult, error) {
-	channelID := strings.TrimPrefix(sessionID, "baidu_")
+	// sessionID 形如 `baidu_<channel_id>|<gid>`，gid 由 GetQRCode 生成并回传。
+	// 这里必须把它原样带进请求 —— 百度用 (channel_id, gid) 定位会话，
+	// 不带 gid 等于用一台陌生设备去问别人刚建的通道。
+	//
+	// 仍然兼容不带 gid 的旧形态（Cut 找不到 `|` 时 g 为空串），
+	// 这样已经握在用户手里的旧 session 不会突然全部失效。
+	rest := strings.TrimPrefix(sessionID, "baidu_")
+	channelID, g, _ := strings.Cut(rest, "|")
 	if channelID == "" {
 		return nil, fmt.Errorf("扫码会话无效")
 	}
@@ -268,11 +344,22 @@ func (b *Baidu) PollQRCode(ctx context.Context, sessionID string) (*adapter.Logi
 		ChannelV string `json:"channel_v"`
 		Msg      string `json:"msg"`
 	}
+	q := map[string]string{
+		"channel_id": channelID,
+		// 与生成端保持一致：tpl 两边都得是 netdisk。
+		"tpl":    "netdisk",
+		"apiver": "v3",
+		// _sdkFrom 照抄百度登录页的 unicast 请求形态（实测带这个参数）。
+		"_sdkFrom": "1",
+	}
+	if g != "" {
+		q["gid"] = g
+	}
 	_, err := b.http.DoJSON(pollCtx, &adapter.Request{
 		Method:  "GET",
-		URL:     passport + "/channel/unicast",
+		URL:     b.pp() + "/channel/unicast",
 		Headers: map[string]string{"User-Agent": webUA},
-		Query:   map[string]string{"channel_id": channelID, "tpl": "netdisk", "apiver": "v3"},
+		Query:   q,
 	}, &resp)
 	if err != nil {
 		return &adapter.LoginResult{Status: "waiting", Message: "轮询中"}, nil
@@ -496,7 +583,7 @@ func (b *Baidu) ListDir(ctx context.Context, cred *adapter.Credential, dirID str
 		dirID = "/"
 	}
 	var resp struct {
-		Errno int `json:"errno"`
+		Errno int             `json:"errno"`
 		List  []baiduListItem `json:"list"`
 	}
 
@@ -1300,17 +1387,17 @@ func (b *Baidu) linkViaOAuth(ctx context.Context, fileID, at string) (*adapter.D
 //
 // ⚠️ 字段名与类型都踩过坑，逐条说明（2026-10-14 实测真实响应）：
 //
-//	{"errno":0,
-//	 "info":[{"dlink":"https://d.pcs.baidu.com/file/…?fid=…",
-//	          "size":"751828992","fs_id":"1114395303765791", …}],
-//	 "request_id":…}
+//		{"errno":0,
+//		 "info":[{"dlink":"https://d.pcs.baidu.com/file/…?fid=…",
+//		          "size":"751828992","fs_id":"1114395303765791", …}],
+//		 "request_id":…}
 //
-//  1. 数组的键是 **info**，不是 list —— 旧代码写 `json:"list"`，于是
-//     `len(resp.List)==0` 恒成立，取直链**从来没成功过**，报错还很有迷惑性：
-//     `百度获取直链失败: errno=0`（errno 明明是 0，看起来"接口是好的"）。
-//  2. `dlink` 是**字符串**，不是 `{"dlink":"…"}` 那种嵌套对象 —— 旧代码按
-//     嵌套解析，即使键名改对了也还是空。
-//  3. `size` 是**字符串**（"751828992"），要用 flexInt64 兼容。
+//	 1. 数组的键是 **info**，不是 list —— 旧代码写 `json:"list"`，于是
+//	    `len(resp.List)==0` 恒成立，取直链**从来没成功过**，报错还很有迷惑性：
+//	    `百度获取直链失败: errno=0`（errno 明明是 0，看起来"接口是好的"）。
+//	 2. `dlink` 是**字符串**，不是 `{"dlink":"…"}` 那种嵌套对象 —— 旧代码按
+//	    嵌套解析，即使键名改对了也还是空。
+//	 3. `size` 是**字符串**（"751828992"），要用 flexInt64 兼容。
 //
 // 为兼容起见两种键名都接：Info 优先，回落 List。
 type baiduDLItem struct {
