@@ -13,6 +13,7 @@ import (
 	"github.com/littlescholar/core/internal/service"
 	"github.com/littlescholar/core/internal/task"
 	"github.com/littlescholar/core/internal/util"
+	"github.com/littlescholar/core/internal/version"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
@@ -95,8 +96,23 @@ func Setup(deps *Deps) *gin.Engine {
 	api := r.Group("/api")
 
 	// 健康检查
+	//
+	// **刻意带上版本号**：这是唯一一个不需要任何鉴权就能读到的接口，
+	// 所以它决定了"线上到底跑的哪一版"这个问题能不能一句话答出来：
+	//
+	//	curl -s http://<host>:8092/api/health
+	//	{"status":"ok","version":"1.8.0","commit":"a1b2c3d",...}
+	//
+	// 在这之前只能靠"抓打包后的 chunk 比对指纹"这种间接办法，
+	// 而且判断不了后端。多回三个字符串的成本为零，排查收益极大。
 	api.GET("/health", func(c *gin.Context) {
-		util.OK(c, gin.H{"status": "ok", "time": time.Now()})
+		util.OK(c, gin.H{
+			"status":    "ok",
+			"version":   version.Version,
+			"commit":    version.ShortCommit(),
+			"buildTime": version.BuildTime,
+			"time":      time.Now(),
+		})
 	})
 
 	// ============ 认证（公开）============

@@ -22,6 +22,7 @@ import (
 	"github.com/littlescholar/core/internal/task"
 	"github.com/littlescholar/core/internal/transcode"
 	"github.com/littlescholar/core/internal/util"
+	"github.com/littlescholar/core/internal/version"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -53,6 +54,9 @@ func main() {
 	defer logger.Sync()
 
 	logger.Info("小书童学习系统启动中...",
+		// 版本进日志：容器日志是服务器上唯一"随手就能看"的东西，
+		// 有了这一行，`docker logs ls-core | head -1` 就能回答"这台跑的是哪一版"。
+		zap.String("version", version.Full()),
 		zap.String("mode", cfg.Server.Mode),
 		zap.String("db", cfg.Database.Driver),
 	)
@@ -362,10 +366,15 @@ func envOr(key, def string) string {
 }
 
 func printBanner(addr, user, pass string) {
+	// 版本号**刻意放在方框外面**。
+	//
+	// 那个框的宽度是手工数好的（中文/全角占两列，ASCII 占一列），
+	// 而 Version 会随版本升级变长（1.9.0 → 1.10.0 多一列）。一旦放回框里，
+	// 每升一次版本右边框就歪一列，而 %-Ns 补不回来 —— 它按 rune 数补，
+	// 中文一律当 1 列。放外面则永远整齐。
 	fmt.Println()
+	fmt.Printf("  小书童 · 孩子学习系统 %s\n", version.Full())
 	fmt.Println("  ╔══════════════════════════════════════════╗")
-	fmt.Println("  ║      小书童 · 孩子学习系统 v1.0.0        ║")
-	fmt.Println("  ╠══════════════════════════════════════════╣")
 	fmt.Printf("  ║  服务地址: http://localhost%-13s ║\n", addr)
 	fmt.Printf("  ║  后台账号: %-30s ║\n", user)
 	fmt.Printf("  ║  后台密码: %-30s ║\n", pass)

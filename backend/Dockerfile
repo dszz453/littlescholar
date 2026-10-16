@@ -14,8 +14,30 @@ RUN go mod download 2>/dev/null || true
 
 # 复制源码并编译
 COPY . .
-RUN go mod tidy && \
-    go build -ldflags="-s -w" -o /build/core-server ./cmd/server
+
+# ============ 构建信息注入 ============
+#
+# **版本号不在这里传**：它的唯一来源是 internal/version/version.go 的
+# `Version` 常量（升版本只改那一行）。这里只补两个"构建那一刻才知道"
+# 的字段，让后台「系统状态」和 `GET /api/health` 能回答
+# "线上这台跑的到底是哪一次构建"：
+#
+#   GIT_SHA     由 CI 传（github.sha）；本地 docker build 不传就是空
+#   BUILD_TIME  不传就在构建时现取 UTC 时刻
+#
+# 两者都可空：缺了只是少显示一段，/api/health 的 version 照常有值。
+ARG GIT_SHA=""
+ARG BUILD_TIME=""
+
+RUN set -e; \
+    LDF="-s -w"; \
+    if [ -n "$GIT_SHA" ]; then \
+        LDF="$LDF -X github.com/littlescholar/core/internal/version.Commit=$GIT_SHA"; \
+    fi; \
+    if [ -z "$BUILD_TIME" ]; then BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ); fi; \
+    LDF="$LDF -X github.com/littlescholar/core/internal/version.BuildTime=$BUILD_TIME"; \
+    go mod tidy && \
+    go build -ldflags="$LDF" -o /build/core-server ./cmd/server
 
 # ============ 运行阶段 ============
 FROM alpine:3.19

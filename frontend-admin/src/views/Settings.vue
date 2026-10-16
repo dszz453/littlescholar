@@ -101,7 +101,10 @@
         <div class="card-box">
           <h3 class="section-title">系统状态</h3>
           <el-descriptions :column="1" border>
-            <el-descriptions-item label="版本">{{ status.version }}</el-descriptions-item>
+            <el-descriptions-item label="版本">
+              <span class="ver">v{{ status.version || '…' }}</span>
+              <span v-if="status.commit || status.buildTime" class="build">{{ buildLabel(status) }}</span>
+            </el-descriptions-item>
             <el-descriptions-item label="运行时长">{{ formatUptime(status.uptime) }}</el-descriptions-item>
             <el-descriptions-item label="数据库">
               <el-tag :type="status.dbOnline ? 'success' : 'danger'" size="small">
@@ -142,6 +145,7 @@ import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { systemApi } from '@/api'
+import { buildLabel } from '@/utils/buildinfo'
 
 const config = ref({
   pansou_url: '',
@@ -220,5 +224,17 @@ onMounted(() => {
   font-size: 15px;
   font-weight: 600;
   margin: 0 0 16px;
+}
+
+.ver {
+  font-weight: 600;
+}
+
+/* 构建信息（短 commit + 构建时刻）是次要信息：小字挂在版本号后面，
+   不抢眼但随时可读。取不到时整段不渲染，见 utils/buildinfo.js。 */
+.build {
+  margin-left: 6px;
+  font-size: 12px;
+  color: var(--ls-text-secondary);
 }
 </style>

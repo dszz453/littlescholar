@@ -2,7 +2,9 @@
 
 一套面向家庭的**自托管儿童学习资源管理与播放系统**：后台统一搜索、转存、编目网盘资源，孩子端用图标化大按钮浏览、听音频、看视频和绘本 PDF，并由 AI 结合孩子年级给出学习建议。
 
-> 当前版本：**v1.0.0**
+> 当前版本：**v1.8.0**（服务端唯一真源 = `backend/internal/version/version.go` 的 `Version`，
+> 升版本只改那一行。后台「系统状态」与 `GET /api/health` 显示的就是它。
+> 安卓客户端各自计数：标配 APK 见 `android/app/build.gradle`，PRO 见 `edge-client/android/app/build.gradle`）
 > 技术栈：Go 1.22 + Gin + GORM + PostgreSQL ｜ Vue 3 + Vite ｜ Element Plus（后台）/ Vant（孩子端）｜ Docker Compose
 > 三种客户端形态：管理后台 · 孩子端 PWA · 安卓 APK
 

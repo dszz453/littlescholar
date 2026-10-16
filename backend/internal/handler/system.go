@@ -12,6 +12,7 @@ import (
 	"github.com/littlescholar/core/internal/service"
 	"github.com/littlescholar/core/internal/task"
 	"github.com/littlescholar/core/internal/util"
+	"github.com/littlescholar/core/internal/version"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -168,7 +169,12 @@ func (h *SystemHandler) Status(c *gin.Context) {
 	runtime.ReadMemStats(&m)
 
 	util.OK(c, gin.H{
-		"version":        "1.0.0",
+		// 版本号来自 internal/version —— 这里**不能**再写字面量。
+		// 曾经写死 "1.0.0"，项目改了十几轮它一次没动过，
+		// 后台「系统状态」显示的版本号从上线第一天就是假的。
+		"version":        version.Version,
+		"commit":         version.ShortCommit(),
+		"buildTime":      version.BuildTime,
 		"uptime":         int(time.Since(h.start).Seconds()),
 		"dbOnline":       dbOnline,
 		"pansouOnline":   pansouOnline,

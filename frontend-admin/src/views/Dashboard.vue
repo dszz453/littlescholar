@@ -24,7 +24,15 @@
         <div class="card-box">
           <h3 class="section-title">系统状态</h3>
           <el-descriptions :column="2" border>
-            <el-descriptions-item label="版本">{{ status.version }}</el-descriptions-item>
+            <!-- 版本 / 构建放在同一项里，凑满 2 列布局，不留半行空格。
+                 「构建」= 这一版服务端二进制是从哪次提交构建出来的：
+                 版本号只能说明"哪一版"，改了却忘了升版本号时就对不上；
+                 commit 是客观的，所以它是"线上跑的对不对"最硬的证据。
+                 本地 go run 与旧镜像没有注入，只显示版本号，不是错误。 -->
+            <el-descriptions-item label="版本">
+              <span class="ver">v{{ status.version || '…' }}</span>
+              <span v-if="status.commit || status.buildTime" class="build">{{ buildLabel(status) }}</span>
+            </el-descriptions-item>
             <el-descriptions-item label="运行时长">{{ formatUptime(status.uptime) }}</el-descriptions-item>
             <el-descriptions-item label="数据库">
               <el-tag :type="status.dbOnline ? 'success' : 'danger'" size="small">
@@ -99,6 +107,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { systemApi, transferApi } from '@/api'
+import { buildLabel } from '@/utils/buildinfo'
 
 const status = ref({})
 const recentTasks = ref([])
@@ -193,6 +202,17 @@ onMounted(loadAll)
 
 .stat-label {
   font-size: 13px;
+  color: var(--ls-text-secondary);
+}
+
+.ver {
+  font-weight: 600;
+}
+
+/* 构建信息是次要信息，压成小字挂在版本号后面，不抢眼但随时可读 */
+.build {
+  margin-left: 6px;
+  font-size: 12px;
   color: var(--ls-text-secondary);
 }
 

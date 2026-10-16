@@ -108,7 +108,13 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.image }}:latest
             ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.image }}:${{ github.sha }}
+          # GIT_SHA 只被 core-server 的 Dockerfile 用（注入到二进制里，
+          # 由 /api/health 与后台「系统状态」读出来，回答"线上是哪一次构建"）；
+          # 前端 Dockerfile 不声明这个 ARG，多传一个未声明的 build-arg 是
+          # 无害的（Docker 只给一条 warning）。刻意不拆成两套参数：
+          # 三行 matrix 里塞条件表达式，比一条多余参数更难维护。
           build-args: |
             VITE_API_BASE=/api
+            GIT_SHA=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}

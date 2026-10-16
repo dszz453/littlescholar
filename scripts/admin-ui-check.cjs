@@ -106,8 +106,21 @@ function mockFor(method, pathAndQuery) {
   }
   // 顶栏的状态徽标。MainLayout 拿到结果后直接读 status.value.pansouOnline，
   // 兜底返回 null 会让它抛 TypeError（真实踩到过）—— 所以这里给一个真结构。
+  //
+  // version / commit / buildTime 三个字段是概览页「版本」项的断言依赖：
+  // 这一项以前直接显示后端写死的 "1.0.0"（后端从项目第一个提交起没改过），
+  // 所以必须有真值可断，否则"页面上有东西"和"显示的是真版本"分不开。
   if (p === '/api/admin/system/status') {
-    return { code: 0, data: { pansouOnline: true, dbOnline: true } };
+    return {
+      code: 0,
+      data: {
+        pansouOnline: true,
+        dbOnline: true,
+        version: '1.8.0',
+        commit: 'a1b2c3d',
+        buildTime: '2026-10-16T06:41:00Z',
+      },
+    };
   }
   if (p === '/api/admin/resources') {
     const mid = Number(url.searchParams.get('mappingId')) || 0;
@@ -418,6 +431,35 @@ async function main() {
   if (consoleErrors.length) console.log('    ' + consoleErrors.join(' | '));
   await shot('d-page-full.png', true);
   if (!dlgShot) no('弹窗截图没拿到');
+
+  // ============ 概览页：版本项 ============
+  //
+  // 单列一节的理由：这行版本号以前是**后端写死的 "1.0.0"**
+  // （`system.go` 的 gin.H 字面量，从项目第一个提交起没动过），
+  // 前端怎么做都救不回来 —— 而"线上到底跑的哪一版"恰恰是排查时
+  // 第一个要回答的问题。所以断言必须落在**具体值**上：
+  // 只断言"这一项存在"的话，1.0.0 和 1.8.0 都能过。
+  console.log('[7] 概览页：版本 / 构建信息');
+  await cmd('Page.navigate', { url: base + '/' });
+  if (!await waitFor(`!!document.querySelector('.el-descriptions .ver')`)) {
+    no('概览页「系统状态」里没有版本项（.ver 没渲染出来）');
+    await shot('e-dashboard-fail.png', true);
+  } else {
+    const ver = ((await evaluate(
+      `document.querySelector('.el-descriptions .ver').textContent`
+    )) || '').trim();
+    eq('版本项显示后端给的版本号', ver, 'v1.8.0');
+    truthy('版本号不是那个写死的 1.0.0', !ver.includes('1.0.0'));
+
+    // 构建信息（短 commit + 构建时刻）。取不到时后端字段为空、
+    // 前端整段不渲染 —— 那是本地 go run 的正常形态，不是错误；
+    // 但 mock 里给了值，所以这里必须真渲染出来。
+    const build = ((await evaluate(
+      `(document.querySelector('.el-descriptions .build') || {}).textContent || ''`
+    )) || '').trim();
+    truthy(`构建信息渲染出来了（${build}）`, build.includes('a1b2c3d'));
+  }
+  await shot('e-dashboard.png', true);
 
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   console.log(`截图目录：${OUT}`);
