@@ -539,40 +539,97 @@ function catTreeShape(nodes, out = []) {
 let lastCatShape = null
 
 /**
- * 局部刷新左树：只重载"当前展开着"的节点，其余节点的展开状态原样保留。
+ * 左树里"最上层那些展开着的"节点 key。
  *
- * 顺序不能反：系统目录重载会**重建它下面的全部子节点**（包括映射节点，
- * 于是映射的展开状态一并消失）。所以先把系统目录刷完，再把原本展开的
- * 映射节点重新展开回去。反过来做的话，映射节点刚展开就被目录重载丢掉。
+ * 为什么要先挑出最上层：el-tree 懒加载的 `loadData` 在 resolve 里执行
+ * `this.childNodes = []` 再重建（element-plus 的 node.mjs），**重载父节点
+ * 本来就把它下面的一切都换掉了** —— 再去单独重载子节点纯属白费力气，
+ * 而且那次重载的结果一定会被父节点的重建吃掉。
+ *
+ * 例：用户展开 乐学英语 → 新概念英语 → 某条映射，三层都在集合里。
+ * 只重载 乐学英语 就够，其余两层交给 restoreLeftExpansion() 还原。
  */
+function topMostExpandedKeys() {
+  const tree = catTreeRef.value
+  if (!tree) return []
+  const out = []
+  for (const k of leftExpandedKeys) {
+    // 映射节点不用单独刷：它的父级系统目录一重载就把它带走了。
+    if (k.startsWith('map-')) continue
+    const node = tree.getNode(k)
+    if (!node) continue
+    let p = node.parent
+    let covered = false
+    while (p && p.level > 0) {
+      const pd = p.data || {}
+      if (pd.id != null && leftExpandedKeys.has(String(pd.id))) {
+        covered = true
+        break
+      }
+      p = p.parent
+    }
+    if (!covered) out.push(k)
+  }
+  return out
+}
+
+/** 局部刷新左树：只重载最上层展开着的节点，不整棵重建。 */
 async function refreshLeftTree() {
   const tree = catTreeRef.value
   if (!tree || !leftExpandedKeys.size) return
   try {
-    const keys = [...leftExpandedKeys]
-    const cats = keys.filter((k) => !k.startsWith('map-'))
-    const maps = keys.filter((k) => k.startsWith('map-'))
-
-    for (const k of cats) {
+    for (const k of topMostExpandedKeys()) {
       const node = tree.getNode(k)
       if (!node) continue
-      // 标成未加载再展开 = 重新拉一次这个节点的子级（el-tree 的 lazy 会
-      // 因为 !loaded 重新调 load）。节点本来就是收起的就不动它 ——
-      // 只置 loaded=false，等用户下次点开时自然拿新数据。
+      // 标成未加载再 expand = 重新调一次 load 拿新子级（el-tree 的 lazy
+      // 会因为 !loaded 重新走 load）。本来就是收起的节点只置标志，
+      // 等用户下次点开时自然拿新数据。
       node.loaded = false
       if (node.expanded) node.expand()
     }
     await nextTick()
-    for (const k of maps) {
-      const node = tree.getNode(k)
-      if (node && !node.expanded) node.expand()
-    }
   } catch (e) {
-    // `node.loaded` 是 el-tree 节点的内部字段（`node.expand()` 是公开的）。
-    // 万一将来升级不再认它，宁可退回到"整棵重建"——展开状态会丢，
-    // 但绝不能什么都不做：那样用户看到的是"映射挂上了、树却没更新"。
-    leftExpandedKeys.clear()
+    // `node.loaded` 是 el-tree 节点的内部字段（`node.expand()` 是公开方法）。
+    // 万一将来升级不再认它，宁可退回到"整棵重建"——展开状态由
+    // restoreLeftExpansion() 兜回来，不会再像以前那样凭空丢掉。
     leftKey.value += 1
+  }
+}
+
+/**
+ * 把左树的展开状态还原成"用户刚才看到的样子"。
+ *
+ * 为什么不能"挨个 expand 一次"就完事 —— 这是上一版真正的 bug，用户报了两次：
+ *
+ *   el-tree 的 `loadData` 在 resolve 时做 `this.childNodes = []` 再新建，
+ *   **新建出来的子节点是全新的 Node 对象，expanded 一律 false**。
+ *   而"恢复"这一步的时序更要命：子节点的 Node 对象**只有在父节点 load
+ *   完成之后才存在**。早一步 getNode，拿到的要么是 undefined，要么是
+ *   **马上要被丢掉**的旧对象 —— 对它 expand() 是个空操作。
+ *
+ *   实测症状（正是用户说的"还存在收缩"）：刷新后第一层保住了、第二层全丢。
+ *
+ * 所以改成**多轮 + 从浅到深**：每一轮把所有"已存在但还没展开"的目标节点
+ * 展开掉，然后让出一轮时间给懒加载，连续几轮无事可做才收手。
+ */
+async function restoreLeftExpansion() {
+  const tree = catTreeRef.value
+  if (!tree || !leftExpandedKeys.size) return
+  const keys = [...leftExpandedKeys]
+  let idle = 0
+  for (let pass = 0; pass < 10 && idle < 3; pass++) {
+    let acted = false
+    for (const k of keys) {
+      const node = tree.getNode(k)
+      if (node && !node.expanded) {
+        node.expand()
+        acted = true
+      }
+    }
+    // 这一轮"没事干"不代表下一轮也没事（有些子级还在加载），
+    // 所以连续 3 轮都无事才停。
+    idle = acted ? 0 : idle + 1
+    await new Promise((r) => setTimeout(r, pass === 0 ? 50 : 140))
   }
 }
 
@@ -589,17 +646,21 @@ async function loadAll() {
     categoryTree.value = c || []
 
     // ⚠️ 这里原来是无条件 `leftKey += 1`（整棵重建）。
-    // 现在分成两条路，判据是"系统目录本身有没有变"：
+    // 现在分成两条路，判据是"系统目录本身的形状有没有变"：
     //   · 变了（首次加载 / 有人加了目录）→ 必须重建，否则新目录不出现；
     //   · 只是映射或资源变了 → 局部刷新，用户的展开状态原地保留。
+    //
+    // ⚠️ 两条路走完**都必须** restoreLeftExpansion()。重建那条路会把
+    // 手上的展开状态全丢掉 —— 光"不重建"是修不掉用户报的收缩的。
     const shape = catTreeShape(categoryTree.value)
     if (shape !== lastCatShape) {
       lastCatShape = shape
-      leftExpandedKeys.clear()
       leftKey.value += 1
+      await nextTick()
     } else {
       await refreshLeftTree()
     }
+    await restoreLeftExpansion()
 
     // 勾选状态必须和这份数据一起清 —— 只清数组、不清树上的勾，
     // 就会出现"格子还打着勾，canMap 却按没选算"的矛盾状态。

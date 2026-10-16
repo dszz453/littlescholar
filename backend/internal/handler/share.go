@@ -379,16 +379,30 @@ func (h *ShareHandler) Clear(c *gin.Context) {
 	for _, r := range resources {
 		rids = append(rids, r.ID)
 	}
+	// 先数「本来就有分享信息」的行数，再执行清除。
+	//
+	// 为什么不能直接用 Updates 的 RowsAffected：那是**匹配行数**，
+	// 把空串写成空串同样算影响 1 行。于是对一批从没共享过的资源点
+	// 「清除共享」，接口会回一句"已清除 12 条"，用户以为清掉了什么，
+	// 实际上一条都没动过 —— 数字对不上，比没有数字更糟。
+	const hasShare = "(share_url <> '' OR passcode <> '' OR share_id <> '')"
+	var affected int64
+	if err := h.db.Model(&model.Resource{}).
+		Where("id IN ?", rids).Where(hasShare).
+		Count(&affected).Error; err != nil {
+		util.ServerError(c, "读取分享信息失败")
+		return
+	}
+
 	// 逐列写空串而不是 Updates(map) 里省字段：省掉的字段 gorm 不会更新，
 	// 上一条分享的 passcode 就会留在库里 —— 表现为"链接没了、码还在"。
-	res := h.db.Model(&model.Resource{}).Where("id IN ?", rids).Updates(map[string]interface{}{
+	if err := h.db.Model(&model.Resource{}).Where("id IN ?", rids).Updates(map[string]interface{}{
 		"share_url": "", "passcode": "", "share_id": "",
-	})
-	if res.Error != nil {
+	}).Error; err != nil {
 		util.ServerError(c, "清除分享信息失败")
 		return
 	}
-	util.OK(c, gin.H{"cleared": res.RowsAffected})
+	util.OK(c, gin.H{"cleared": affected})
 }
 
 // collect 按入参取出本次要处理的资源。

@@ -756,3 +756,60 @@ func TestShareClearOnlyAffectsGiven(t *testing.T) {
 		t.Error("清 A 的时候把不在范围内的资源也清了")
 	}
 }
+
+// TestShareClearCountsOnlyShared 没共享过的资源不该被算进 cleared。
+//
+// Updates 的影响行数是"匹配行数"，空值覆盖空值也算 1 —— 对一批从没共享过的
+// 资源点「清除共享」，接口原样回"已清除 3 条"，用户以为清掉了什么。
+// 这里钉住"只数本来就有分享信息的"。
+func TestShareClearCountsOnlyShared(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newShareTestDB(t)
+	h := newShareHandler(t, db)
+	acc := seedQuarkAccount(t, db, "fake-share")
+
+	m := model.ResourceMapping{Name: "映射A", AccountID: acc.ID, CategoryID: 1}
+	mustCreate(t, db, &m)
+
+	shared := model.Resource{
+		Title: "共享过的", CategoryID: 1, DiskType: "fake-share",
+		DiskAccountID: &acc.ID, FileID: "fid-1", MappingID: m.ID,
+		ShareURL: "https://pan.example.com/s/x", Passcode: "pw", ShareID: "sid",
+	}
+	mustCreate(t, db, &shared)
+	// 另外两条只有 passcode / 完全为空 —— 都算"没有分享信息"。
+	onlyPass := model.Resource{
+		Title: "只有码的", CategoryID: 1, DiskType: "fake-share",
+		DiskAccountID: &acc.ID, FileID: "fid-2", MappingID: m.ID, Passcode: "pw",
+	}
+	mustCreate(t, db, &onlyPass)
+	bare := model.Resource{
+		Title: "没共享的", CategoryID: 1, DiskType: "fake-share",
+		DiskAccountID: &acc.ID, FileID: "fid-3", MappingID: m.ID,
+	}
+	mustCreate(t, db, &bare)
+
+	// 清除范围覆盖全部三条，但只有两条"有分享信息" → cleared 必须是 2：
+	//   · shared（链接+码+shareId）→ 算
+	//   · onlyPass（只剩一个码的**残留**）→ 也算，而且确实被清掉了
+	//     （这是"链接没了、码还在"那种半截状态，不清反而留隐患）
+	//   · bare（三列全空）→ **不算**，这正是要钉住的那一条
+	data := callShareClear(t, h, "?mappingId="+strconv.FormatUint(m.ID, 10))
+	if got := numOf(t, data, "cleared"); got != 2 {
+		t.Fatalf("cleared = %d，期望 2（shared + 只剩码的残留；bare 不算）", got)
+	}
+
+	got := reloadResources(t, db, shared.ID, onlyPass.ID, bare.ID)
+	if got[0].ShareURL != "" || got[0].Passcode != "" || got[0].ShareID != "" {
+		t.Errorf("shared 没被清干净: %+v", got[0])
+	}
+	if got[1].Passcode != "" {
+		t.Errorf("只剩 passcode 的那条也该被清干净: %+v", got[1])
+	}
+
+	// 再来一次：这回一条分享信息都没有了，cleared 必须是 0 而不是 3。
+	data2 := callShareClear(t, h, "?mappingId="+strconv.FormatUint(m.ID, 10))
+	if got := numOf(t, data2, "cleared"); got != 0 {
+		t.Fatalf("第二次 cleared = %d，期望 0（三列都空了却还回 3，就是「匹配行数」那个老毛病）", got)
+	}
+}

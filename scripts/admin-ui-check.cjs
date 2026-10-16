@@ -49,8 +49,31 @@ const truthy = (m, v) => (v ? ok(m) : no(m));
 
 /* ============ mock 数据 ============ */
 
+// ⚠️ 这里必须**有层级**，不能是"一个扁平节点"。
+//
+// 原来只有 `英语` 一个 `children: []` 的节点，于是「刷新后展开状态保持」
+// 那节只能验到**第一层** —— 而真正的 bug 恰好只发生在第二层往下：
+// el-tree 懒加载的 loadData 在 resolve 里 `childNodes = []` 再重建，
+// 子节点是全新 Node 对象、expanded 一律 false，第一层因为是被直接重载的
+// 那个节点所以保得住，第二层往上全被收回去。
+// 扁平 mock 让"断言全绿、线上照错"变成了必然。
 const CATEGORIES = [
-  { id: 17, name: '英语', parentId: 0, path: '/17/', children: [] },
+  {
+    id: 17, name: '英语', parentId: 0, path: '/17/',
+    children: [
+      {
+        // ⚠️ 名字**故意**不叫「牛津树」/「RAZ」：映射节点的显示名就是远端目录名
+        // （正好是这两个词）。同名会让"按名字找节点"的用例选中系统目录，
+        // 那边没有「共享」按钮 —— 表现是共享那节莫名其妙报"弹层没打开"。
+        id: 18, name: '分级读物', parentId: 17, path: '/17/18/',
+        children: [
+          { id: 19, name: '第一册', parentId: 18, path: '/17/18/19/', children: [] },
+        ],
+      },
+      { id: 20, name: '绘本', parentId: 17, path: '/17/20/', children: [] },
+    ],
+  },
+  { id: 21, name: '国学经典', parentId: 0, path: '/21/', children: [] },
 ];
 const ACCOUNTS = [
   { id: 1, nickname: '我的夸克', diskType: 'quark' },
@@ -492,16 +515,33 @@ async function main() {
   // 左树是 `.mp-cols` 下的第一个 `.mp-col`（中间是箭头、右边是接入源），
   // 不加 :first-child 会连右树一起数进来。
   const LEFT_EXPANDED = `document.querySelectorAll('.mp-cols > .mp-col:first-child .el-tree-node.is-expanded').length`;
-
-  truthy('左树展开了第一个系统目录', await evaluate(`
+  // 展开着的节点**名单**（只取自身，不把子孙算到父节点头上）。
+  // 只数个数是不够的：数目对得上、换了一批节点，一样是"用户的东西被动了"。
+  const LEFT_NAMES = `
+    Array.from(document.querySelectorAll('.mp-cols > .mp-col:first-child .el-tree-node.is-expanded'))
+      .map(n => { const x = n.querySelector(':scope > .el-tree-node__content .mp-node-name'); return x ? x.textContent.trim() : '?'; })
+  `;
+  const clickExpandIcons = async (max) => evaluate(`
     (function(){
-      var ic = document.querySelector('.mp-cols > .mp-col:first-child .el-tree-node__expand-icon');
-      if (!ic) return false;
-      ic.click();
-      return true;
+      var col = document.querySelector('.mp-cols > .mp-col:first-child');
+      var icons = Array.prototype.slice.call(col.querySelectorAll('.el-tree-node'))
+        .filter(function(n){ return !n.classList.contains('is-expanded'); })
+        .map(function(n){ return n.querySelector(':scope > .el-tree-node__content .el-tree-node__expand-icon'); })
+        .filter(function(i){ return i && !i.classList.contains('is-leaf'); });
+      icons.slice(0, ${max}).forEach(function(i){ i.click(); });
+      return icons.length;
     })()
-  `));
-  await sleep(600);
+  `);
+
+  // ⚠️ 展开**三层**，不是一层。第二层往下才是这个 bug 真正藏身的地方
+  // （见 CATEGORIES 上的说明）。只展开一层的话，旧实现的 `afterCount`
+  // 也不会归零，这条用例就成了"永远绿"的摆设。
+  await clickExpandIcons(1);
+  await sleep(700);
+  await clickExpandIcons(2);
+  await sleep(700);
+
+  const beforeNames = await evaluate(LEFT_NAMES);
   const beforeCount = await evaluate(LEFT_EXPANDED);
   const beforeName = await evaluate(`
     (function(){
@@ -509,8 +549,9 @@ async function main() {
       return n ? n.textContent.trim() : '';
     })()
   `);
-  truthy(`确实是展开状态（展开数 ${beforeCount}，目录「${beforeName}」）`,
-    beforeCount > 0 && !!beforeName);
+  truthy(`左树展开了多层（展开数 ${beforeCount}：${(beforeNames || []).join(' / ')}）`,
+    beforeCount >= 2);
+  truthy(`确实是展开状态（目录「${beforeName}」）`, !!beforeName);
 
   // 触发一次刷新。用工具栏最右那个只有图标没有文字的按钮 ——
   // 它走的正是 `loadAll()`，也就是"每挂完一个映射"必然要走的那条路。
@@ -526,16 +567,21 @@ async function main() {
   await sleep(1500);
 
   const afterCount = await evaluate(LEFT_EXPANDED);
+  const afterNames = await evaluate(LEFT_NAMES);
   const afterName = await evaluate(`
     (function(){
       var n = document.querySelector('.mp-cols > .mp-col:first-child .el-tree-node.is-expanded .mp-node-name');
       return n ? n.textContent.trim() : '';
     })()
   `);
-  // 这里是整条断言的核心：旧实现每刷新一次就 `leftKey += 1` 整棵重建，
-  // 于是 afterCount 恒为 0 —— 用户就得一级一级把目录重新点开。
+  // 这里是整条断言的核心：旧实现每次刷新都把展开的第二层往下整批收回去
+  // （父节点的 loadData 会 `childNodes = []` 重建），用户就得一级一级重点。
   eq('刷新后展开的节点数不变（不再整棵重建）', afterCount, beforeCount);
   eq('刷新后展开的还是原来那个目录', afterName, beforeName);
+  // 名单级断言：个数对得上但"换了一批节点"同样是要抓的。
+  const lost = (beforeNames || []).filter((x) => !(afterNames || []).includes(x));
+  truthy(`刷新后展开的节点名单一个不少（丢失 ${lost.length} 个${lost.length ? '：' + lost.join(' / ') : ''}）`,
+    lost.length === 0);
   await shot('f-tree-expanded.png', true);
 
   // ============ 概览页：版本项 ============
@@ -602,6 +648,7 @@ async function main() {
       (function(){
         var nodes = document.querySelectorAll('.mp-cols > .mp-col:first-child .el-tree-node');
         var seen = [];
+        var nameMatched = false;
         for (var i = 0; i < nodes.length; i++) {
           var nm = nodes[i].querySelector(':scope > .el-tree-node__content .mp-node-name');
           if (!nm) continue;
@@ -609,11 +656,16 @@ async function main() {
           seen.push(t);
           if (t === ${JSON.stringify(name)}) {
             var b = nodes[i].querySelector(':scope > .el-tree-node__content ' + ${JSON.stringify(sel)});
+            // ⚠️ 名字撞车是**正常**的：系统目录和"挂上来的远端目录"可能同名。
+            // 所以"名字对上但没这个按钮"不能直接判失败，要继续往后找 ——
+            // 直接 return 会把"选错了同名节点"误报成"按钮不存在"。
             if (b) { b.click(); return { ok: true, seen: seen }; }
-            return { ok: false, why: '节点找到了但没有 ' + ${JSON.stringify(sel)}, seen: seen };
+            nameMatched = true;
           }
         }
-        return { ok: false, why: '没找到名为 ' + ${JSON.stringify(name)} + ' 的节点', seen: seen };
+        return { ok: false, why: nameMatched
+          ? '同名节点找到了但没有 ' + ${JSON.stringify(sel)}
+          : '没找到名为 ' + ${JSON.stringify(name)} + ' 的节点', seen: seen };
       })()
     `;
 
