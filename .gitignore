@@ -112,3 +112,7 @@ frontend-kid/public/standard_fonts/
 # 构建时 `mv dist dist-old` 留下的旧产物
 frontend-kid/dist-old*/
 frontend-admin/dist-old*/
+
+# 探针/比对用的临时产物（从线上抓下来的 index.html 与 JS 快照）
+# 「跑一次就丢」的东西，进库只会让 clone 变慢。
+.probe/

@@ -14,9 +14,13 @@ import android.net.Uri
 import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
+import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.SslErrorHandler
@@ -54,9 +58,71 @@ import com.journeyapps.barcodescanner.ScanOptions
  */
 class MainActivity : AppCompatActivity() {
 
+    private companion object {
+        /**
+         * 暂停/播完之后，前台服务**再多活这么久**才真的停。
+         *
+         * ⚠️ 这个宽限期不是"保险"，是**刚需**：播完一集，播放页会立刻
+         * `router.replace('/play/{下一集}')`，中间那 1~3 秒里
+         * `<video>`/`<audio>` 会先 `ended`、新的一集才 `play`。
+         * 如果"收到 ended 立刻停"，服务正好停在空窗里 ——
+         * 而下一集要拉 `/api/app/play/{id}`，此刻进程已经没有前台优先级，
+         * 被冻住就取不到 → 孩子看到的是「网络异常」。
+         *
+         * 也不能设太长：用户真不听了之后，通知栏那条要如期消失。
+         * 90 秒足够覆盖切集、拖动、缓冲重试。
+         */
+        const val KEEPALIVE_GRACE_MS = 90_000L
+
+        /**
+         * 注入给播放页的监听脚本。
+         *
+         * ⚠️ 为什么必须"注入"而不是"让孩子端自己调"：
+         * 这个壳的职责本来就写着「息屏播放、返回键、下载/外链」，
+         * 而孩子端 PWA 是**另一份产物**（还有线上部署的那一份）——
+         * 让 PWA 去调一个只有 APK 里才存在的桥，等于把壳的职责推给网页，
+         * 而且线上那份不该知道有 App 这回事。所以接线放在壳里。
+         *
+         * 媒体事件（play/pause/ended…）**不冒泡**，但会走**捕获阶段**，
+         * 所以在 document 上挂捕获监听能收到页面里**所有** video/audio 的事件，
+         * 不需要知道播放页把播放器放在哪一层、是 `<video>` 还是 `<audio>`
+         * （孩子端两种都用：音频走 `<audio>`、视频走 `<video>`）。
+         * `__lsPlayWatch` 保证只装一次（SPA 路由切换不会重装）。
+         */
+        const val KEEPALIVE_JS = """
+(function () {
+  if (window.__lsPlayWatch) { return; }
+  window.__lsPlayWatch = 1;
+  var send = function (on) {
+    try { window.KidNative.setPlaying(!!on); } catch (e) { /* 纯浏览器里没有这个桥 */ }
+  };
+  var on  = ['play', 'playing'];
+  var off = ['pause', 'ended', 'emptied', 'error'];
+  on.concat(off).forEach(function (name) {
+    document.addEventListener(name, function (e) {
+      var t = e.target;
+      if (!t || (t.tagName !== 'VIDEO' && t.tagName !== 'AUDIO')) { return; }
+      send(on.indexOf(name) >= 0);
+    }, true);
+  });
+})();
+"""
+    }
+
     private lateinit var webView: WebView
     private lateinit var swipe: SwipeRefreshLayout
     private lateinit var root: FrameLayout
+
+    /**
+     * 我们**希望**前台服务开着（网页里有东西在播）。
+     *
+     * ⚠️ 它只表达"意愿"，**不能**用来判断服务是否真的在跑 ——
+     * 通知栏按钮、Activity 重建、系统重启服务都会让两边状态漂。
+     * 真正的事实只有一份：`MediaPlaybackService.isRunning()`。
+     */
+    private var playbackWanted = false
+    private val playbackHandler = Handler(Looper.getMainLooper())
+    private val stopPlayback = Runnable { maybeStopPlayback() }
 
     /** 当前生效的服务器地址（来自本地存储，家长可改）。 */
     private var siteUrl: String = ""
@@ -354,6 +420,20 @@ class MainActivity : AppCompatActivity() {
             s.mediaPlaybackRequiresUserGesture = false
         }
 
+        // ============ 播放保活桥 ============
+        //
+        // ⚠️ 2026-10-16 补的：在此之前 MediaPlaybackService 的 start()/stop()
+        // **全项目零调用** —— 前台服务和唤醒锁都是一段完整的死代码，
+        // 于是"息屏播放"全靠运气，现象是「息屏播完一集不切下一集，提示网络错误」。
+        //
+        // ⚠️ `addJavascriptInterface` 一挂上，**任何被加载的页面**都能调它。
+        // 所以这里两点必须守住：
+        //   ① 暴露面做到最小 —— 只有一个"我在播/我不播了"的布尔量，
+        //      拿不到任何本机信息、也执行不了任何跳转；
+        //   ② 配合 [shouldOverrideUrlLoading] 的导航闸门 —— 只有配置地址
+        //      （`siteUrl` 前缀）下的页面留在 WebView 里，外链一律走系统浏览器。
+        webView.addJavascriptInterface(PlaybackBridge(), "KidNative")
+
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView,
@@ -373,6 +453,11 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView, url: String) {
                 swipe.isRefreshing = false
                 Diagnostics.add("页面", "加载完成 $url")
+
+                // 注入"播放保活"监听（细节见 KEEPALIVE_JS）。
+                // ⚠️ 必须**每次**加载完都注入：脚本自己不重复装（靠 __lsPlayWatch），
+                //    但页面重载后 window 是全新的，不注入就退回"没有保活"。
+                injectPlaybackWatch(view)
 
                 // 出问题时第一个要回答的问题永远是「客户端到底跑的是哪份 JS」。
                 // 让网页自报家门并存进诊断，省得每次都靠猜。
@@ -567,10 +652,15 @@ class MainActivity : AppCompatActivity() {
      * 应用退到后台时不暂停 WebView 的媒体播放。
      *
      * 实测要点：WebView 内部一旦进入 paused 状态，<audio>/<video> 会被强制停，
-     * "息屏听故事"直接失效。所以这里 **不调用** webView.onPause()，
-     * 仅在前台服务里持唤醒锁防止 CPU 休眠。
+     * "息屏听故事"直接失效。所以这里 **不调用** webView.onPause()。
      *
-     * 注意：这是"后台播放"的必要条件，不是充分条件。
+     * ⚠️ 不暂停 WebView 只是**必要条件之一**，另外两条同样不能少
+     * （2026-10-16 才补齐，此前"息屏播放"其实一直没真正成立）：
+     *   ① 前台服务得真的**被启动**（`MediaPlaybackService.start()`）；
+     *   ② 服务里得真的持 CPU 唤醒锁 + WiFi 锁。
+     * 这两条现在由 [setPlaybackActive] / [maybeStopPlayback] 驱动。
+     *
+     * 注意：这仍是"后台播放"的必要条件，不是充分条件。
      * 部分国产 ROM（MIUI / EMUI / ColorOS）还会额外杀后台，
      * 需要在系统设置里把小书童的电池策略设为"无限制"，或引导家长加白名单。
      */
@@ -585,8 +675,103 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // ⚠️ 一定要摘掉挂在主线程 Handler 上的那个 Runnable：
+        // 它捕获了 this，留着就是一条"Activity 已销毁但还被 Handler 引用"的泄漏链，
+        // 而它在宽限期到点时还会去碰已经没了的 Activity。
+        playbackHandler.removeCallbacks(stopPlayback)
         MediaBridge.detach()
         webView.destroy()
         super.onDestroy()
+    }
+
+    // ============================================================
+    //  播放保活（前台服务 + 唤醒锁的启停）
+    // ============================================================
+
+    /**
+     * 暴露给网页的最小桥：**只有"我在播 / 我不播了"这一件事**。
+     *
+     * ⚠️ 方法跑在 WebView 的 JavaBridge 线程上，碰 UI/服务的都要 `runOnUiThread`。
+     * ⚠️ 参数来自页面，一律当不可信输入 —— 这里只有一个 Boolean，
+     * 不存在注入点；但也正因如此，**不要往这个类里加任何能读本机信息
+     * 或能发网络请求的方法**（它挂在任何被加载的页面上）。
+     */
+    inner class PlaybackBridge {
+        @JavascriptInterface
+        fun setPlaying(on: Boolean) {
+            runOnUiThread { setPlaybackActive(on) }
+        }
+    }
+
+    /**
+     * 把 [KEEPALIVE_JS] 塞进当前页面。
+     *
+     * ⚠️ 用 `evaluateJavascript` 而不是 `loadUrl("javascript:…")`：前者不刷新页面、
+     * 也不受 URL 长度与转义影响。它**不等待 Promise** —— 但这段脚本是同步的。
+     * 失败只记诊断：保活是优化，不是功能，绝不能让它把页面搞挂。
+     */
+    private fun injectPlaybackWatch(view: WebView) {
+        try {
+            view.evaluateJavascript(KEEPALIVE_JS, null)
+            Diagnostics.add("保活", "已注入播放监听")
+        } catch (e: Exception) {
+            Diagnostics.add("保活", "注入失败：${e.message}")
+        }
+    }
+
+    /**
+     * 播放状态变了。`on = true` 表示"网页里某个播放器正在播"。
+     *
+     * 开：马上起服务（用户此刻在操作，前台启动一定被允许）。
+     * 关：**不马上停**，交给 [maybeStopPlayback] —— 详见宽限期那段注释。
+     */
+    private fun setPlaybackActive(on: Boolean) {
+        playbackHandler.removeCallbacks(stopPlayback)
+        if (on) {
+            playbackWanted = true
+            if (!MediaPlaybackService.isRunning()) {
+                Diagnostics.add("保活", "开始播放 → 起前台服务与唤醒锁")
+                MediaPlaybackService.start(this)
+            }
+            return
+        }
+        if (!playbackWanted) return
+        playbackHandler.postDelayed(stopPlayback, KEEPALIVE_GRACE_MS)
+    }
+
+    /**
+     * 宽限期到了，判断到底该不该停。
+     *
+     * ⚠️ **息屏时不停**，再等一轮。
+     *
+     * 因为"息屏"在这个 App 里基本等价于"用户正在听"（孩子端播放页上就写着
+     * 「播放中直接锁屏也不会停，把手机翻过来听也行」）。这时候把服务收掉
+     * 有两个后果，而且是叠加的：
+     *   ① 进程立刻失去前台优先级，可能被回收/冻结 —— 音频就断了；
+     *   ② 想再起来就得**从后台**调 `startForegroundService`，
+     *      Android 12+ 直接抛 `ForegroundServiceStartNotAllowedException`
+     *      —— 也就是说**这一集结束了就再也切不到下一集了**，
+     *      而不是"断一下能恢复"。
+     * 所以熄屏期间一直续着，等亮屏之后的那一轮再收。
+     *
+     * 这也顺手解决了"息屏播完一集切下一集"：切集时 `ended` → `play` 之间
+     * 本来就落在宽限期里，服务根本不会停。
+     */
+    private fun maybeStopPlayback() {
+        if (!playbackWanted) return
+        if (!screenInteractive()) {
+            // 屏幕还黑着：再续一轮，不释放任何东西
+            playbackHandler.postDelayed(stopPlayback, KEEPALIVE_GRACE_MS)
+            return
+        }
+        playbackWanted = false
+        Diagnostics.add("保活", "播放结束 → 停前台服务并释放唤醒锁")
+        MediaPlaybackService.stop(this)
+    }
+
+    private fun screenInteractive(): Boolean = try {
+        (getSystemService(POWER_SERVICE) as? PowerManager)?.isInteractive ?: true
+    } catch (e: Exception) {
+        true // 拿不到就按"亮着"处理：宁可多留一会儿服务，也别在息屏时误停
     }
 }
