@@ -110,7 +110,10 @@ export const diskApi = {
 
 // 资源映射：远端存储目录 → 系统目录，同步即批量登记资源
 export const mappingApi = {
-  list: (accountId) => http.get('/admin/mappings', { params: accountId ? { accountId } : {} }),
+  // params 可选：{ accountId } 看"某个网盘挂了哪些目录"，
+  // { categoryId } 看"某个系统目录挂了哪条映射"（目录管理页的「立即同步」要用）。
+  // 都不传就是全部。
+  list: (params) => http.get('/admin/mappings', { params: params || {} }),
   create: (data) => http.post('/admin/mappings', data),
   update: (id, data) => http.put(`/admin/mappings/${id}`, data),
   // withResources=true 时连带清理这条映射同步进来的资源。

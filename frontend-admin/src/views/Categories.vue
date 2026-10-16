@@ -129,17 +129,45 @@
           <div class="form-tip">
             <template v-if="remote">
               保存后会同时建立一条<b>递归映射</b>，把该目录里的媒体文件登记成资源。
-              目录名已按网盘目录名填好，可以改。
+              目录名已按网盘目录名填好，可以改。<br />
+              想建完马上把资源拉下来，用下面的「<b>保存并同步</b>」。
             </template>
             <template v-else>
               选好网盘目录后，目录名会自动填上；不想建映射就留空。
             </template>
           </div>
         </el-form-item>
+
+        <!-- 同步：编辑目录时就地同步，不再逼用户跑去「资源映射」页找那一条。
+             ⚠️ 一个系统目录理论上可以挂多条映射（虽然少见），
+             所以这里列全并逐条同步，而不是只同步第一条。 -->
+        <el-form-item v-if="editing" label="映射同步">
+          <div v-if="catMappings.length" class="sync-box">
+            <div v-for="m in catMappings" :key="m.id" class="sync-row">
+              <span class="sync-name">{{ m.name || ('映射 #' + m.id) }}</span>
+              <span class="text-secondary">{{ syncHint(m) }}</span>
+            </div>
+            <el-button
+              type="success"
+              size="small"
+              :icon="RefreshRight"
+              :loading="syncing"
+              @click="syncCat"
+            >
+              立即同步（{{ catMappings.length }} 条）
+            </el-button>
+          </div>
+          <span v-else class="text-secondary">
+            这个目录还没有网盘映射。新建目录时选一个「网盘目录」就会自动建一条。
+          </span>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+        <el-button v-if="!editing && remote" :loading="saving" @click="save(true)">
+          保存并同步
+        </el-button>
+        <el-button type="primary" :loading="saving" @click="save(false)">保存</el-button>
       </template>
     </el-dialog>
 
@@ -162,7 +190,7 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Refresh } from '@element-plus/icons-vue'
+import { Plus, Refresh, RefreshRight } from '@element-plus/icons-vue'
 import { categoryApi, diskApi, mappingApi } from '@/api'
 import RemoteDirTree from '@/components/RemoteDirTree.vue'
 
@@ -179,6 +207,9 @@ const accounts = ref([])
 const pickerVisible = ref(false)
 // 选中的远端目录（null = 用户没打算建映射）
 const remote = ref(null)
+// 当前编辑的目录已挂的映射（编辑时用来就地同步）
+const catMappings = ref([])
+const syncing = ref(false)
 
 const form = ref({
   name: '',
@@ -281,9 +312,75 @@ function openEdit(data) {
     parentId: data.parentId,
   }
   dialogVisible.value = true
+  loadCatMappings(data.id)
 }
 
-async function save() {
+/** 拉这个目录已挂的映射。失败只当作"没有"，不打断编辑本身。 */
+async function loadCatMappings(categoryId) {
+  catMappings.value = []
+  if (!categoryId) return
+  try {
+    catMappings.value = (await mappingApi.list({ categoryId })) || []
+  } catch (e) {
+    catMappings.value = []
+  }
+}
+
+/** 映射的一行说明：上次同步结果比"有没有配"更值得看 —— 配了但从没同步过才是常态。 */
+function syncHint(m) {
+  if (!m.lastSyncAt) return '还没同步过'
+  const t = fmtSyncTime(m.lastSyncAt)
+  if (m.lastSyncError) return `${t} 同步失败：${m.lastSyncError}`
+  return `${t} 同步 +${m.lastSyncCreated || 0} 条`
+}
+
+function fmtSyncTime(v) {
+  try {
+    const d = new Date(v)
+    if (Number.isNaN(d.getTime())) return String(v)
+    const p = (n) => String(n).padStart(2, '0')
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+  } catch (e) {
+    return String(v)
+  }
+}
+
+/**
+ * 就地同步这个目录挂着的映射。
+ *
+ * ⚠️ 逐条串行而不是 Promise.all：同步会真的去列网盘目录（递归可能几十秒），
+ * 并发发出去容易被网盘侧风控，而且报错会糊成一条 —— 用户看不清是哪条失败。
+ */
+async function syncCat() {
+  if (!catMappings.value.length) return
+  syncing.value = true
+  let created = 0
+  const errs = []
+  try {
+    for (const m of catMappings.value) {
+      try {
+        const r = await mappingApi.sync(m.id)
+        created += (r && r.created) || 0
+        if (r && r.error) errs.push(`${m.name || m.id}：${r.error}`)
+      } catch (e) {
+        errs.push(`${m.name || m.id}：${(e && e.message) || '同步失败'}`)
+      }
+    }
+    if (errs.length) {
+      ElMessage.warning(`同步有失败：${errs.join('；')}`)
+    } else if (created > 0) {
+      ElMessage.success(`同步完成，新登记 ${created} 个资源`)
+    } else {
+      ElMessage.success('同步完成，没有新资源（已是最新）')
+    }
+    loadCatMappings(currentId.value)
+    loadTree()
+  } finally {
+    syncing.value = false
+  }
+}
+
+async function save(andSync) {
   if (!form.value.name.trim()) {
     ElMessage.warning('请输入目录名称')
     return
@@ -298,9 +395,10 @@ async function save() {
       // 建映射是"顺手做的事"，它失败**不能吞掉**：
       // 目录已经建出来了，用户会以为映射也成了，回头发现孩子端空空如也。
       let mappingErr = ''
+      let mappingId = 0
       if (remote.value && created && created.id) {
         try {
-          await mappingApi.create({
+          const m = await mappingApi.create({
             name: remote.value.dirName || created.name,
             accountId: remote.value.accountId,
             remoteDirId: remote.value.dirId || '',
@@ -309,6 +407,7 @@ async function save() {
             recursive: true,
             enabled: true,
           })
+          mappingId = (m && m.id) || 0
         } catch (e) {
           mappingErr = (e && e.message) || '未知原因'
         }
@@ -316,7 +415,28 @@ async function save() {
       if (mappingErr) {
         ElMessage.warning(`目录已创建，但映射没建上：${mappingErr}。请到「资源映射」手动补一条`)
       } else if (remote.value) {
-        ElMessage.success('创建成功，并建好了映射（记得去「资源映射」点一次同步）')
+        // 「保存并同步」：建完映射**当场**把资源拉下来。
+        // ⚠️ 同步失败不能把"目录+映射已建好"这件事说成失败 ——
+        //    它们是两步：目录/映射已经落库，同步只是没拉到资源，重试即可。
+        if (andSync && mappingId) {
+          try {
+            const r = await mappingApi.sync(mappingId)
+            if (r && r.error) {
+              ElMessage.warning(`目录与映射已建好，但同步失败：${r.error}。稍后可再同步`)
+            } else {
+              ElMessage.success(
+                `创建成功，已同步登记 ${(r && r.created) || 0} 个资源` +
+                  ((r && r.skipped) ? `（跳过 ${r.skipped} 个已存在的）` : '')
+              )
+            }
+          } catch (e) {
+            ElMessage.warning(
+              `目录与映射已建好，但同步没能执行：${(e && e.message) || '未知原因'}。稍后可再同步`
+            )
+          }
+        } else {
+          ElMessage.success('创建成功，并建好了映射（可用「保存并同步」一步到位）')
+        }
       } else {
         ElMessage.success('创建成功')
       }
@@ -462,5 +582,28 @@ onMounted(() => {
   font-size: 13px;
   color: var(--ls-text-secondary);
   word-break: break-all;
+}
+
+/* 编辑目录时的「映射同步」块。
+   ⚠️ 「上次同步结果」用等宽数字：时间与条数上下对齐后，
+   扫一眼就能看出哪条最近同步过、哪条一直是失败的。 */
+.sync-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.sync-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.sync-name {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 </style>

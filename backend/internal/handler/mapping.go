@@ -37,11 +37,21 @@ func NewMappingHandler(db *gorm.DB, encryptor *util.Encryptor) *MappingHandler {
 }
 
 // List 映射列表
+//
+// 支持按账号、按系统目录过滤：
+//
+//	· accountId  —— 「资源接入」页关心"这个网盘挂了哪些目录"；
+//	· categoryId —— 「目录管理」页关心"这个目录挂了哪条映射"，
+//	  这样它才能在编辑目录时就地放一个「立即同步」按钮，
+//	  而不必让用户跑去「资源映射」页找那一条。
 func (h *MappingHandler) List(c *gin.Context) {
 	var list []model.ResourceMapping
 	q := h.db.Preload("Account").Preload("Category")
 	if t := c.Query("accountId"); t != "" {
 		q = q.Where("account_id = ?", t)
+	}
+	if t := c.Query("categoryId"); t != "" {
+		q = q.Where("category_id = ?", t)
 	}
 	if err := q.Order("id desc").Find(&list).Error; err != nil {
 		util.ServerError(c, "查询失败")
