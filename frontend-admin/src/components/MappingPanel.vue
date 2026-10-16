@@ -3,8 +3,8 @@
     <div class="mp-bar">
       <span class="text-secondary">
         左边是系统目录，右边是接入源。左边勾系统目录、右边勾要挂进来的内容，用中间的箭头搬运：
-        <b>→</b> 挂过来（勾目录 = 建一条映射并递归导入；勾文件 = 只导入这一个），
-        <b>←</b> 放回去。
+        <b>←</b> 挂过来（勾目录 = 建一条映射并递归导入；勾文件 = 只导入这一个），
+        <b>→</b> 放回去。
         系统目录展开能一路看到<b>已经导入的每一个资源</b>，每条映射、每个资源旁边都有 ✕ 可以单独取消。
       </span>
       <div class="mp-bar-actions">
@@ -66,6 +66,8 @@
             :expand-on-click-node="false"
             empty-text="还没有系统目录"
             @check="onCatCheck"
+            @node-expand="onLeftExpand"
+            @node-collapse="onLeftCollapse"
           >
             <template #default="{ data }">
               <span class="mp-node">
@@ -95,23 +97,26 @@
                 >
                   {{ diskName(data.diskType) }}{{ data.enabled ? '' : ' · 已停用' }}
                 </el-tag>
+                <!-- 角标一律**现算**，不读节点自带的字段：左树不再整棵重建，
+                     而节点数据是 load 那一刻定死的 —— 读老字段的话，
+                     新加的映射数、新同步的资源数都不会变。 -->
                 <el-tag
-                  v-if="data.kind === 'mapping' && data.resourceCount"
+                  v-if="data.kind === 'mapping' && mappingResCount(data)"
                   size="small"
                   type="info"
                   effect="plain"
                   class="mp-node-tag"
                 >
-                  {{ data.resourceCount }} 个资源
+                  {{ mappingResCount(data) }} 个资源
                 </el-tag>
                 <el-tag
-                  v-if="data.kind === 'category' && data.mapCount"
+                  v-if="data.kind === 'category' && catMapCount(data)"
                   size="small"
                   type="success"
                   effect="plain"
                   class="mp-node-tag"
                 >
-                  {{ data.mapCount }} 条映射
+                  {{ catMapCount(data) }} 条映射
                 </el-tag>
                 <span v-if="data.kind === 'resource'" class="mp-size">
                   {{ fmtSize(data.size) }}
@@ -139,17 +144,23 @@
       </div>
 
       <!-- 中：箭头 -->
+      <!-- ⚠️ 箭头的**朝向**不能按"按钮在中间"来随便选，它指的是数据流向：
+           左边是系统目录（库里的），右边是接入源（网盘上的）。
+             · 挂过来 —— 网盘 → 库，所以是 **←**（从右指向左）
+             · 放回去 —— 库 → 网盘，所以是 **→**（从左指向右）
+           用户 2026-10-16 反馈："箭头肯定是右到左，现在是反的"。
+           之前两个箭头恰好写反，看着像"把系统目录推到网盘去"。 -->
       <div class="mp-arrows">
         <el-tooltip :content="mapTip" placement="top" :disabled="canMap">
           <span class="mp-arrow-wrap">
             <el-button class="mp-arrow" type="primary" :disabled="!canMap" @click="doMap">
-              →
+              ←
             </el-button>
           </span>
         </el-tooltip>
         <el-tooltip :content="unmapTip" placement="bottom" :disabled="canUnmap">
           <span class="mp-arrow-wrap">
-            <el-button class="mp-arrow" :disabled="!canUnmap" @click="doUnmap"> ← </el-button>
+            <el-button class="mp-arrow" :disabled="!canUnmap" @click="doUnmap"> → </el-button>
           </span>
         </el-tooltip>
         <div class="mp-opt">
@@ -299,7 +310,7 @@
 </template>
 
 <script setup>
-import { computed, h, onMounted, ref } from 'vue'
+import { computed, h, nextTick, onMounted, ref } from 'vue'
 import { ElCheckbox, ElMessage, ElMessageBox } from 'element-plus'
 import { Download, Refresh, RefreshRight } from '@element-plus/icons-vue'
 import { diskApi, mappingApi, categoryApi, resourceApi } from '@/api'
@@ -383,6 +394,80 @@ function formatTime(t) {
   return new Date(t).toLocaleString('zh-CN', { hour12: false })
 }
 
+/**
+ * 左树当前**展开着**的节点 id 集合。
+ *
+ * 只为了一件事：映射增删之后左树必须能更新，但**不能整棵重建**。
+ *
+ * 用户 2026-10-16 反馈："每匹配一个资源，我展开的两边目录树就自动刷新、
+ * 又收回去，还得一级一级重新点开 —— 因为我还要在这个目录下继续映射。"
+ * 根因就是重建：`:key="leftKey"` 一变，el-tree 整个重新挂载，
+ * 展开状态、滚动位置全丢。挂完一个目录必然要刷新一次，于是每挂一次收一次。
+ *
+ * 所以改成"只重载展开着的那些节点"。这份集合由 el-tree 的
+ * node-expand / node-collapse 事件维护 —— 都是公开事件，
+ * 不依赖组件内部结构。
+ */
+const leftExpandedKeys = new Set()
+
+function onLeftExpand(data) {
+  if (data && data.id != null) leftExpandedKeys.add(String(data.id))
+}
+
+function onLeftCollapse(data) {
+  if (data && data.id != null) leftExpandedKeys.delete(String(data.id))
+}
+
+/** 系统目录树的"形状指纹"：所有节点 id 按顺序拼起来。 */
+function catTreeShape(nodes, out = []) {
+  for (const n of nodes || []) {
+    out.push(n.id)
+    catTreeShape(n.children, out)
+  }
+  return out.join(',')
+}
+
+// 上一次见的形状。只有当它变了（首次加载、目录被增删）才值得整棵重建。
+let lastCatShape = null
+
+/**
+ * 局部刷新左树：只重载"当前展开着"的节点，其余节点的展开状态原样保留。
+ *
+ * 顺序不能反：系统目录重载会**重建它下面的全部子节点**（包括映射节点，
+ * 于是映射的展开状态一并消失）。所以先把系统目录刷完，再把原本展开的
+ * 映射节点重新展开回去。反过来做的话，映射节点刚展开就被目录重载丢掉。
+ */
+async function refreshLeftTree() {
+  const tree = catTreeRef.value
+  if (!tree || !leftExpandedKeys.size) return
+  try {
+    const keys = [...leftExpandedKeys]
+    const cats = keys.filter((k) => !k.startsWith('map-'))
+    const maps = keys.filter((k) => k.startsWith('map-'))
+
+    for (const k of cats) {
+      const node = tree.getNode(k)
+      if (!node) continue
+      // 标成未加载再展开 = 重新拉一次这个节点的子级（el-tree 的 lazy 会
+      // 因为 !loaded 重新调 load）。节点本来就是收起的就不动它 ——
+      // 只置 loaded=false，等用户下次点开时自然拿新数据。
+      node.loaded = false
+      if (node.expanded) node.expand()
+    }
+    await nextTick()
+    for (const k of maps) {
+      const node = tree.getNode(k)
+      if (node && !node.expanded) node.expand()
+    }
+  } catch (e) {
+    // `node.loaded` 是 el-tree 节点的内部字段（`node.expand()` 是公开的）。
+    // 万一将来升级不再认它，宁可退回到"整棵重建"——展开状态会丢，
+    // 但绝不能什么都不做：那样用户看到的是"映射挂上了、树却没更新"。
+    leftExpandedKeys.clear()
+    leftKey.value += 1
+  }
+}
+
 async function loadAll() {
   loading.value = true
   try {
@@ -394,9 +479,28 @@ async function loadAll() {
     mappings.value = m || []
     accounts.value = a || []
     categoryTree.value = c || []
-    // 映射变了，左树上挂的那些"已映射"节点也得跟着变 —— 整棵重建
-    leftKey.value += 1
+
+    // ⚠️ 这里原来是无条件 `leftKey += 1`（整棵重建）。
+    // 现在分成两条路，判据是"系统目录本身有没有变"：
+    //   · 变了（首次加载 / 有人加了目录）→ 必须重建，否则新目录不出现；
+    //   · 只是映射或资源变了 → 局部刷新，用户的展开状态原地保留。
+    const shape = catTreeShape(categoryTree.value)
+    if (shape !== lastCatShape) {
+      lastCatShape = shape
+      leftExpandedKeys.clear()
+      leftKey.value += 1
+    } else {
+      await refreshLeftTree()
+    }
+
+    // 勾选状态必须和这份数据一起清 —— 只清数组、不清树上的勾，
+    // 就会出现"格子还打着勾，canMap 却按没选算"的矛盾状态。
     catCheckedIds.value = []
+    try {
+      catTreeRef.value?.setCheckedKeys([])
+    } catch (e) {
+      /* 树尚未挂载时忽略 */
+    }
   } catch (e) {
     /* 拦截器已提示 */
   } finally {
@@ -431,6 +535,22 @@ function mapNode(m) {
     // "这条映射倒进来几个资源"。没有它，用户只能一条条点开看。
     resourceCount: m.resourceCount || 0,
   }
+}
+
+/**
+ * 节点上的两个角标一律**现算**，不读节点自带的 `mapCount` / `resourceCount`。
+ *
+ * 原因是左树不再整棵重建了：节点数据是 load 那一刻构造出来的，之后就冻结了。
+ * 再挂一条映射、再同步几个资源，节点对象上的老数值不会变 ——
+ * 用户会看到一个"加了映射但角标还是 0"的树。现算就跟着 mappings 走。
+ */
+function catMapCount(data) {
+  return mapCountByCat.value[data.id] || 0
+}
+
+function mappingResCount(data) {
+  const m = mappings.value.find((x) => x.id === data.mappingId)
+  return (m && m.resourceCount) || 0
 }
 
 /**
@@ -1021,7 +1141,12 @@ async function toggleEnabled(row, v) {
   try {
     await mappingApi.update(row.id, { enabled: v })
     row.enabled = v
-    leftKey.value += 1 // 左树上的"已停用"标记要跟着变
+    // 左树上那条映射的"已停用"标记要跟着变。
+    //
+    // ⚠️ 原来这里是 `leftKey += 1`（整棵重建）。用户此刻多半正展开着几个
+    // 目录在里面继续挂东西，为一个小开关把他的展开状态全收掉，代价远大于收益。
+    // 局部刷新同样能让标记更新：重载展开的系统目录会连带重建它下面的映射节点。
+    await refreshLeftTree()
   } catch (e) {
     /* 忽略 */
   }

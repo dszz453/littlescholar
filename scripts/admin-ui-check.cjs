@@ -432,6 +432,71 @@ async function main() {
   await shot('d-page-full.png', true);
   if (!dlgShot) no('弹窗截图没拿到');
 
+  // ============ 箭头方向 + 左树展开状态 ============
+  //
+  // 这两条都是用户 2026-10-16 反馈的，而且**只有真跑才验得出来**：
+  //   · 箭头方向 —— 两个按钮都在、都能点，符号写反了照样"功能正常"，
+  //     静态看代码也看不出对错（得先想明白"数据从哪流到哪"）；
+  //   · 展开状态 —— 它是**交互的结果**，属于"点一下再看"的东西，
+  //     任何不驱动 DOM 的断言都够不着。
+  console.log('[7] 箭头方向：数据流向必须"右 → 左"');
+  const arrowTexts = await evaluate(`
+    Array.from(document.querySelectorAll('.mp-arrows .mp-arrow')).map(function(b){
+      return (b.textContent || '').trim();
+    })
+  `);
+  eq('挂载按钮是 ←（把网盘内容挂进系统目录）', (arrowTexts || [])[0], '←');
+  eq('放回按钮是 →（把系统目录里的东西放回网盘）', (arrowTexts || [])[1], '→');
+
+  console.log('[8] 展开状态保持：刷新后不该把展开的树收回去');
+  // 左树是 `.mp-cols` 下的第一个 `.mp-col`（中间是箭头、右边是接入源），
+  // 不加 :first-child 会连右树一起数进来。
+  const LEFT_EXPANDED = `document.querySelectorAll('.mp-cols > .mp-col:first-child .el-tree-node.is-expanded').length`;
+
+  truthy('左树展开了第一个系统目录', await evaluate(`
+    (function(){
+      var ic = document.querySelector('.mp-cols > .mp-col:first-child .el-tree-node__expand-icon');
+      if (!ic) return false;
+      ic.click();
+      return true;
+    })()
+  `));
+  await sleep(600);
+  const beforeCount = await evaluate(LEFT_EXPANDED);
+  const beforeName = await evaluate(`
+    (function(){
+      var n = document.querySelector('.mp-cols > .mp-col:first-child .el-tree-node.is-expanded .mp-node-name');
+      return n ? n.textContent.trim() : '';
+    })()
+  `);
+  truthy(`确实是展开状态（展开数 ${beforeCount}，目录「${beforeName}」）`,
+    beforeCount > 0 && !!beforeName);
+
+  // 触发一次刷新。用工具栏最右那个只有图标没有文字的按钮 ——
+  // 它走的正是 `loadAll()`，也就是"每挂完一个映射"必然要走的那条路。
+  await evaluate(`
+    (function(){
+      var btns = document.querySelectorAll('.mp-bar-actions button');
+      var b = btns[btns.length - 1];
+      if (!b) return false;
+      b.click();
+      return true;
+    })()
+  `);
+  await sleep(1500);
+
+  const afterCount = await evaluate(LEFT_EXPANDED);
+  const afterName = await evaluate(`
+    (function(){
+      var n = document.querySelector('.mp-cols > .mp-col:first-child .el-tree-node.is-expanded .mp-node-name');
+      return n ? n.textContent.trim() : '';
+    })()
+  `);
+  // 这里是整条断言的核心：旧实现每刷新一次就 `leftKey += 1` 整棵重建，
+  // 于是 afterCount 恒为 0 —— 用户就得一级一级把目录重新点开。
+  eq('刷新后展开的节点数不变（不再整棵重建）', afterCount, beforeCount);
+  eq('刷新后展开的还是原来那个目录', afterName, beforeName);
+
   // ============ 概览页：版本项 ============
   //
   // 单列一节的理由：这行版本号以前是**后端写死的 "1.0.0"**
@@ -439,7 +504,7 @@ async function main() {
   // 前端怎么做都救不回来 —— 而"线上到底跑的哪一版"恰恰是排查时
   // 第一个要回答的问题。所以断言必须落在**具体值**上：
   // 只断言"这一项存在"的话，1.0.0 和 1.8.0 都能过。
-  console.log('[7] 概览页：版本 / 构建信息');
+  console.log('[9] 概览页：版本 / 构建信息');
   await cmd('Page.navigate', { url: base + '/' });
   if (!await waitFor(`!!document.querySelector('.el-descriptions .ver')`)) {
     no('概览页「系统状态」里没有版本项（.ver 没渲染出来）');
