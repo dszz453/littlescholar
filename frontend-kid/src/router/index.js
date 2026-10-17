@@ -44,6 +44,12 @@ const routes = [
     meta: { title: '学习计划' },
   },
   {
+    path: '/offline',
+    name: 'offline',
+    component: () => import('@/views/Offline.vue'),
+    meta: { title: '我的缓存' },
+  },
+  {
     path: '/play/:id',
     name: 'play',
     component: () => import('@/views/Play.vue'),

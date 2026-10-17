@@ -189,6 +189,21 @@
         <p v-if="smoothUnavailable" class="qb-warn">转码服务暂时不可用，「流畅」用不了</p>
       </section>
 
+      <!-- ===== 缓存（下载到本机） =====
+           标准版与 PRO 用的是同一份孩子端前端，所以这一块两边都有；
+           下载的是本站的代理地址（同源），不是网盘直链 —— 见 utils/offline.js。 -->
+      <section v-if="canCache && !error" class="quality-bar dl-bar">
+        <span class="qb-label">缓存</span>
+        <button
+          class="qb pressable"
+          :class="{ on: offlineState === 'cached', busy: offlineState === 'downloading' }"
+          @click="toggleOffline"
+        >
+          {{ offlineLabel }}
+        </button>
+        <span class="qb-hint">{{ offlineHintText }}</span>
+      </section>
+
       <!-- ===== 播放模式（顺序 / 随机 / 单曲） =====
            列表已按标题升序，"顺序"就是列表里从上往下的那个顺序，
            播完最后一集停下 —— 不回头循环，睡前不会一直播下去。
@@ -346,8 +361,18 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { showToast } from 'vant'
 import { playApi } from '@/api'
 import { tint } from '@/assets/icons'
+import {
+  isCached as offlineIsCached,
+  getMeta as offlineGetMeta,
+  cachedURL as offlineCachedURL,
+  download as offlineDownload,
+  removeCache as offlineRemove,
+  releaseUrls as offlineReleaseUrls,
+  fmtSize as offlineFmtSize,
+} from '@/utils/offline'
 
 const route = useRoute()
 const router = useRouter()
@@ -553,6 +578,134 @@ function fmtClock(sec) {
   return h > 0 ? `${h}:${pad(m)}:${pad(ss)}` : `${m}:${pad(ss)}`
 }
 
+/* ---------- 下载 / 离线缓存 ---------- */
+//
+// 为什么下载的是"播放地址"而不是网盘直链：直链要带 Cookie/Referer，
+// 浏览器 fetch 带不上，而且还有跨域；播放地址是我们**自己的代理**
+// （/api/stream/:id 或 PRO 的 /edge/stream/:ticket），同源、无需额外头，
+// 顺带还能吃到服务端的多连接加速。详见 utils/offline.js 的注释。
+const offlineState = ref('none') // none | downloading | cached
+const offlinePercent = ref(0)
+const offlinePlay = ref(false) // 本次播放用的是本地文件
+let offlineAbort = null
+// 下载中要显示的"多少 MB / 多少 MB"，光有百分比看不出还有多久。
+const offlineLoaded = ref(0)
+const offlineTotal = ref(0)
+
+const canCache = computed(() => {
+  if (!info.value.url) return false
+  // 流畅模式是 HLS（一堆切片 + m3u8），整包缓存要先合并，先不做。
+  if (isSmooth.value && !offlinePlay.value) return false
+  return ['video', 'audio', 'pdf', 'image'].includes(info.value.mediaType)
+})
+
+const offlineLabel = computed(() => {
+  switch (offlineState.value) {
+    case 'cached':
+      return '已缓存'
+    case 'downloading':
+      return offlinePercent.value > 0 ? `${offlinePercent.value}%` : '准备中'
+    default:
+      return '下载'
+  }
+})
+
+const offlineHintText = computed(() => {
+  switch (offlineState.value) {
+    case 'cached':
+      return '没有网也能看，点一下可以删掉'
+    case 'downloading':
+      const total = offlineTotal.value ? ` / ${offlineFmtSize(offlineTotal.value)}` : ''
+      return `正在缓存 ${offlineFmtSize(offlineLoaded.value)}${total}`
+    default:
+      return offlinePlay.value ? '正在用本地文件播放' : '存到本机，没有网也能看'
+  }
+})
+
+// localURLFor 取本地缓存的播放地址；没有就返回空串（不抛错）。
+async function localURLFor(id) {
+  try {
+    if (!(await offlineIsCached(id))) return ''
+    return await offlineCachedURL(id)
+  } catch (e) {
+    return ''
+  }
+}
+
+async function refreshOfflineState() {
+  try {
+    offlineState.value = (await offlineIsCached(resourceId.value)) ? 'cached' : 'none'
+  } catch (e) {
+    offlineState.value = 'none'
+  }
+}
+
+async function toggleOffline() {
+  if (offlineState.value === 'downloading') {
+    // 再点一次 = 取消下载
+    if (offlineAbort) offlineAbort.abort()
+    return
+  }
+  if (offlineState.value === 'cached') {
+    try {
+      await offlineRemove(resourceId.value)
+      offlineState.value = 'none'
+      offlinePlay.value = false
+      offlinePercent.value = 0
+      showToast('已删除缓存')
+    } catch (e) {
+      showToast(e?.message || '删除失败')
+    }
+    return
+  }
+
+  if (!info.value.url) {
+    showToast('还没拿到可下载的地址')
+    return
+  }
+  // 下载的是**原始地址**：如果当前正在用本地文件播，
+  // info.url 已经是 blob:，再下它没有意义（也已经下载过了）。
+  if (offlinePlay.value) return
+
+  offlineAbort = new AbortController()
+  offlineState.value = 'downloading'
+  offlinePercent.value = 0
+  offlineLoaded.value = 0
+  offlineTotal.value = 0
+  try {
+    await offlineDownload(
+      resourceId.value,
+      info.value.url,
+      {
+        title: info.value.title,
+        mediaType: info.value.mediaType,
+        cover: info.value.poster,
+        categoryName: info.value.categoryName,
+        duration: duration.value,
+      },
+      (p) => {
+        offlinePercent.value = p.percent
+        offlineLoaded.value = p.loaded
+        offlineTotal.value = p.total || offlineTotal.value
+      },
+      offlineAbort.signal,
+    )
+    offlineState.value = 'cached'
+    offlinePercent.value = 100
+    showToast('已存到本机')
+  } catch (e) {
+    if (e && (e.name === 'AbortError' || e.code === 20)) {
+      showToast('已取消下载')
+    } else {
+      showToast(e?.message || '下载失败')
+    }
+    offlineState.value = 'none'
+    offlinePercent.value = 0
+  } finally {
+    offlineAbort = null
+  }
+}
+
 /* ---------- 加载播放信息 ---------- */
 // resumeAt > 0 时用它作为续播点（切换画质时用得上：那会儿还没上报，
 // 库里的 lastPosition 可能是十几秒前的旧值）。
@@ -566,7 +719,27 @@ async function load(resumeAt = 0) {
   stopTranscodePolling()
 
   try {
-    const data = await playApi.info(resourceId.value, quality.value)
+    let data = await playApi.info(resourceId.value, quality.value)
+
+    // 本地已有这份文件 → 直接播本地。既省流量，**没有网也能看**。
+    //
+    // 放在 external / transcoding 判断之前：缓存里是完整原片，
+    // 既不需要跳网盘，也不需要等转码 —— 那两条路都是"只能在线"的方案。
+    const localURL = await localURLFor(resourceId.value)
+    if (localURL) {
+      offlinePlay.value = true
+      data = {
+        ...(data || {}),
+        url: localURL,
+        playMode: 'direct',
+        transcodeTaskId: 0,
+        transcodeProgress: 0,
+        quality: QUALITY_ORIGINAL,
+      }
+    } else {
+      offlinePlay.value = false
+    }
+
     info.value = data || {}
     duration.value = Number(data?.duration) || 0
     // 后端回传本次实际生效的画质：以它为准，避免本地状态和真实播放不一致
@@ -613,10 +786,35 @@ async function load(resumeAt = 0) {
     loadSiblings()
     loadPlaylist()
   } catch (e) {
-    error.value = e?.message || '资源加载失败'
+    // 网络不通 / 接口挂了，但本地有缓存 → 照常看。这正是"下载"的意义：
+    // 以前离线时播放页只能给一句"资源加载失败"，孩子什么都干不了。
+    const local = await localURLFor(resourceId.value)
+    if (local) {
+      const meta = (await offlineGetMeta(resourceId.value)) || {}
+      offlinePlay.value = true
+      info.value = {
+        url: local,
+        title: meta.title || '',
+        mediaType: meta.mediaType || '',
+        poster: meta.cover || '',
+        categoryName: meta.categoryName || '',
+        playMode: 'direct',
+        quality: QUALITY_ORIGINAL,
+        duration: Number(meta.duration) || 0,
+      }
+      duration.value = Number(meta.duration) || 0
+      error.value = ''
+      pendingSeek = resumeAt > 0 ? resumeAt : 0
+      if (meta.mediaType === 'pdf') pdfURL = local
+      setupMediaSession()
+    } else {
+      error.value = e?.message || '资源加载失败'
+    }
   } finally {
     loading.value = false
   }
+  // 下载按钮的状态要按"这条资源有没有缓存"刷新
+  refreshOfflineState()
   // loading 关掉之后媒体区才挂载，PDF 的 canvas 这时候才存在
   if (pdfURL) await openPDF(pdfURL)
 }
@@ -1357,6 +1555,10 @@ onBeforeUnmount(() => {
   }
   cleanupMedia()
   stopTranscodePolling()
+  // 正在下载就中断，别让一个已卸载的页面继续吃流量
+  if (offlineAbort) offlineAbort.abort()
+  // 释放 blob: 地址（只释放地址，不删已下载的数据）
+  offlineReleaseUrls()
   document.removeEventListener('visibilitychange', onVisibilityChange)
   window.removeEventListener('pagehide', onPageHide)
 })
@@ -1647,6 +1849,20 @@ watch(isPlaying, (v) => {
   margin: 2px 0 0;
   font-size: 12px;
   color: #c0392b;
+}
+
+.dl-bar .qb {
+  background: #fff;
+  color: var(--c-primary);
+  box-shadow: 0 1px 4px rgba(38, 154, 153, 0.14);
+  min-width: 74px;
+}
+.dl-bar .qb.on {
+  background: #e8f6f5;
+  color: var(--c-primary);
+}
+.dl-bar .qb.busy {
+  opacity: 0.72;
 }
 
 /* PDF */

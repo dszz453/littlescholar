@@ -40,6 +40,16 @@
         <span class="e-arrow">›</span>
       </div>
 
+      <!-- 我的缓存：下载到本机的内容，没有网也能看 -->
+      <div class="entry pressable" @click="goOffline">
+        <span class="e-ico">📥</span>
+        <div class="e-body">
+          <div class="e-title">我的缓存</div>
+          <div class="e-sub">{{ offlineHint }}</div>
+        </div>
+        <span class="e-arrow">›</span>
+      </div>
+
       <!-- 标签切换 -->
       <div class="tabs">
         <button
@@ -110,6 +120,7 @@ import ResourceCard from '@/components/ResourceCard.vue'
 import SkeletonList from '@/components/SkeletonList.vue'
 import { useUserStore } from '@/stores/user'
 import { playApi, studyApi, planApi } from '@/api'
+import { listCached, fmtSize, offlineSupported } from '@/utils/offline'
 
 const route = useRoute()
 const router = useRouter()
@@ -209,6 +220,31 @@ function goPlan() {
   router.push({ name: 'plan' })
 }
 
+function goOffline() {
+  router.push({ name: 'offline' })
+}
+
+// 缓存入口的副标题：有内容时显示"几个 · 占多少"，
+// 空的时候给一句"在哪下载"，否则一个空入口等于没有入口。
+const offlineHint = ref('在播放页点「下载」，没有网也能看')
+async function loadOfflineHint() {
+  try {
+    if (!(await offlineSupported())) {
+      offlineHint.value = '当前设备不支持离线缓存'
+      return
+    }
+    const items = await listCached()
+    if (!items.length) {
+      offlineHint.value = '在播放页点「下载」，没有网也能看'
+      return
+    }
+    const bytes = items.reduce((n, r) => n + (Number(r.size) || 0), 0)
+    offlineHint.value = `${items.length} 个 · 占用 ${fmtSize(bytes)}`
+  } catch {
+    offlineHint.value = '在播放页点「下载」，没有网也能看'
+  }
+}
+
 // loadPlanHint 取今日计划状态，作为入口卡片的一句提示。
 // 这里只做展示，真正的打卡判定与恭喜弹窗都在计划页里。
 async function loadPlanHint() {
@@ -239,6 +275,7 @@ onMounted(() => {
   if (route.query.tab === 'history') tab.value = 'history'
   loadStats()
   loadPlanHint()
+  loadOfflineHint()
   load()
 })
 
