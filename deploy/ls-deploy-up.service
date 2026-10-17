@@ -1,0 +1,20 @@
+[Unit]
+Description=lsxuetong compose boot self-heal (re-attach container network endpoints)
+Documentation=https://github.com/dszz453/littlescholar
+# 只在 docker 起来、且网络基本可用之后跑
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/vol1/1000/ls-deploy
+# 给 docker 一点时间把 restart=unless-stopped 的容器拉起来，
+# 再统一 up -d 一次：网络端点没建上的容器会被重建并重新接入 ls-net。
+ExecStartPre=/bin/sleep 20
+ExecStart=/usr/bin/docker compose up -d
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
