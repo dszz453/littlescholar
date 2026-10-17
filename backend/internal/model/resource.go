@@ -26,10 +26,21 @@ type Resource struct {
 	Description string `gorm:"type:text" json:"description"`
 
 	// 网盘来源
-	DiskType  string `gorm:"size:20;index" json:"diskType"` // quark/baidu/uc/tianyi
-	ShareURL  string `gorm:"size:800" json:"shareUrl"`
-	Passcode  string `gorm:"size:50" json:"passcode"`
-	ShareID   string `gorm:"size:200;index" json:"shareId"` // 分享ID，用于去重
+	DiskType string `gorm:"size:20;index" json:"diskType"` // quark/baidu/uc/tianyi
+	ShareURL string `gorm:"size:800" json:"shareUrl"`
+	Passcode string `gorm:"size:50" json:"passcode"`
+	ShareID  string `gorm:"size:200;index" json:"shareId"` // 分享ID，用于去重
+
+	// ShareExpireAt 分享在网盘那边的失效时间（Unix 秒）。
+	//
+	// 0 = **永久有效**，或"不知道"（本字段是后加的，存量行是 NULL/0）。
+	//
+	// 为什么要记：网盘的分享默认会过期（夸克 30 天）。过期之后
+	// share_url 仍然躺在库里、看着一切正常，但孩子端点播时网盘回
+	// "分享已失效" —— 而自动补齐任务按"已经有 share_url 就跳过"处理，
+	// 于是**永远不会去修**，孩子端从此一直播不了，且没人知道原因。
+	// 记下失效时间，自动任务就能把"已经过期的"当成"没分享"重新补上。
+	ShareExpireAt int64 `json:"shareExpireAt"`
 
 	// 转存后的信息
 	DiskAccountID *uint64 `gorm:"index" json:"diskAccountId"` // 转存到哪个账号
@@ -57,11 +68,11 @@ type Resource struct {
 	// 而"能不能直接交给浏览器播"完全取决于**容器格式** —— 拿 Title 判后缀
 	// 永远判不出来，结果 RMVB/AVI/MKV 这类浏览器原生不支持的资源从不触发
 	// 转码，一路直链送到 <video> 必然报错，前端只能提示"播放地址可能已过期"。
-	Ext        string  `gorm:"size:20" json:"ext"`
-	Cover      string  `gorm:"size:800" json:"cover"`
-	FileCount  int     `json:"fileCount"`
-	TotalSize  int64   `json:"totalSize"`
-	Duration   int     `json:"duration"` // 秒
+	Ext       string `gorm:"size:20" json:"ext"`
+	Cover     string `gorm:"size:800" json:"cover"`
+	FileCount int    `json:"fileCount"`
+	TotalSize int64  `json:"totalSize"`
+	Duration  int    `json:"duration"` // 秒
 
 	// DirectPlay 强制走直链播放，跳过转码。
 	//

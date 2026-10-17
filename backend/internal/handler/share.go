@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/littlescholar/core/internal/adapter"
@@ -48,6 +49,69 @@ func NewShareHandler(db *gorm.DB, enc *util.Encryptor) *ShareHandler {
 // 绝大多数"一整季动画"的场景，又不至于把一次请求撑到不可控。
 const shareChunkSize = 50
 
+// ShareScopeMapped 按范围批量的取值：所有挂过映射、但还没建分享的资源。
+const ShareScopeMapped = "mapped"
+
+// shareAutoBatch 自动任务单轮最多补多少条。
+//
+// 不是"怕漏"，是"怕一口气打爆"：每 shareChunkSize 条就会发一次
+// 创建分享的请求，首轮可能一次性面对几百条存量资源。既然它每 6 小时
+// 就会再跑一次，就没必要在一轮里把所有请求都压上去 —— 撞上限流的话
+// 受影响的不只是这次补齐，而是同一个账号下的所有网盘操作。
+// 500 条 ≈ 10 次请求，一轮跑完，对典型的几百条资源库也够用。
+const shareAutoBatch = 500
+
+// shareChunkCooldown 批与批之间的间隔。
+//
+// 一批 = 一次创建分享请求。存量补齐时可能要连着打好几次，而夸克对
+// 分享创建有频率限制 —— 撞上了不只是"这一批失败"：同一个账号接下来的
+// 列目录、取直链也会跟着异常，而那时候报错已经完全看不出"是我自己
+// 打太快了"。1.5 秒 × 10 批 ≈ 15 秒，用户点一次按钮等得起。
+//
+// 是变量不是常量：单测里要把它置 0，否则一条造 500 条资源的用例
+// 光睡觉就要 12 秒（10 批 × 1.5 秒），跑全量时非常刺眼。
+var shareChunkCooldown = 1500 * time.Millisecond
+
+// shareAutoRounds 定时任务的单次运行最多补几批（一批 shareAutoBatch 条）。
+//
+// 4 批 ≈ 2000 条，够覆盖典型资源库的存量；同时给出明确上限，
+// 免得某次异常（资源表被灌进几万条）让这个任务在网盘上连打几个小时。
+const shareAutoRounds = 4
+
+// shareRunResult 一轮设置共享的结果。
+//
+// 抽成结构体而不是一路 gin.H：定时任务要跑**同一套**逻辑，而它需要的是
+// 能打日志、能断言的数字，不是 HTTP 响应体。让 gin 那层在最后一步才把
+// 结构体摊平成响应，两条入口就不会各写一份、各错一处。
+type shareRunResult struct {
+	DryRun   bool
+	Total    int
+	Created  int
+	Skipped  int
+	Failed   int
+	Groups   []shareGroupStat
+	Failures []shareFailure
+	Message  string
+
+	// ProcessedIDs 本轮实际捞出来的资源 ID（内部用，不进 HTTP 响应）。
+	//
+	// 定时任务靠它把"这轮试过的"排除出下一轮 —— 建分享失败的资源
+	// share_url 仍然是空的，下一轮按同样条件还会被选中，不排除就会
+	// 在同一批上无限空转。
+	ProcessedIDs []uint64
+}
+
+// ShareAutoResult 自动共享一轮的统计（给调度器与单测用）。
+//
+// 只带四个数字：调度器关心的是"这轮补齐了几条"，Groups/Failures 是
+// 给后台界面看的明细，定时任务里没人读。
+type ShareAutoResult struct {
+	Total   int
+	Created int
+	Skipped int
+	Failed  int
+}
+
 // shareRequest 设置共享的入参。
 //
 // 三种定位方式二选一（按优先级）：resourceIds / resourceId → mappingId。
@@ -55,6 +119,19 @@ type shareRequest struct {
 	ResourceID  uint64   `json:"resourceId"`
 	ResourceIDs []uint64 `json:"resourceIds"`
 	MappingID   uint64   `json:"mappingId"`
+
+	// Scope 按范围批量，与上面三种定位方式互斥（优先级最低）。
+	//
+	// 目前只有一个值 ShareScopeMapped：所有**挂过映射、但还没建分享**
+	// 的资源。它是 PRO 转存链路的正主 —— PRO 的 Prepare 第一句就是
+	// "缺 shareUrl 直接报错"，所以只要有一条映射资源没分享，孩子点它
+	// 就是"播不了"，而且报错发生在播放那一刻，家长根本没处查。
+	//
+	// 为什么用字符串而不是再加一个 bool/uint 字段：将来还会出现
+	// "all"、"expired" 之类的范围，每加一种就在 collect 里多一个分支、
+	// 请求体里多一个互斥字段，"两个都传了走哪个看运气"这类问题
+	// 就会开始冒出来。字符串一眼能看出语义。
+	Scope string `json:"scope"`
 
 	// ExpireDays 有效期：省略/0 = 适配器默认（夸克 30 天）；
 	// 负数 = 永久（adapter.ShareExpirePermanent）。
@@ -74,6 +151,15 @@ type shareRequest struct {
 	// 建分享，不会把老的链接全部作废 —— 老的链接可能已经被记在
 	// 某处、或已经让孩子转过存了。
 	Force bool `json:"force"`
+
+	// SkipIDs 本轮不再处理的资源（内部用，不对外）。
+	//
+	// 定时任务会在一个 runOnce 里连跑几批来补齐存量；某条资源**建分享失败**
+	// 时 share_url 仍是空的，下一批按同样的条件还会把它捞出来 ——
+	// 于是一批注定失败的文件能把整个补齐卡在原地空转（每轮重试 500 条，
+	// 既打网盘接口又什么都不会变）。把"这轮已经试过的"排除掉，
+	// 剩下的资源才有机会被处理到。
+	SkipIDs []uint64 `json:"-"`
 }
 
 // shareGroupStat 按网盘账号汇总的执行结果。
@@ -109,24 +195,102 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		util.BadRequest(c, "参数格式错误")
 		return
 	}
-	dryRun := c.Query("dryRun") == "1"
-
-	resources, err := h.collect(req)
+	res, err := h.create(c.Request.Context(), req, c.Query("dryRun") == "1")
 	if err != nil {
 		util.BadRequest(c, err.Error())
 		return
 	}
+	util.OK(c, gin.H{
+		"dryRun":   res.DryRun,
+		"total":    res.Total,
+		"created":  res.Created,
+		"skipped":  res.Skipped,
+		"failed":   res.Failed,
+		"groups":   res.Groups,
+		"failures": res.Failures,
+		"message":  res.Message,
+	})
+}
 
-	resp := gin.H{
-		"dryRun": dryRun,
-		"total":  len(resources),
+// Auto 给定时任务用：把所有「挂过映射但还没分享」的资源补齐。
+//
+// 与 Create 只差两处：范围由 Scope 指定（调用方不用自己凑 ID 列表），
+// 返回值是能直接打日志、直接断言的数字，而不是 HTTP 响应体。
+//
+// # 为什么要在一个 runOnce 里连跑几批
+//
+// 单批上限 shareAutoBatch 是限流考虑，但存量资源常常有几百到上千条。
+// 只跑一批的话，剩下的要等下一个 tick（6 小时）—— 用户装完、扫码、
+// 打开孩子端点播，发现"还是只有一部分能播"，而这时候后台任务明明
+// 在正常跑。所以一次补齐最多 shareAutoRounds 批，把存量在首轮就清掉。
+//
+// 每批都会把**已经试过的**排除掉（SkipIDs）。这一点是必须的：建分享
+// 失败的资源 share_url 仍然是空的，下一批按同样的条件还会被选中，
+// 一批注定失败的文件就能让补齐永远卡在原地 —— 每轮重试几百条，
+// 既打网盘接口，又一条新资源都处理不到。
+func (h *ShareHandler) Auto(ctx context.Context) (ShareAutoResult, error) {
+	var agg ShareAutoResult
+	tried := make([]uint64, 0, shareAutoBatch*shareAutoRounds)
+
+	// 自动补齐一律建**永久**分享。
+	//
+	// 这些分享是给 PRO 长期转存用的内部通道，不是给人传阅的。用默认的
+	// 30 天意味着：装好一个月后的某一天，孩子端点播突然全都"分享已失效"，
+	// 而家长完全不知道去哪续 —— 后台看着每条资源都"已共享"，自动任务
+	// 也一直在正常跑。永久链接没有续期这件事，也就不用再维护一个续期任务。
+	permanent := adapter.ShareExpirePermanent
+
+	for round := 1; round <= shareAutoRounds; round++ {
+		if err := ctx.Err(); err != nil {
+			return agg, err
+		}
+		res, err := h.create(ctx, shareRequest{
+			Scope:      ShareScopeMapped,
+			SkipIDs:    tried,
+			ExpireDays: &permanent,
+		}, false)
+		if err != nil {
+			return agg, err
+		}
+		agg.Total += res.Total
+		agg.Created += res.Created
+		agg.Skipped += res.Skipped
+		agg.Failed += res.Failed
+
+		if res.Total == 0 {
+			// 没有更多待补的了 —— 补完即停，别多打一轮网盘接口。
+			break
+		}
+		tried = append(tried, res.ProcessedIDs...)
+		if len(res.ProcessedIDs) == 0 {
+			// 理论上看不到（Total > 0 就必有 ID）；真出现说明状态诡异，
+			// 再跑下去只会重复同一批，直接收手。
+			break
+		}
+	}
+	return agg, nil
+}
+
+// create 是一轮设置共享的实体，手动与定时两条入口共用。
+//
+// ctx 从 gin 那层传进来（原来是 c.Request.Context()），所以定时任务
+// 也能用同一个超时/取消语义 —— 否则定时任务只能用 context.Background()，
+// 一旦网盘卡住就没有任何办法叫停。
+func (h *ShareHandler) create(ctx context.Context, req shareRequest, dryRun bool) (shareRunResult, error) {
+	resources, err := h.collect(req)
+	if err != nil {
+		return shareRunResult{}, err
+	}
+
+	out := shareRunResult{DryRun: dryRun, Total: len(resources)}
+	for _, r := range resources {
+		out.ProcessedIDs = append(out.ProcessedIDs, r.ID)
 	}
 	if len(resources) == 0 {
-		resp["message"] = "没有找到符合条件的资源"
-		resp["created"], resp["skipped"], resp["failed"] = 0, 0, 0
-		resp["groups"], resp["failures"] = []shareGroupStat{}, []shareFailure{}
-		util.OK(c, resp)
-		return
+		out.Message = "没有找到符合条件的资源"
+		// 显式给空切片而不是留 nil：JSON 里会是 []，前端不必为 null 写分支。
+		out.Groups, out.Failures = []shareGroupStat{}, []shareFailure{}
+		return out, nil
 	}
 
 	groups, failures := h.groupByAccount(resources)
@@ -135,7 +299,7 @@ func (h *ShareHandler) Create(c *gin.Context) {
 	// 必须一起计进 failed。否则会出现"failures 里有 1 条原因、failed 却是 0"
 	// 这种自相矛盾的响应，而前端按 failed 判成败，就会把一次什么都没做成的
 	// 操作显示成成功。（这条是测试先发现的，不是事后想到的。）
-	failed := len(failures)
+	out.Failed = len(failures)
 
 	// 有效期与提取码是**整批共用**的：一次批量操作里给不同资源
 	// 生成不同的提取码，用户面对的就是一堆互不相干的码，
@@ -145,8 +309,7 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		opt.ExpireDays = *req.ExpireDays
 	}
 
-	var stats []shareGroupStat
-	created, skipped := 0, 0
+	stats := []shareGroupStat{}
 
 	for _, g := range groups {
 		st := shareGroupStat{
@@ -157,9 +320,10 @@ func (h *ShareHandler) Create(c *gin.Context) {
 
 		var todo []model.Resource
 		for _, r := range g.resources {
-			if !req.Force && strings.TrimSpace(r.ShareURL) != "" {
+			// 过期的不算"已有分享"：库里 share_url 还在，网盘那边却是死的。
+			if !req.Force && strings.TrimSpace(r.ShareURL) != "" && !shareExpired(r) {
 				st.Skipped++
-				skipped++
+				out.Skipped++
 				continue
 			}
 			todo = append(todo, r)
@@ -167,11 +331,11 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		st.Planned = len(todo)
 
 		if len(todo) > 0 && !dryRun {
-			nCreated, errs := h.shareInChunks(c.Request.Context(), g, todo, opt)
+			nCreated, errs := h.shareInChunks(ctx, g, todo, opt)
 			st.Created += nCreated
 			st.Failed += len(errs)
-			created += nCreated
-			failed += len(errs)
+			out.Created += nCreated
+			out.Failed += len(errs)
 			failures = append(failures, errs...)
 		}
 		stats = append(stats, st)
@@ -180,16 +344,17 @@ func (h *ShareHandler) Create(c *gin.Context) {
 	// 排序只为让输出稳定：map 遍历顺序随机，验收脚本没法断言。
 	sort.Slice(stats, func(i, j int) bool { return stats[i].AccountID < stats[j].AccountID })
 
-	resp["created"], resp["skipped"], resp["failed"] = created, skipped, failed
-	resp["groups"] = stats
-	resp["failures"] = capFailures(failures)
+	out.Groups = stats
+	out.Failures = capFailures(failures)
 	if dryRun {
 		// dryRun 下 created 一定是 0，"计划做多少"才是用户想看的数字。
-		resp["message"] = fmt.Sprintf("预览：将为 %d 条资源创建分享，跳过 %d 条已有分享的", countPlanned(stats), skipped)
+		out.Message = fmt.Sprintf("预览：将为 %d 条资源创建分享，跳过 %d 条已有分享的",
+			countPlanned(stats), out.Skipped)
 	} else {
-		resp["message"] = fmt.Sprintf("成功 %d 条，跳过 %d 条，失败 %d 条", created, skipped, failed)
+		out.Message = fmt.Sprintf("成功 %d 条，跳过 %d 条，失败 %d 条",
+			out.Created, out.Skipped, out.Failed)
 	}
-	util.OK(c, resp)
+	return out, nil
 }
 
 // shareVerifyItem 单条资源的校验结论。
@@ -405,6 +570,36 @@ func (h *ShareHandler) Clear(c *gin.Context) {
 	util.OK(c, gin.H{"cleared": affected})
 }
 
+// shareExpired 这条资源的分享在网盘那边是否**已经过期**。
+//
+// ShareExpireAt 为 0 表示永久有效，或"不知道"（后加字段，存量行是 0）。
+// 两种都按"没过期"处理：宁可不动老链接，也不要无端重建 ——
+// 重建会让家长已经转述出去、孩子已经转存过的链接全部作废。
+// 只有**明确记下失效时间且已经过去**的，才算该补。
+func shareExpired(r model.Resource) bool {
+	return r.ShareExpireAt > 0 && r.ShareExpireAt < time.Now().Unix()
+}
+
+// shareableAccountIDs 返回「所属网盘类型支持创建分享」的账号 ID。
+//
+// 判断口径与 shareInChunks 完全一致（都走 adapter.ShareCreatorOf 的
+// 类型断言），否则会出现"collect 选出来的"和"真正做得了的"两套标准：
+// 本地硬盘、WebDAV 这类存储源同样是 mapping_id > 0，却永远建不出分享，
+// 不过滤就会被每轮捞出来、每轮失败一次。
+func (h *ShareHandler) shareableAccountIDs() []uint64 {
+	var accs []model.DiskAccount
+	if err := h.db.Select("id", "disk_type").Find(&accs).Error; err != nil {
+		return nil
+	}
+	ids := make([]uint64, 0, len(accs))
+	for _, a := range accs {
+		if _, err := adapter.ShareCreatorOf(adapter.DiskType(a.DiskType)); err == nil {
+			ids = append(ids, a.ID)
+		}
+	}
+	return ids
+}
+
 // collect 按入参取出本次要处理的资源。
 func (h *ShareHandler) collect(req shareRequest) ([]model.Resource, error) {
 	q := h.db.Where("deleted_at IS NULL")
@@ -416,8 +611,43 @@ func (h *ShareHandler) collect(req shareRequest) ([]model.Resource, error) {
 		q = q.Where("id = ?", req.ResourceID)
 	case req.MappingID > 0:
 		q = q.Where("mapping_id = ?", req.MappingID)
+	case req.Scope == ShareScopeMapped:
+		// 「挂过映射但还没分享」。
+		//
+		// 两个 COALESCE 都是必要的：mapping_id / share_url 都是后加的列，
+		// AutoMigrate 给存量行补列时**不回填默认值**，库里是 NULL 而不是
+		// 0 或空串。直接写 `share_url = ''` 会把这些行漏掉 —— 而它们恰恰
+		// 就是最需要补分享的那批。
+		//
+		// 这里**只补缺**：已经有 share_url 的一律不碰。自动任务如果重建
+		// 链接，会把家长已经转述出去/已经转存过的老链接全部作废。
+		//
+		// 例外是**已经过期的**：网盘那边过期后链接就是死的（夸克默认 30 天），
+		// 而库里 share_url 还在、看着一切正常。不把过期的算进来，这些资源
+		// 就永远补不到 —— 孩子端一直播不了，日志里却一条错误都没有。
+		now := time.Now().Unix()
+		q = q.Where("COALESCE(mapping_id, 0) > 0").
+			Where("COALESCE(share_url, '') = '' OR (COALESCE(share_expire_at, 0) > 0 AND share_expire_at < ?)", now)
+
+		// 只处理「所属网盘支持创建分享」的账号。
+		//
+		// 本地硬盘 / WebDAV 这类存储源同样是 mapping_id > 0，但它们
+		// **永远**建不出分享。不过滤的话，这些资源每 6 小时被捞出来一次、
+		// 每 6 小时失败一次：日志里是假的告警，统计里的 failed 永远降不到 0，
+		// 真正需要处理的失败反而被淹掉。
+		accIDs := h.shareableAccountIDs()
+		if len(accIDs) == 0 {
+			return nil, nil
+		}
+		q = q.Where("disk_account_id IN ?", accIDs)
+
+		// 本轮已经试过的不再捞（见 shareRequest.SkipIDs 的说明）。
+		if len(req.SkipIDs) > 0 {
+			q = q.Where("id NOT IN ?", req.SkipIDs)
+		}
+		q = q.Limit(shareAutoBatch)
 	default:
-		return nil, fmt.Errorf("请指定要共享的资源（resourceId / resourceIds / mappingId）")
+		return nil, fmt.Errorf("请指定要共享的资源（resourceId / resourceIds / mappingId / scope）")
 	}
 
 	var out []model.Resource
@@ -584,9 +814,10 @@ func (h *ShareHandler) shareInChunks(ctx context.Context, g *accountGroup, todo 
 		// 回写分享信息。这里必须整块写同一条链接：分享的粒度就是
 		// "这一块文件"，不是单条资源。
 		up := h.db.Model(&model.Resource{}).Where("id IN ?", ids).Updates(map[string]interface{}{
-			"share_url": res.ShareURL,
-			"passcode":  res.Passcode,
-			"share_id":  res.ShareID,
+			"share_url":       res.ShareURL,
+			"passcode":        res.Passcode,
+			"share_id":        res.ShareID,
+			"share_expire_at": res.ExpireAt,
 		})
 		if up.Error != nil {
 			msg := "分享已创建但写入资源失败：" + up.Error.Error()
@@ -599,6 +830,16 @@ func (h *ShareHandler) shareInChunks(ctx context.Context, g *accountGroup, todo 
 		log.Printf("[share] 账号 %d(%s) 已为 %d 条资源创建分享 %s（提取码 %s，有效期至 %d）",
 			g.accountID, accountLabel(acc), len(chunk), res.ShareURL, res.Passcode, res.ExpireAt)
 		created += int(up.RowsAffected)
+
+		// 批间喘一口气。最后一批之后不睡：那一觉没人受益，
+		// 只会让点按钮的人多等 1.5 秒。
+		if end < len(todo) {
+			select {
+			case <-ctx.Done():
+				return created, failures
+			case <-time.After(shareChunkCooldown):
+			}
+		}
 	}
 	return created, failures
 }

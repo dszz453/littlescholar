@@ -313,6 +313,39 @@ func main() {
 		logger.Info("知识沉淀定时任务未启用（system_configs.digest_enabled=false），仍可在后台手动刷新")
 	}
 
+	// 8.3 自动共享补齐
+	//
+	// 存在的理由：PRO 的转存链路要求资源上必须有 shareUrl，缺了整个播放
+	// 就停在"缺少分享链接"；而资源是**持续新增**的（每次同步、每次新挂
+	// 映射都会带来一批没分享的）。指望家长记得回后台点按钮不现实，
+	// 结果就是孩子时不时遇到"这集播不了"，而原因在后台。
+	//
+	// 这里**再建一个** ShareHandler 实例是安全的：它只持有 db 与 encryptor，
+	// 没有任何自有状态，与 router.Setup 内部那个功能完全等价。
+	// （那个实例没导出，为了拿它去改 Deps 反而会把装配关系搞复杂。）
+	//
+	// 节奏：每 6 小时补一次，首轮延迟 15 分钟 —— 避开启动期（此刻还在跑
+	// 首次转码自检、巡检等），也不至于让别人安装完等半天才看到分享。
+	shareAutoHandler := handler.NewShareHandler(db, encryptor)
+	if sysConf("share_auto_enabled", "true") == "true" {
+		stopShareAuto := service.StartShareAutoScheduler(
+			func(ctx context.Context) (service.ShareAutoStat, error) {
+				r, err := shareAutoHandler.Auto(ctx)
+				return service.ShareAutoStat{
+					Total:   r.Total,
+					Created: r.Created,
+					Skipped: r.Skipped,
+					Failed:  r.Failed,
+				}, err
+			},
+			logger, 6*time.Hour, 15*time.Minute)
+		defer stopShareAuto()
+		logger.Info("自动共享任务已就绪（每 6 小时补齐一次）",
+			zap.String("config", "system_configs.share_auto_enabled"))
+	} else {
+		logger.Info("自动共享未启用（system_configs.share_auto_enabled=false），仍可在后台手动触发")
+	}
+
 	// 9. 启动 HTTP 服务
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	srv := &http.Server{

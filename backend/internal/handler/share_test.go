@@ -44,6 +44,19 @@ type fakeShareAdapter struct {
 	calls []fakeShareCall
 	fail  error
 
+	// failOnce 前 N 次调用返回失败（之后恢复正常）。
+	//
+	// 专门用来测「一批失败不能让补齐卡在原地」：失败的资源 share_url 仍是空的，
+	// 下一批按同样条件还会被选中，不排除就会在同一批上空转。
+	failOnce int
+
+	// failFids 只要这一批里含这些 fid 就报错（**永远**失败，不是失败一次）。
+	//
+	// 用来模拟真实里最常见的那种失败：某个文件已被删掉/被风控，重试多少次
+	// 都不会好。配合 failOnce 用能区分"失败后重试成功"和"永远失败"两种情形 ——
+	// 后者才是会把补齐卡死的那一类。
+	failFids map[string]bool
+
 	// shareFiles 模拟"分享里到底有什么"：shareURL -> fid 集合。
 	//
 	// 校验接口（Verify）的价值全在于"分享根目录里的 fid 与资源的 fileId
@@ -63,6 +76,8 @@ func (f *fakeShareAdapter) reset() {
 	defer f.mu.Unlock()
 	f.calls = nil
 	f.fail = nil
+	f.failOnce = 0
+	f.failFids = map[string]bool{}
 	f.shareFiles = map[string]map[string]bool{}
 	f.dropFid = ""
 }
@@ -125,18 +140,33 @@ func (f *fakeShareAdapter) CreateShare(_ context.Context, cred *adapter.Credenti
 	if f.fail != nil {
 		return nil, f.fail
 	}
+	if f.failOnce > 0 {
+		f.failOnce--
+		return nil, fmt.Errorf("模拟这一批创建分享失败")
+	}
+	for _, id := range fids {
+		if f.failFids[id] {
+			return nil, fmt.Errorf("模拟这个文件永远建不成分享（fileid=%s）", id)
+		}
+	}
 	n := len(f.calls)
 	url := "https://pan.example.com/s/fake-" + strconv.Itoa(n)
 	set := make(map[string]bool, len(fids))
 	for _, id := range fids {
 		set[id] = true
 	}
+	// 按 ExpireDays 回对应的失效时间：永久=0，其余给一个未来的固定值。
+	// 不跟着入参走的话，"重建后是否变成永久"这件事在库里根本验不出来。
+	var expireAt int64 = 1800000000
+	if opt.ExpireDays == adapter.ShareExpirePermanent {
+		expireAt = 0
+	}
 	f.shareFiles[url] = set
 	return &adapter.ShareResult{
 		ShareURL: url,
 		Passcode: "p" + strconv.Itoa(n) + "w",
 		ShareID:  "sid-" + strconv.Itoa(n),
-		ExpireAt: 1800000000,
+		ExpireAt: expireAt,
 	}, nil
 }
 
