@@ -307,6 +307,14 @@ func (h *ShareHandler) create(ctx context.Context, req shareRequest, dryRun bool
 	opt := adapter.ShareCreateOptions{Passcode: strings.TrimSpace(req.Passcode)}
 	if req.ExpireDays != nil {
 		opt.ExpireDays = *req.ExpireDays
+	} else if req.Scope == ShareScopeMapped {
+		// scope=mapped 的语义是「给所有映射资源补齐分享」，这是给孩子端
+		// 长期转存用的**内部通道**，不是拿来给人传阅的链接。
+		// 漏了这一条就会默认 30 天 —— 2026-10-17 实际踩过：手动跑一批
+		// 1026 条全是 30 天有效期，而当时看着"成功 1026 条、失败 0 条"，
+		// 完全不知道一个月后会集体失效。定时任务那条路本来就显式传了
+		// 永久，这里补齐，免得两个入口两个行为。
+		opt.ExpireDays = adapter.ShareExpirePermanent
 	}
 
 	stats := []shareGroupStat{}
@@ -321,7 +329,7 @@ func (h *ShareHandler) create(ctx context.Context, req shareRequest, dryRun bool
 		var todo []model.Resource
 		for _, r := range g.resources {
 			// 过期的不算"已有分享"：库里 share_url 还在，网盘那边却是死的。
-			if !req.Force && strings.TrimSpace(r.ShareURL) != "" && !shareExpired(r) {
+			if !req.Force && strings.TrimSpace(r.ShareURL) != "" && !shareNeedsRenew(r) {
 				st.Skipped++
 				out.Skipped++
 				continue
@@ -570,15 +578,21 @@ func (h *ShareHandler) Clear(c *gin.Context) {
 	util.OK(c, gin.H{"cleared": affected})
 }
 
-// shareExpired 这条资源的分享在网盘那边是否**已经过期**。
+// shareNeedsRenew 这条资源的分享是否**已经过期、或即将过期**。
 //
 // ShareExpireAt 为 0 表示永久有效，或"不知道"（后加字段，存量行是 0）。
-// 两种都按"没过期"处理：宁可不动老链接，也不要无端重建 ——
+// 两种都按"不用管"处理：宁可不动老链接，也不要无端重建 ——
 // 重建会让家长已经转述出去、孩子已经转存过的链接全部作废。
-// 只有**明确记下失效时间且已经过去**的，才算该补。
-func shareExpired(r model.Resource) bool {
-	return r.ShareExpireAt > 0 && r.ShareExpireAt < time.Now().Unix()
+//
+// 为什么是"提前一天"而不是"过期之后"：自动任务 6 小时一轮，
+// 过期后才补意味着最长有 6 小时孩子端点播是坏的，而这完全可以避免。
+// 提前一天重建没有任何代价 —— 那时旧链接本来也快死了。
+func shareNeedsRenew(r model.Resource) bool {
+	return r.ShareExpireAt > 0 && r.ShareExpireAt < time.Now().Add(shareRenewAhead).Unix()
 }
+
+// shareRenewAhead 提前多久续期。
+const shareRenewAhead = 24 * time.Hour
 
 // shareableAccountIDs 返回「所属网盘类型支持创建分享」的账号 ID。
 //
@@ -619,15 +633,23 @@ func (h *ShareHandler) collect(req shareRequest) ([]model.Resource, error) {
 		// 0 或空串。直接写 `share_url = ''` 会把这些行漏掉 —— 而它们恰恰
 		// 就是最需要补分享的那批。
 		//
+		q = q.Where("COALESCE(mapping_id, 0) > 0")
+
 		// 这里**只补缺**：已经有 share_url 的一律不碰。自动任务如果重建
 		// 链接，会把家长已经转述出去/已经转存过的老链接全部作废。
 		//
 		// 例外是**已经过期的**：网盘那边过期后链接就是死的（夸克默认 30 天），
 		// 而库里 share_url 还在、看着一切正常。不把过期的算进来，这些资源
 		// 就永远补不到 —— 孩子端一直播不了，日志里却一条错误都没有。
-		now := time.Now().Unix()
-		q = q.Where("COALESCE(mapping_id, 0) > 0").
-			Where("COALESCE(share_url, '') = '' OR (COALESCE(share_expire_at, 0) > 0 AND share_expire_at < ?)", now)
+		//
+		// ⚠️ Force=true 时**不再过滤**，把该范围里的全部资源都取出来。
+		// 不然 force 就是个摆设：create 里那个"已有分享就跳过"的判断根本轮不到，
+		// 因为这些行在 collect 阶段就已经被排除了。2026-10-17 实际踩过 ——
+		// 想用 force 把一批 30 天的分享重建成永久，返回 total=0、什么都没干。
+		if !req.Force {
+			deadline := time.Now().Add(shareRenewAhead).Unix()
+			q = q.Where("COALESCE(share_url, '') = '' OR (COALESCE(share_expire_at, 0) > 0 AND share_expire_at < ?)", deadline)
+		}
 
 		// 只处理「所属网盘支持创建分享」的账号。
 		//

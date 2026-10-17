@@ -298,8 +298,9 @@ func TestAutoRebuildsExpiredShare(t *testing.T) {
 
 	alive := seedMappedResource(t, db, acc.ID, "还有效", "fid-ok", 7,
 		"https://pan.example.com/s/alive")
+	// +72h：明确"还早"，不该被续期（+24h 正好卡在续期线附近，边界会抖）
 	db.Model(&model.Resource{}).Where("id = ?", alive.ID).
-		Update("share_expire_at", time.Now().Add(24*time.Hour).Unix())
+		Update("share_expire_at", time.Now().Add(72*time.Hour).Unix())
 
 	res, err := h.Auto(context.Background())
 	if err != nil {
@@ -320,5 +321,34 @@ func TestAutoRebuildsExpiredShare(t *testing.T) {
 	}
 	if gotAlive.ShareURL != "https://pan.example.com/s/alive" {
 		t.Errorf("还有效的分享被动了，绝不能重建老链接（实得 %q）", gotAlive.ShareURL)
+	}
+}
+
+// TestAutoRenewsExpiringShare 快过期的要**提前**重建，不能等它真的死掉。
+//
+// 自动任务 6 小时一轮。如果只在"已经过期"之后才补，那么过期那一刻起
+// 最长有 6 小时孩子端是播不了的 —— 而这完全能避免：提前一天重建时，
+// 旧链接本来也快死了，重建没有任何代价。
+func TestAutoRenewsExpiringShare(t *testing.T) {
+	db := newShareTestDB(t)
+	acc := seedQuarkAccount(t, db, shareAutoDiskType)
+	h := newShareHandler(t, db)
+
+	soon := seedMappedResource(t, db, acc.ID, "明天就过期", "fid-soon", 7,
+		"https://pan.example.com/s/soon")
+	db.Model(&model.Resource{}).Where("id = ?", soon.ID).
+		Update("share_expire_at", time.Now().Add(12*time.Hour).Unix())
+
+	res, err := h.Auto(context.Background())
+	if err != nil {
+		t.Fatalf("自动共享失败: %v", err)
+	}
+	if res.Created != 1 {
+		t.Errorf("还有 12 小时过期的应被提前重建，实得 created=%d", res.Created)
+	}
+	var got model.Resource
+	db.First(&got, soon.ID)
+	if got.ShareExpireAt != 0 {
+		t.Errorf("重建后应是永久（ShareExpireAt=0），实得 %d —— 否则 30 天后又要再来一次", got.ShareExpireAt)
 	}
 }
