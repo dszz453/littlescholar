@@ -256,14 +256,23 @@ func (h *StreamHandler) Serve(c *gin.Context) {
 
 	// 用独立的 context：c.Request.Context() 在客户端断开时会取消，
 	// 那正是我们要停止拉流的时机，所以沿用它是正确的。
-	link, err := a.GetDirectLink(c.Request.Context(), &adapter.Credential{
-		DiskType: adapter.DiskType(res.DiskType),
-		Cookie:   cookie,
-		Extra:    extra,
-	}, res.FileID)
-	if err != nil {
-		util.ServerError(c, "获取播放地址失败: "+err.Error())
-		return
+	//
+	// ⚠️ 直链**先查进程内缓存**。播放一个视频会发十几个 Range 请求，
+	// 每个都真去打一次网盘 API 的话，点开要等、拖进度要等、
+	// 还容易撞上网盘限流（见 linkcache.go 的说明）。
+	linkKey := linkCacheKey(*res.DiskAccountID, res.FileID)
+	link, cached := getCachedLink(linkKey)
+	if !cached {
+		link, err = a.GetDirectLink(c.Request.Context(), &adapter.Credential{
+			DiskType: adapter.DiskType(res.DiskType),
+			Cookie:   cookie,
+			Extra:    extra,
+		}, res.FileID)
+		if err != nil {
+			util.ServerError(c, "获取播放地址失败: "+err.Error())
+			return
+		}
+		putCachedLink(linkKey, link)
 	}
 	if link == nil || link.URL == "" {
 		util.ServerError(c, "获取到的播放地址为空")
@@ -320,6 +329,46 @@ func (h *StreamHandler) Serve(c *gin.Context) {
 	if err != nil {
 		util.ServerError(c, "拉取媒体流失败: "+err.Error())
 		return
+	}
+	// 缓存里的直链失效了（典型：夸克 `__puus` 过期 —— 列目录/取链仍回 200，
+	// 只有 CDN 真取字节才 401/403/412）。这时**丢掉缓存重取一次**再试，
+	// 而不是把一个"看不了"丢给孩子。
+	if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 412 {
+		_, _ = io.CopyN(io.Discard, resp.Body, 1<<10)
+		resp.Body.Close()
+		dropCachedLink(linkKey)
+
+		if nl, derr := a.GetDirectLink(c.Request.Context(), &adapter.Credential{
+			DiskType: adapter.DiskType(res.DiskType),
+			Cookie:   cookie,
+			Extra:    extra,
+		}, res.FileID); derr == nil && nl != nil && nl.URL != "" {
+			putCachedLink(linkKey, nl)
+			link = nl
+			if req2, rerr := http.NewRequestWithContext(c.Request.Context(),
+				http.MethodGet, link.URL, nil); rerr == nil {
+				for k, v := range link.Headers {
+					req2.Header.Set(k, v)
+				}
+				if r := c.GetHeader("Range"); r != "" {
+					req2.Header.Set("Range", r)
+				}
+				if ir := c.GetHeader("If-Range"); ir != "" {
+					req2.Header.Set("If-Range", ir)
+				}
+				if r := c.GetHeader("If-None-Match"); r != "" {
+					req2.Header.Set("If-None-Match", r)
+				}
+				resp, err = h.client.Do(req2)
+				if err != nil {
+					util.ServerError(c, "拉取媒体流失败: "+err.Error())
+					return
+				}
+			}
+		} else {
+			util.ServerError(c, "播放地址已失效，请重新进入播放页")
+			return
+		}
 	}
 	defer resp.Body.Close()
 

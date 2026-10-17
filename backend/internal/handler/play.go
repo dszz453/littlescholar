@@ -370,6 +370,12 @@ func (h *PlayHandler) resolveDirectLinkObj(res *model.Resource) (*adapter.Direct
 	if err != nil {
 		return nil, err
 	}
+	// 与取流侧共用同一份直链缓存：探测容器格式、取直链这些"前置动作"
+	// 没必要每次都真打一次网盘 API（见 linkcache.go 的说明）。
+	key := linkCacheKey(*res.DiskAccountID, res.FileID)
+	if link, ok := getCachedLink(key); ok {
+		return link, nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -381,6 +387,7 @@ func (h *PlayHandler) resolveDirectLinkObj(res *model.Resource) (*adapter.Direct
 	if err != nil {
 		return nil, err
 	}
+	putCachedLink(key, link)
 	return link, nil
 }
 
@@ -448,14 +455,21 @@ func (h *PlayHandler) probeContainer(ctx context.Context, res *model.Resource) {
 	if res == nil || !canProxy(res) {
 		return
 	}
+	// 探不出来就别每次都探：那是一次真实的网络往返，白等 1~3 秒，
+	// 而且每次点开都等（见 probeMissRecently 的注释）。
+	if probeMissRecently(res.ID) {
+		return
+	}
 	link, err := h.resolveDirectLinkObj(res)
 	if err != nil || link == nil {
 		return
 	}
 	ext := probeExtFromLink(ctx, link)
 	if ext == "" {
+		markProbeMiss(res.ID)
 		return
 	}
+	clearProbeMiss(res.ID)
 	// 条件更新：只在仍然没有格式信息时写，避免覆盖更权威的值
 	// （WebDAV 的 FileID 带后缀，比 CDN 的 MIME 更准）。
 	if err := h.db.Model(&model.Resource{}).
