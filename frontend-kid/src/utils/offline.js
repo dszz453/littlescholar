@@ -98,13 +98,19 @@ export async function getMeta(id) {
   return row || null
 }
 
-/** 列出所有已缓存的条目（按缓存时间倒序）。 */
+/** 列出所有已缓存的条目（最近看过的排前面）。 */
 export async function listCached() {
   const db = await openDB()
   const { store, done } = tx(db, [STORE_META], 'readonly')
   const rows = (await wrap(store(STORE_META).getAll())) || []
   await done
-  rows.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0))
+  // 按"最近一次使用"排，而不是下载时间：孩子反复看的那几集应该留在
+  // 最上面，自动清理也按同一口径淘汰，避免"看着列表挺新、实际要被删"。
+  rows.sort(
+    (a, b) =>
+      (Number(b.lastUsedAt) || Number(b.savedAt) || 0) -
+      (Number(a.lastUsedAt) || Number(a.savedAt) || 0),
+  )
   return rows
 }
 
@@ -237,6 +243,9 @@ export async function download(id, url, meta, onProgress, signal) {
     mime: type,
     size: blob.size,
     savedAt: Date.now(),
+    // 刚下好 = 刚用过。自动清理按它排序，没这行的话"昨天下的今天就删"
+    // 会发生在刚下完还没看的片子上。
+    lastUsedAt: Date.now(),
   })
   await done
   revokeUrl(id) // 数据换了，旧的 objectURL 必须作废
@@ -252,3 +261,103 @@ export function fmtSize(bytes) {
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
+
+// ---------- 自动清理 ----------
+//
+// 为什么必须自动清：缓存是"存到手机里"的，而手机空间是有限的。
+// 只给一个「清空」按钮不够 —— 家长不会主动去点，等到发现时手机已经满了，
+// 表现成"App 打不开 / 拍了照片存不下"，而根本原因在几十集动画片。
+// 所以按「看过没有 + 多久没看 + 一共占多少」三条规则在后台悄悄淘汰。
+//
+// 规则（都在这里集中定义，改策略只改这一处）：
+//   · 超过 30 天没看 → 删（孩子早就不看了，留着只是占地方）
+//   · 总量超过 2GB   → 从最久没看的开始删，直到降下来
+//   · 永远至少保留最近看的 1 条（避免一次性清空，也避免刚下好就被删）
+//
+// 判「看过没有」用 lastUsedAt（播放时刷新），没有就退回 savedAt。
+export const AUTO_CLEAN = {
+  maxBytes: 2 * 1024 * 1024 * 1024, // 2GB
+  maxAgeDays: 30,
+  keep: 1,
+}
+
+/** 记录"这条刚被看过"，自动清理据此判断该淘汰谁。 */
+export async function touchCache(id) {
+  const key = String(id)
+  const db = await openDB()
+  const { store, done } = tx(db, [STORE_META], 'readwrite')
+  const row = await wrap(store(STORE_META).get(key))
+  if (row) {
+    row.lastUsedAt = Date.now()
+    store(STORE_META).put(row)
+  }
+  await done
+}
+
+/** 某条最近一次被使用的时间（没有记录就用缓存时间）。 */
+function usedAt(row) {
+  return Number(row.lastUsedAt) || Number(row.savedAt) || 0
+}
+
+/**
+ * 按上面的规则清理一遍，返回清掉了多少。
+ *
+ * @param {{maxBytes?:number, maxAgeDays?:number, keep?:number, protect?:Array}} opts
+ *        protect 是"这次别动"的 id 列表（正在播的那条要传进来）
+ * @returns {Promise<{removed:number, freed:number}>}
+ */
+export async function autoClean(opts = {}) {
+  const maxBytes = Number(opts.maxBytes) || AUTO_CLEAN.maxBytes
+  const maxAgeDays = Number(opts.maxAgeDays) || AUTO_CLEAN.maxAgeDays
+  const keep = Math.max(
+    0,
+    opts.keep === undefined ? AUTO_CLEAN.keep : Number(opts.keep) || 0,
+  )
+  const protect = new Set((opts.protect || []).map(String))
+
+  let rows
+  try {
+    rows = await listCached()
+  } catch (e) {
+    return { removed: 0, freed: 0 }
+  }
+  if (!rows.length) return { removed: 0, freed: 0 }
+
+  // 最近看过的排前面：淘汰从末尾开始。
+  rows.sort((a, b) => usedAt(b) - usedAt(a))
+
+  const now = Date.now()
+  const expireBefore = now - maxAgeDays * 24 * 3600 * 1000
+  let alive = 0 // 已经"保住"的条数（受 keep 保护）
+  let total = rows.reduce((n, r) => n + (Number(r.size) || 0), 0)
+
+  const doomed = []
+  for (const r of rows) {
+    const id = String(r.id)
+    if (protect.has(id)) continue
+    if (alive < keep) {
+      alive++
+      continue
+    }
+    const tooOld = usedAt(r) < expireBefore
+    const tooBig = total > maxBytes
+    if (tooOld || tooBig) {
+      doomed.push(r)
+      total -= Number(r.size) || 0
+    }
+  }
+
+  let removed = 0
+  let freed = 0
+  for (const r of doomed) {
+    try {
+      await removeCache(r.id)
+      removed++
+      freed += Number(r.size) || 0
+    } catch (e) {
+      /* 单条删失败不影响其它：下次启动还会再试 */
+    }
+  }
+  return { removed, freed }
+}
+

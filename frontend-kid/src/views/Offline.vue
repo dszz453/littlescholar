@@ -14,6 +14,10 @@
       <p v-if="items.length" class="summary">
         共 {{ items.length }} 个 · 占用 {{ fmtSize(used) }}
         <span class="summary-tip">缓存的内容不占流量，随时能看</span>
+        <span class="summary-tip auto-tip">
+          自动清理：超过 {{ AUTO_CLEAN.maxAgeDays }} 天没看、或总共超过
+          {{ fmtSize(AUTO_CLEAN.maxBytes) }} 时，会从最久没看的开始删
+        </span>
       </p>
 
       <div v-if="loading" class="empty"><span class="emoji">⏳</span><p>正在读取…</p></div>
@@ -48,6 +52,8 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import {
+  AUTO_CLEAN,
+  autoClean,
   clearAll,
   listCached,
   offlineSupported,
@@ -78,6 +84,13 @@ async function reload() {
     if (!(await offlineSupported())) {
       items.value = []
       return
+    }
+    // 进这个页面也清一遍：App 启动时清过，但用户可能在里面待了很久，
+    // 或者刚下完几集把空间顶超了。清掉的条数告诉用户一声 ——
+    // 悄悄消失比"删了但有提示"更让人困惑。
+    const cleaned = await autoClean()
+    if (cleaned && cleaned.removed > 0) {
+      showToast(`已自动清理 ${cleaned.removed} 个较久没看的缓存`)
     }
     items.value = await listCached()
     used.value = items.value.reduce((n, r) => n + (Number(r.size) || 0), 0)
@@ -185,6 +198,10 @@ onMounted(reload)
   margin-top: 2px;
   color: #b0b4bc;
   font-size: 12px;
+}
+.auto-tip {
+  margin-top: 6px;
+  line-height: 1.5;
 }
 .row {
   display: flex;

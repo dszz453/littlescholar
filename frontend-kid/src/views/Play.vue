@@ -13,7 +13,13 @@
     </header>
 
     <!-- ===== 加载 / 错误 ===== -->
-    <div v-if="loading" class="loading"><div class="spinner"></div></div>
+    <!-- 说明文案不是装饰：PRO 端第一次播放要先把这个文件转存进自己的网盘，
+         网盘那边 3~30 秒都正常。只给一个转圈，用户会以为卡死了。 -->
+    <div v-if="loading" class="loading">
+      <div class="spinner"></div>
+      <p class="loading-text">正在打开…</p>
+      <p class="loading-sub">第一次播放要先存到你自己的网盘，可能要十几秒</p>
+    </div>
 
     <div v-else-if="error" class="empty">
       <div class="emoji">{{ needSmooth ? '🎬' : '😢' }}</div>
@@ -72,7 +78,8 @@
           class="video"
           :src="info.url"
           :poster="info.poster"
-          preload="metadata"
+          preload="auto"
+          autoplay
           playsinline
           webkit-playsinline
           controls
@@ -372,6 +379,7 @@ import {
   removeCache as offlineRemove,
   releaseUrls as offlineReleaseUrls,
   fmtSize as offlineFmtSize,
+  touchCache as offlineTouch,
 } from '@/utils/offline'
 
 const route = useRoute()
@@ -626,6 +634,9 @@ const offlineHintText = computed(() => {
 async function localURLFor(id) {
   try {
     if (!(await offlineIsCached(id))) return ''
+    // 顺手记一笔"刚看过"：自动清理按这个时间淘汰最久没看的，
+    // 不刷新的话，一部片子反复看也会因为"下载时间久"被删掉。
+    offlineTouch(id).catch(() => {})
     return await offlineCachedURL(id)
   } catch (e) {
     return ''
@@ -1122,13 +1133,16 @@ function onLoadedMetadata() {
     }
   }
   pendingSeek = 0
-  // 音频自动播放（视频不自动播，避免流量与自动出声）
-  if (isAudio.value) {
-    el.play().catch(() => {
-      // 浏览器策略拦截自动播放时静默失败，等用户点按钮
-      isPlaying.value = false
-    })
-  }
+  // 点开就播 —— 视频、音频都一样。
+  //
+  // 以前这里只给音频自动播放，视频要用户再点一次播放键：孩子端看到的是
+  // 一个转圈的播放器，点一下才动，像是"卡住了"。安卓壳（标准版与 PRO）
+  // 都关掉了 mediaPlaybackRequiresUserGesture，所以这里能直接播；
+  // 万一被浏览器策略拦下，catch 掉即可，手动点依然有效。
+  el.play().catch(() => {
+    // 拦截 / 解码未就绪都会走到这里，等用户点按钮
+    isPlaying.value = false
+  })
 }
 
 function onTimeUpdate() {
@@ -1247,6 +1261,9 @@ async function reloadInfo() {
       pendingSeek = pos
     }
     el?.load()
+    // load() 会把播放器打回暂停态，这里补一次播放：
+    // 走到这条路说明刚才正在播（直链过期 / 网络抖了一下），换好源就该继续。
+    el?.play().catch(() => {})
     return
   }
 
@@ -1595,6 +1612,27 @@ watch(isPlaying, (v) => {
   min-height: 100vh;
   background: var(--c-bg);
   padding-bottom: calc(32px + var(--safe-bottom));
+}
+
+/* 加载态：转圈 + 两行说明，竖排。
+   main.css 里的 .loading 是横排（只有转圈），这里只在本页收紧。 */
+.play-page .loading {
+  flex-direction: column;
+  gap: 10px;
+  padding: 64px 32px;
+}
+.loading-text {
+  margin: 4px 0 0;
+  font-size: 15px;
+  color: var(--c-text);
+}
+.loading-sub {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--c-text-2, #8a8a8a);
+  text-align: center;
+  max-width: 260px;
 }
 
 /* ===== 顶栏 ===== */
