@@ -28,10 +28,34 @@ type PlayHandler struct {
 	// secret 用于签发播放票据（见 stream.go）。播放 URL 要进 <video src>，
 	// 带不了 Authorization 头，所以不能靠常规 JWT 中间件鉴权。
 	secret string
+	// ebook 为 nil 时电子书退化为"给原始直链"，不影响其它类型。
+	ebook *EbookHandler
+	// audioFmt 为 nil 时音频退化为"给原始直链"。
+	audioFmt *AudioFormatHandler
+	// imageFmt 为 nil 时 HEIC/TIFF 退化为"给原始直链"（多半是空白）。
+	imageFmt *ImageFormatHandler
 }
 
 func NewPlayHandler(db *gorm.DB, perm *service.PermissionService, encryptor *util.Encryptor, transcode *service.TranscodeService, secret string) *PlayHandler {
 	return &PlayHandler{db: db, perm: perm, encryptor: encryptor, transcode: transcode, secret: secret}
+}
+
+// WithEbook 注入电子书转换能力（链式，避免改动既有构造签名）。
+func (h *PlayHandler) WithEbook(e *EbookHandler) *PlayHandler {
+	h.ebook = e
+	return h
+}
+
+// WithAudioFormat 注入音频格式转换能力。
+func (h *PlayHandler) WithAudioFormat(a *AudioFormatHandler) *PlayHandler {
+	h.audioFmt = a
+	return h
+}
+
+// WithImageFormat 注入图片格式转换能力（HEIC / TIFF → JPEG）。
+func (h *PlayHandler) WithImageFormat(m *ImageFormatHandler) *PlayHandler {
+	h.imageFmt = m
+	return h
 }
 
 // canProxy 判断资源是否具备"由后端代取流"的条件：
@@ -118,6 +142,22 @@ func (h *PlayHandler) setDirectPlay(res *model.Resource, playMode, playURL *stri
 	h.fallbackDirect(res, playMode, playURL)
 }
 
+// setupEbook 决定电子书的取文件方式，并返回前端该用的渲染器名。
+//
+// 两类分开：
+//   - epub / txt / cbz：浏览器那边有纯前端解析器，直接代理原文件（支持 Range）；
+//   - mobi / azw3 / cbr / fb2：WebView 解不了，交给 EbookHandler 转成 EPUB。
+func (h *PlayHandler) setupEbook(res *model.Resource, playMode, playURL *string) string {
+	ext := service.ResourceExt(res)
+	if h.ebook != nil && service.EbookNeedsConvertExt(ext) {
+		*playMode = "ebook"
+		*playURL = h.ebook.URLFor(res.ID)
+		return "epub"
+	}
+	h.setDirectPlay(res, playMode, playURL)
+	return ext
+}
+
 // Info 获取播放信息
 func (h *PlayHandler) Info(c *gin.Context) {
 	id, ok := util.GetUintParam(c, "id")
@@ -150,8 +190,23 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	}
 
 	mediaType := res.MediaType
+	// media_type 是后来补的列（见 MEMORY「AutoMigrate 补列不回填默认值」），
+	// 存量行可能是空；而这些资源的 Title 在入库时就被剥掉了扩展名，
+	// 按标题猜只会得到空 ext → 默认 video。真实格式还留在 Ext / FileID 里，
+	// 先按它反推才对 —— 否则一本 EPUB 会被当成视频塞进 <video>。
 	if mediaType == "" {
-		mediaType = guessMediaType(res.Title)
+		if e := service.ResourceExt(&res); e != "" {
+			mediaType = service.MediaTypeByExt(e)
+		} else {
+			mediaType = guessMediaType(res.Title)
+		}
+	} else if mediaType == model.MediaTypeVideo {
+		// 历史误判（早年导入一律写 video）：Ext 明确不是视频时以 Ext 为准
+		if e := service.ResourceExt(&res); e != "" {
+			if t := service.MediaTypeByExt(e); t != model.MediaTypeVideo {
+				mediaType = t
+			}
+		}
 	}
 
 	// 播放地址生成策略
@@ -193,7 +248,22 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	wantSmooth := quality == QualitySmooth
 	transcodeReady := h.transcode != nil && h.transcode.Enabled()
 
+	// 电子书没有"码率/转码"这回事，它要回答的是另外两个问题：
+	// 前端该用哪个渲染器、文件从哪拿。所以单开一个分支，
+	// 不参与下面的画质选择。
+	ebookFormat := ""
 	switch {
+	case mediaType == model.MediaTypeEbook:
+		ebookFormat = h.setupEbook(&res, &playMode, &playURL)
+	case mediaType == model.MediaTypeAudio && h.audioFmt != nil && h.audioFmt.NeedsConvert(&res):
+		// wma / ape / amr / ac3 …：WebView 的 <audio> 直接放不出来。
+		// 这里给一个"服务端已经转成 AAC"的地址，前端不用做任何判断。
+		playMode = "audioformat"
+		playURL = h.audioFmt.URLFor(res.ID)
+	case mediaType == model.MediaTypeImage && h.imageFmt != nil && h.imageFmt.NeedsConvert(&res):
+		// HEIC / TIFF：<img> 在 WebView 里就是一块空白，转成 JPEG 再给
+		playMode = "imageformat"
+		playURL = h.imageFmt.URLFor(res.ID)
 	case wantSmooth && transcodeReady:
 		// EnsureHLS 会：已就绪→直接返回；未开始→入队并返回；进行中→返回进度
 		masterURL, ready, taskID, err := h.transcode.EnsureHLS(c.Request.Context(), &res)
@@ -283,8 +353,14 @@ func (h *PlayHandler) Info(c *gin.Context) {
 		"smoothUnavailable": smoothUnavailable,
 		// 浏览器放不出来的容器：前端据此给出「格式需要转码」而不是
 		// 含糊的「地址可能已过期」。转码成功进入 hls 模式后即为 false。
+		// 已经交给转码/转换链路（hls / audioformat / ebook）时不算"放不出来"，
+		// 否则前端会在音频刚转好的那一刻弹一句"格式不支持"。
 		"containerUnsupported": service.ContainerUnsupported(&res) &&
-			playMode != "hls" && playMode != "transcoding",
+			playMode != "hls" && playMode != "transcoding" &&
+			playMode != "audioformat" && playMode != "ebook" && playMode != "imageformat",
+		// 电子书用哪个渲染器：epub / txt / cbz / pdf（转换过的统一是 epub）。
+		// 前端据此决定用 epub.js、纯文本、图片序列还是 pdf.js。
+		"ebookFormat": ebookFormat,
 	})
 }
 
@@ -349,14 +425,23 @@ func (h *PlayHandler) resolveDirectLink(res *model.Resource) (string, error) {
 // 需要 headers 的场景（如 probeContainer 要向上游发一个 Range 试探请求）
 // 不能只用 URL —— 夸克/UC 的 CDN 缺了 Cookie 会直接 412。
 func (h *PlayHandler) resolveDirectLinkObj(res *model.Resource) (*adapter.DirectLink, error) {
+	return resolveDirectLinkFor(h.db, h.encryptor, res)
+}
+
+// resolveDirectLinkFor 包级版本：播放、容器探测、电子书转换都走这一条。
+//
+// 抽出来的原因很实际 —— 电子书转换要先把源文件下载到本地，
+// 而复刻一份"读账号 → 解密 Cookie → 调适配器 → 写缓存"的逻辑，
+// 迟早会和这边漂移（漏了缓存就会每次多打一次网盘 API）。
+func resolveDirectLinkFor(db *gorm.DB, encryptor *util.Encryptor, res *model.Resource) (*adapter.DirectLink, error) {
 	if res.DiskAccountID == nil || res.FileID == "" {
 		return nil, fmt.Errorf("缺少转存信息")
 	}
 	var acc model.DiskAccount
-	if err := h.db.First(&acc, *res.DiskAccountID).Error; err != nil {
+	if err := db.First(&acc, *res.DiskAccountID).Error; err != nil {
 		return nil, fmt.Errorf("账号不存在")
 	}
-	cookie, err := h.encryptor.Decrypt(acc.CookieEncrypted)
+	cookie, err := encryptor.Decrypt(acc.CookieEncrypted)
 	if err != nil {
 		return nil, fmt.Errorf("凭据解密失败")
 	}

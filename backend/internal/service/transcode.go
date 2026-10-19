@@ -617,29 +617,49 @@ func (s *TranscodeService) DiskUsage() int64 {
 // 现在改成读 model.Resource.Ext（新数据）并带 Title/FileID 兜底
 // （老数据），FileID 兜底尤其关键：WebDAV 的 FileID 就是带后缀的路径。
 func NeedsTranscode(res *model.Resource) bool {
-	if res == nil || res.MediaType != model.MediaTypeVideo {
+	if res == nil {
 		return false
 	}
 	ext := ResourceExt(res)
-	// 已经是 HLS 清单，本身就是流，再转没有意义
-	if ext == "m3u8" {
-		return false
+	switch res.MediaType {
+	case model.MediaTypeVideo:
+		// 已经是 HLS 清单，本身就是流，再转没有意义
+		if ext == "m3u8" {
+			return false
+		}
+		// 体积超过 300MB 或时长超过 10 分钟，直链拖动体验差，转码收益明显
+		if res.TotalSize > 300*1024*1024 || res.Duration > 600 {
+			return true
+		}
+		// 容器格式浏览器原生不支持 → 必须转
+		return NeedsTranscodeExt(ext)
+	case model.MediaTypeAudio:
+		// 音频只看编码：<audio> 拖进度不需要 HLS，
+		// wma/ape/amr 这些编码不支持才转。
+		return AudioNeedsTranscodeExt(ext)
+	case model.MediaTypeImage:
+		return ImageNeedsTranscodeExt(ext)
 	}
-	// 体积超过 300MB 或时长超过 10 分钟，直链拖动体验差，转码收益明显
-	if res.TotalSize > 300*1024*1024 || res.Duration > 600 {
-		return true
-	}
-	// 容器格式浏览器原生不支持 → 必须转
-	return NeedsTranscodeExt(ext)
+	return false
 }
 
-// ContainerUnsupported 资源当前会不会因为"容器格式浏览器放不出来"而播不了。
+// ContainerUnsupported 资源当前会不会因为"格式浏览器放不出来"而播不了。
 //
 // 用途是给前端一个**能解释得通**的错误提示：直链播放失败时，
 // 到底是"地址过期"还是"格式不支持"，两者给用户的操作完全不同。
+// 2026-10 扩展到音频 / 图片：WMA、APE、HEIC 在 WebView 里同样是黑屏/空白。
 func ContainerUnsupported(res *model.Resource) bool {
-	if res == nil || res.MediaType != model.MediaTypeVideo {
+	if res == nil {
 		return false
 	}
-	return NeedsTranscodeExt(ResourceExt(res))
+	ext := ResourceExt(res)
+	switch res.MediaType {
+	case model.MediaTypeVideo:
+		return NeedsTranscodeExt(ext)
+	case model.MediaTypeAudio:
+		return AudioNeedsTranscodeExt(ext)
+	case model.MediaTypeImage:
+		return ImageNeedsTranscodeExt(ext)
+	}
+	return false
 }

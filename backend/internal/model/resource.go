@@ -10,9 +10,15 @@ const (
 )
 
 // 媒体类型
+//
+// ebook 是 2026-10 新增的一类：pdf 早就有独立类型（走 pdf.js），
+// 但 epub / mobi / azw3 / txt / cbz 这些"电子书"以前被归到 other，
+// 孩子端点开只能看到一个「打开网盘」的按钮。现在它们有正式归类，
+// 前端按 ext 再细分用哪个阅读器渲染。
 const (
 	MediaTypeVideo = "video"
 	MediaTypeAudio = "audio"
+	MediaTypeEbook = "ebook"
 	MediaTypePDF   = "pdf"
 	MediaTypeImage = "image"
 	MediaTypeOther = "other"

@@ -161,10 +161,50 @@ func contentTypeExt(ct string) string {
 		return "m4a"
 	case "audio/flac", "audio/x-flac":
 		return "flac"
-	case "audio/wav", "audio/x-wav":
+	case "audio/wav", "audio/x-wav", "audio/wave":
 		return "wav"
+	case "audio/aac", "audio/x-aac":
+		return "aac"
+	case "audio/ogg", "audio/vorbis", "application/ogg":
+		return "ogg"
+	case "audio/opus":
+		return "opus"
+	case "audio/x-ms-wma", "audio/wma":
+		return "wma"
+	case "audio/x-ape":
+		return "ape"
+	case "audio/amr", "audio/x-amr":
+		return "amr"
+	case "audio/ac3":
+		return "ac3"
+	case "audio/vnd.dts", "audio/x-dts":
+		return "dts"
+	case "audio/x-matroska":
+		return "mka"
+	case "audio/aiff", "audio/x-aiff":
+		return "aiff"
+	case "audio/basic", "audio/x-au":
+		return "au"
 	case "application/pdf":
 		return "pdf"
+	// 电子书。Kindle 的 azw3 上游普遍报 application/vnd.amazon.ebook，
+	// 认不出 azw3 与 azw 的区别，统一按 azw3 处理（转换逻辑一样）。
+	case "application/epub+zip":
+		return "epub"
+	case "application/x-mobipocket-ebook":
+		return "mobi"
+	case "application/vnd.amazon.ebook":
+		return "azw3"
+	case "application/vnd.comicbook+zip":
+		return "cbz"
+	case "application/vnd.comicbook-rar":
+		return "cbr"
+	case "image/heic", "image/heif":
+		return "heic"
+	case "image/tiff":
+		return "tiff"
+	case "image/avif":
+		return "avif"
 	}
 	return ""
 }

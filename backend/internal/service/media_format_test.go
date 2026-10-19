@@ -149,12 +149,121 @@ func TestContainerUnsupported(t *testing.T) {
 			want: true,
 		},
 		{name: "mp4 可以放", res: &model.Resource{MediaType: model.MediaTypeVideo, Ext: "mp4"}, want: false},
-		{name: "音频不参与该判断", res: &model.Resource{MediaType: model.MediaTypeAudio, Ext: "ape"}, want: false},
+		// 2026-10 扩展：音频和图片也参与这个判定。
+		// WMA/APE 在 WebView 里就是一句"播放失败"，HEIC 是一张空白图 ——
+		// 它们和 rmvb 属于同一类问题，必须有同样的引导。
+		{
+			name: "ape 音频浏览器放不出来",
+			res:  &model.Resource{MediaType: model.MediaTypeAudio, Ext: "ape"},
+			want: true,
+		},
+		{
+			name: "wma 音频浏览器放不出来",
+			res:  &model.Resource{MediaType: model.MediaTypeAudio, Ext: "WMA"},
+			want: true,
+		},
+		{name: "m4a 可以放", res: &model.Resource{MediaType: model.MediaTypeAudio, Ext: "m4a"}, want: false},
+		{name: "flac 可以放", res: &model.Resource{MediaType: model.MediaTypeAudio, Ext: "flac"}, want: false},
+		{
+			name: "heic 图片浏览器解不了",
+			res:  &model.Resource{MediaType: model.MediaTypeImage, Ext: "heic"},
+			want: true,
+		},
+		{name: "jpg 可以显示", res: &model.Resource{MediaType: model.MediaTypeImage, Ext: "jpg"}, want: false},
 		{name: "格式未知时不误报", res: &model.Resource{MediaType: model.MediaTypeVideo}, want: false},
+		{name: "nil 安全", res: nil, want: false},
 	}
 	for _, c := range cases {
 		if got := ContainerUnsupported(c.res); got != c.want {
 			t.Errorf("%s: ContainerUnsupported() = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestFormatTablesConsistent 保证四张扩展名表与 MediaTypeByExt 不分叉。
+//
+// 这是"兼容大部分格式"这个需求最容易出错的地方：往 videoExts 里加一个
+// 格式却忘了更新分类，表现是**导入成功、点开按错的播放器渲染**。
+// 遍历整张表而不是挑几个样本来断言，漏一项就会红。
+func TestFormatTablesConsistent(t *testing.T) {
+	sets := []struct {
+		name string
+		tbl  map[string]bool
+		want string
+	}{
+		{"video", videoExts, model.MediaTypeVideo},
+		{"audio", audioExts, model.MediaTypeAudio},
+		{"ebook", ebookExts, model.MediaTypeEbook},
+		{"image", imageExts, model.MediaTypeImage},
+	}
+	for _, s := range sets {
+		for ext := range s.tbl {
+			if got := MediaTypeByExt(ext); got != s.want {
+				t.Errorf("%s 表里的 %q 被分类成 %q，期望 %q", s.name, ext, got, s.want)
+			}
+			if !IsMediaFile("x." + ext) {
+				t.Errorf("%s 表里的 %q 不在可导入白名单里", s.name, ext)
+			}
+		}
+	}
+	if MediaTypeByExt("pdf") != model.MediaTypePDF {
+		t.Errorf("pdf 必须仍是独立类型")
+	}
+}
+
+// TestMediaTypeByExt 锁住用户实际点到的那几个格式的归类。
+func TestMediaTypeByExt(t *testing.T) {
+	cases := map[string]string{
+		"mp4": "video", "mkv": "video", "m2ts": "video", "rmvb": "video", "ogv": "video",
+		"mp3": "audio", "wma": "audio", "ape": "audio", "mka": "audio", "opus": "audio",
+		"epub": "ebook", "mobi": "ebook", "azw3": "ebook", "cbz": "ebook", "cbr": "ebook", "txt": "ebook",
+		"jpg": "image", "heic": "image", "svg": "video", // svg 不在表里 → 历史行为按视频
+		"pdf": "pdf",
+	}
+	for ext, want := range cases {
+		if got := MediaTypeByExt(ext); got != want {
+			t.Errorf("MediaTypeByExt(%q) = %q, want %q", ext, got, want)
+		}
+	}
+}
+
+// TestNeedsTranscodeForType 三类资源的"直接播 / 要转码"判定。
+func TestNeedsTranscodeForType(t *testing.T) {
+	cases := []struct {
+		mt, ext string
+		want    bool
+	}{
+		{"video", "mp4", false},
+		{"video", "mkv", true},
+		{"video", "m2ts", true},
+		{"audio", "mp3", false},
+		{"audio", "flac", false},
+		{"audio", "wma", true},
+		{"audio", "ape", true},
+		{"image", "jpg", false},
+		{"image", "heic", true},
+		{"ebook", "epub", false},
+		{"ebook", "mobi", false}, // 电子书的问题不是解码，走 EbookNeedsConvertExt
+	}
+	for _, c := range cases {
+		if got := NeedsTranscodeForType(c.mt, c.ext); got != c.want {
+			t.Errorf("NeedsTranscodeForType(%q,%q) = %v, want %v", c.mt, c.ext, got, c.want)
+		}
+	}
+}
+
+// TestEbookNeedsConvert 哪些电子书要服务端转换。
+func TestEbookNeedsConvert(t *testing.T) {
+	need := []string{"mobi", "azw", "azw3", "cbr", "cb7", "fb2"}
+	direct := []string{"epub", "txt", "cbz", "pdf"}
+	for _, e := range need {
+		if !EbookNeedsConvertExt(e) {
+			t.Errorf("%s 应该需要服务端转换", e)
+		}
+	}
+	for _, e := range direct {
+		if EbookNeedsConvertExt(e) {
+			t.Errorf("%s 前端能直接读，不该走转换", e)
 		}
 	}
 }

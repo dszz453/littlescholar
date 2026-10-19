@@ -85,11 +85,18 @@ let reportTimer = null
 const playUrl = computed(() => info.value.url || '')
 
 function mediaText(t) {
-  return { video: '视频', audio: '音频', pdf: 'PDF 文档', image: '图片' }[t] || t
+  return { video: '视频', audio: '音频', pdf: 'PDF 文档', image: '图片', ebook: '电子书' }[t] || t
 }
 
 function modeText(m) {
-  return { direct: '直链播放', proxy: '服务端中转', hls: 'HLS 转码', external: '外部打开' }[m] || m
+  return {
+    direct: '直链播放',
+    proxy: '服务端中转',
+    hls: 'HLS 转码',
+    audioformat: '音频转码（AAC）',
+    ebook: '电子书转换（EPUB）',
+    external: '外部打开',
+  }[m] || m
 }
 
 function formatDuration(sec) {

@@ -21,22 +21,63 @@ const (
 	maxImportDepth = 16
 )
 
-// mediaFileExts 可播放 / 可阅读的扩展名白名单。
+// videoExts 视频文件扩展名。
+//
+// 这里只回答"它是不是视频"，**不回答"浏览器能不能播"** ——
+// 后者由 needsTranscodeExts 负责。两件事分开，是因为
+// 2026-10 那次"格式兼容"改造发现：以前只维护一张 mediaFileExts，
+// 结果 asx/m2v/dv 这些容器既导不进来（不在白名单）又不在转码表里。
+var videoExts = map[string]bool{
+	"mp4": true, "m4v": true, "webm": true, "m3u8": true,
+	"mkv": true, "avi": true, "mov": true, "wmv": true, "asf": true,
+	"flv": true, "f4v": true, "rmvb": true, "rm": true,
+	"ts": true, "m2ts": true, "mts": true, "mpg": true, "mpeg": true, "m2v": true,
+	"vob": true, "3gp": true, "3g2": true, "ogv": true, "ogm": true,
+	"divx": true, "xvid": true, "mxf": true, "dv": true, "wtv": true,
+}
+
+// audioExts 音频文件扩展名。
+var audioExts = map[string]bool{
+	"mp3": true, "m4a": true, "m4b": true, "aac": true, "wav": true,
+	"flac": true, "ogg": true, "oga": true, "opus": true, "weba": true,
+	"wma": true, "ape": true, "amr": true, "ac3": true, "eac3": true,
+	"dts": true, "mka": true, "tta": true, "wv": true, "aiff": true,
+	"aif": true, "au": true, "ra": true, "mpc": true, "tak": true,
+}
+
+// ebookExts 电子书扩展名（不含 pdf —— pdf 有独立类型，走 pdf.js）。
+//
+// cbz / cbr / cb7 是"图片打包成漫画"，本质是 zip/rar/7z；
+// mobi / azw / azw3 是 Kindle 格式，浏览器读不了，要服务端转换。
+var ebookExts = map[string]bool{
+	"epub": true, "mobi": true, "azw": true, "azw3": true,
+	"cbz": true, "cbr": true, "cb7": true,
+	"txt": true, "fb2": true,
+}
+
+// imageExts 图片扩展名。
+//
+// heic/heif/tif 浏览器多半解不了，需要服务端转码成 jpg ——
+// 它们仍在白名单里，因为 iPhone 拍的绘本照片就是这个格式。
+var imageExts = map[string]bool{
+	"jpg": true, "jpeg": true, "png": true, "gif": true, "webp": true,
+	"bmp": true, "avif": true, "heic": true, "heif": true, "tif": true, "tiff": true,
+}
+
+// mediaFileExts 可导入的扩展名白名单 = 四类并集。
 //
 // 导入时必须过滤：NAS 上每个视频旁边通常还有 .nfo / .srt / .torrent /
 // 缩略图等附属文件，全登记成资源的话，孩子端点开就是乱码或空白。
-var mediaFileExts = map[string]bool{
-	// 视频
-	"mp4": true, "mkv": true, "avi": true, "mov": true, "wmv": true,
-	"flv": true, "rmvb": true, "rm": true, "ts": true, "m3u8": true,
-	"webm": true, "m4v": true, "mpg": true, "mpeg": true, "3gp": true,
-	// 音频
-	"mp3": true, "wav": true, "flac": true, "aac": true, "m4a": true,
-	"ogg": true, "wma": true, "ape": true,
-	// 文档 / 图片
-	"pdf": true,
-	"jpg": true, "jpeg": true, "png": true, "gif": true, "webp": true, "bmp": true,
-}
+var mediaFileExts = func() map[string]bool {
+	m := make(map[string]bool, len(videoExts)+len(audioExts)+len(ebookExts)+len(imageExts)+1)
+	for _, set := range []map[string]bool{videoExts, audioExts, ebookExts, imageExts} {
+		for k := range set {
+			m[k] = true
+		}
+	}
+	m["pdf"] = true
+	return m
+}()
 
 // ExtOfName 取小写扩展名，没有则返回空串。
 func ExtOfName(name string) string {
@@ -47,21 +88,46 @@ func ExtOfName(name string) string {
 	return strings.ToLower(name[i+1:])
 }
 
-// needsTranscodeExts 浏览器**原生放不出来**的容器格式。
+// needsTranscodeExts 浏览器**原生放不出来**的视频容器。
 //
 // 这张表是"要不要转码"的判据核心：命中就必须转码，否则 <video>
 // 只会抛 MediaError(code=4) 然后前端弹一句毫无信息量的提示。
 //
 // 有意不包含的：
 //   - mp4 / m4v / webm / m3u8 —— 浏览器原生支持，转码纯属浪费 CPU；
-//   - mp3 / m4a / flac / wav —— 音频同理；
+//     （mp4 里的 HEVC/AC3 属于**编码**问题，容器看不出，靠播放失败自动降级兜）
 //   - mov —— 部分情况是 h264 可以直接播，但线上实测有大量 mov 用的是
 //     非浏览器编码，保险起见仍走转码（与改动前的行为保持一致）。
 var needsTranscodeExts = map[string]bool{
 	"mkv": true, "avi": true, "rmvb": true, "rm": true, "flv": true,
-	"wmv": true, "mov": true, "ts": true, "mpg": true, "mpeg": true,
-	"3gp": true, "vob": true, "f4v": true, "asf": true, "m2ts": true,
-	"mts": true, "divx": true, "xv": true, "ogm": true, "mxf": true,
+	"wmv": true, "asf": true, "mov": true, "ts": true, "m2ts": true,
+	"mts": true, "mpg": true, "mpeg": true, "m2v": true, "3gp": true,
+	"3g2": true, "vob": true, "f4v": true, "divx": true, "xvid": true,
+	"ogv": true, "ogm": true, "mxf": true, "dv": true, "wtv": true,
+}
+
+// audioNeedsTranscodeExts 浏览器放不出来的音频格式。
+//
+// 和视频不同，音频转码不用切 HLS：直接转成单文件 AAC/m4a，
+// 输出小、转得快、<audio> 100% 认（HLS 在部分 WebView 的 <audio> 上不认）。
+var audioNeedsTranscodeExts = map[string]bool{
+	"wma": true, "ape": true, "amr": true, "ac3": true, "eac3": true,
+	"dts": true, "mka": true, "tta": true, "wv": true, "aiff": true,
+	"aif": true, "au": true, "ra": true, "mpc": true, "tak": true,
+}
+
+// ebookNeedsConvertExts 浏览器读不了、必须服务端转换的电子书。
+//
+// epub / pdf / txt / cbz 前端能直接读，不在此列。
+var ebookNeedsConvertExts = map[string]bool{
+	"mobi": true, "azw": true, "azw3": true, // → epub
+	"cbr": true, "cb7": true, // → cbz（zip 图片）
+	"fb2": true, // → html
+}
+
+// imageNeedsTranscodeExts 浏览器解不了的图片。
+var imageNeedsTranscodeExts = map[string]bool{
+	"heic": true, "heif": true, "tif": true, "tiff": true,
 }
 
 // knownExts 我们"认得出来"的格式集合 = 可导入白名单 ∪ 需转码容器表。
@@ -81,8 +147,34 @@ var knownExts = func() map[string]bool {
 	return m
 }()
 
-// NeedsTranscodeExt 判断该扩展名是否必须转码才能给浏览器播。
+// NeedsTranscodeExt 判断该扩展名是否必须转码才能给浏览器播（视频容器）。
 func NeedsTranscodeExt(ext string) bool { return needsTranscodeExts[ext] }
+
+// AudioNeedsTranscodeExt 音频是否必须转码才能给浏览器播。
+func AudioNeedsTranscodeExt(ext string) bool { return audioNeedsTranscodeExts[ext] }
+
+// EbookNeedsConvertExt 电子书是否必须服务端转换（mobi/azw3/cbr/fb2 …）。
+func EbookNeedsConvertExt(ext string) bool { return ebookNeedsConvertExts[ext] }
+
+// ImageNeedsTranscodeExt 图片是否必须转码（heic/tiff）。
+func ImageNeedsTranscodeExt(ext string) bool { return imageNeedsTranscodeExts[ext] }
+
+// NeedsTranscodeForType 按媒体类型判断"这个文件浏览器能不能直接用"。
+//
+// 视频看容器表、音频看编码表、图片看解码表；电子书不在这里 ——
+// 它们的问题不是"能不能解码"，而是"要不要换一个容器读"，
+// 由 EbookNeedsConvertExt 单独回答。
+func NeedsTranscodeForType(mediaType, ext string) bool {
+	switch mediaType {
+	case model.MediaTypeVideo:
+		return NeedsTranscodeExt(ext)
+	case model.MediaTypeAudio:
+		return AudioNeedsTranscodeExt(ext)
+	case model.MediaTypeImage:
+		return ImageNeedsTranscodeExt(ext)
+	}
+	return false
+}
 
 // ResourceExt 推断资源的真实文件扩展名（小写、不含点）。
 //
@@ -129,13 +221,18 @@ func GuessMediaType(title string) string {
 // 与**播放**用的分类共用同一张表 —— 两边各写一份迟早会漂移，
 // 表现就是"列表里排前面的打不开、能播的排在后面"。
 func MediaTypeByExt(ext string) string {
-	switch strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), ".")) {
-	case "mp3", "wav", "flac", "aac", "m4a", "ogg", "wma", "ape":
+	e := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), "."))
+	switch {
+	case audioExts[e]:
 		return model.MediaTypeAudio
-	case "pdf":
+	case ebookExts[e]:
+		return model.MediaTypeEbook
+	case e == "pdf":
 		return model.MediaTypePDF
-	case "jpg", "jpeg", "png", "gif", "webp", "bmp":
+	case imageExts[e]:
 		return model.MediaTypeImage
+	case videoExts[e]:
+		return model.MediaTypeVideo
 	default:
 		return model.MediaTypeVideo
 	}

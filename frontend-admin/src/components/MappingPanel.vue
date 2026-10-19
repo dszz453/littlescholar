@@ -741,6 +741,7 @@ function mediaIcon(data) {
   if (data.mediaType === 'audio') return '🎵'
   if (data.mediaType === 'image') return '🖼️'
   if (data.mediaType === 'pdf') return '📕'
+  if (data.mediaType === 'ebook') return '📚'
   if (/^(mp4|mkv|avi|mov|wmv|flv|rmvb|rm|ts|m3u8|webm|m4v|mpg|mpeg|3gp)$/.test(ext)) return '🎬'
   if (/^(mp3|wav|flac|aac|m4a|ogg|wma|ape)$/.test(ext)) return '🎵'
   if (ext === 'pdf') return '📕'

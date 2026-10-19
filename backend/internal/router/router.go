@@ -2,6 +2,7 @@ package router
 
 import (
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -86,7 +87,20 @@ func Setup(deps *Deps) *gin.Engine {
 		organizeH = handler.NewOrganizeHandler(deps.DB, deps.Perm, aiH).WithEncryptor(deps.Encryptor)
 	}
 	studyH := handler.NewStudyHandler(deps.DB, aiH)
-	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret)
+	// 电子书产物放在 data/ 下**没有被 r.Static 暴露**的独立目录：
+	// media/ 与 transcode/ 都是公开静态，把书放进去等于让任何人都能猜文件名下载。
+	ebookDir := filepath.Join(filepath.Dir(deps.Cfg.Storage.TranscodeDir), "ebook")
+	ebookH := handler.NewEbookHandler(deps.DB, deps.Perm, deps.Encryptor, nil, ebookDir, deps.Cfg.JWT.Secret)
+	audioFmtDir := filepath.Join(filepath.Dir(deps.Cfg.Storage.TranscodeDir), "audiofmt")
+	audioFmtH := handler.NewAudioFormatHandler(deps.DB, deps.Encryptor, nil,
+		deps.Cfg.Transcode.FFmpegPath, audioFmtDir, deps.Cfg.JWT.Secret)
+	imageFmtDir := filepath.Join(filepath.Dir(deps.Cfg.Storage.TranscodeDir), "imagefmt")
+	imageFmtH := handler.NewImageFormatHandler(deps.DB, deps.Encryptor, nil,
+		deps.Cfg.Transcode.FFmpegPath, imageFmtDir, deps.Cfg.JWT.Secret)
+	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret).
+		WithEbook(ebookH).
+		WithAudioFormat(audioFmtH).
+		WithImageFormat(imageFmtH)
 	streamH := handler.NewStreamHandler(deps.DB, deps.Encryptor, deps.Cfg.JWT.Secret)
 	systemH := handler.NewSystemHandler(deps.DB, deps.Cfg, deps.Pansou, deps.Pancheck, deps.Pool, deps.StartedAt)
 	transcodeH := handler.NewTranscodeHandler(deps.DB, deps.Transcode)
@@ -130,6 +144,12 @@ func Setup(deps *Deps) *gin.Engine {
 	// 票据绑定"资源 ID + 过期时间"，由 JWT secret 做 HMAC，
 	// 泄露也只能播那一个资源。
 	api.GET("/stream/:id", streamH.Serve)
+	// 电子书同理：mobi/azw3/cbr/fb2 转出来的 EPUB 走这条带票据的地址
+	api.GET("/ebook/:id", ebookH.Serve)
+	// 音频格式转换（wma/ape/… → aac），同样靠票据鉴权
+	api.GET("/audio/:id", audioFmtH.Serve)
+	// 图片格式转换（heic/tiff → jpeg）
+	api.GET("/image/:id", imageFmtH.Serve)
 
 	// 静态资源（媒体文件）
 	r.Static("/media", deps.Cfg.Storage.MediaDir)

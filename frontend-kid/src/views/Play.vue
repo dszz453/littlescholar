@@ -105,6 +105,86 @@
         </div>
       </section>
 
+      <!-- ===== 电子书：EPUB / TXT / CBZ =====
+           三个渲染器共用这一块外壳（标题条、字号、目录、翻页），
+           真正的正文交给各自的动态 import —— epub.js 有 400KB+，
+           不为一本 txt 把它拉下来。 -->
+      <section v-else-if="isEbook" class="media-area ebook-area">
+        <div class="ebook-bar">
+          <span class="ebook-badge">{{ ebookBadge }}</span>
+          <div class="ebook-tools">
+            <button class="eb-btn pressable" @click="ebookFontStep(-1)" aria-label="缩小字号">A-</button>
+            <button class="eb-btn pressable" @click="ebookFontStep(1)" aria-label="放大字号">A+</button>
+            <button
+              v-if="ebookTocItems.length"
+              class="eb-btn pressable"
+              :class="{ on: ebookTocOpen }"
+              @click="ebookTocOpen = !ebookTocOpen"
+            >
+              目录
+            </button>
+          </div>
+        </div>
+
+        <div v-if="ebookLoading" class="ebook-wait">
+          <div class="spinner"></div>
+          <p class="ebook-wait-text">{{ ebookLoadingText }}</p>
+        </div>
+
+        <div v-else-if="ebookError" class="empty">
+          <div class="emoji">📖</div>
+          <p>{{ ebookError }}</p>
+          <button class="retry pressable" @click="reloadEbook">再试一次</button>
+        </div>
+
+        <template v-else>
+          <!-- EPUB：epub.js 渲染在受控 iframe 里，自带分页与滑动 -->
+          <div v-if="ebookMode === 'epub'" ref="epubHost" class="epub-host"></div>
+
+          <!-- TXT：纯文本，滚动阅读 -->
+          <div
+            v-if="ebookMode === 'txt'"
+            ref="txtHost"
+            class="txt-host"
+            :style="{ fontSize: ebookFont + 'px' }"
+          ></div>
+
+          <!-- CBZ / 图片书：竖向滚动，到底部自动解压下一批 -->
+          <div v-if="ebookMode === 'cbz'" class="cbz-host" @scroll.passive="onCbzScroll">
+            <img
+              v-for="(u, i) in cbzShown"
+              :key="u + i"
+              :src="u"
+              class="cbz-page"
+              alt=""
+            />
+            <p v-if="cbzLoadingMore" class="cbz-more">正在加载后面的页面…</p>
+            <p v-else-if="cbzShown.length >= cbzTotal" class="cbz-more">已经是最后一页了</p>
+          </div>
+
+          <!-- 目录抽屉 -->
+          <div v-if="ebookTocOpen && ebookTocItems.length" class="ebook-toc">
+            <div
+              v-for="(it, i) in ebookTocItems"
+              :key="i"
+              class="toc-item pressable"
+              :style="{ paddingLeft: 12 + Math.min(it.depth || 0, 3) * 14 + 'px' }"
+              @click="goToc(it)"
+            >
+              {{ it.label }}
+            </div>
+          </div>
+        </template>
+
+        <!-- EPUB 翻页条。epub.js 自己支持左右滑动，但孩子端的小手
+             不一定划得动 iframe —— 页面上给一对明确的按钮更保险。 -->
+        <div v-if="ebookMode === 'epub' && !ebookError" class="ebook-pager">
+          <button class="pdf-nav pressable" @click="epubPrev">◀ 上一页</button>
+          <span class="pdf-pageinfo">{{ ebookProgressText }}</span>
+          <button class="pdf-nav pressable" @click="epubNext">下一页 ▶</button>
+        </div>
+      </section>
+
       <!-- PDF：用 pdf.js 在页面内渲染。
            以前是 <iframe src="blob:...pdf"> —— 桌面 Chrome 自带 PDF 阅读器，
            所以看着没问题；但**安卓 WebView 没有 PDF 插件**，装成 App 之后
@@ -396,6 +476,9 @@ const error = ref('')
 // errorRetried 防止"媒体报错 → 重取直链 → 又报错"打成死循环。
 // 一次播放生命周期内只自动重取一次，之后交给用户手动重试。
 let errorRetried = false
+// autoFallbackTried 记录"已经自动帮用户切过一次转码"。
+// 只切一次：转码也可能失败，无限重试会变成一个看不见的死循环。
+let autoFallbackTried = false
 
 const audioEl = ref(null)
 const videoEl = ref(null)
@@ -554,7 +637,7 @@ const isVideo = computed(() => info.value.mediaType === 'video')
 const isPDF = computed(() => info.value.mediaType === 'pdf')
 const isImage = computed(() => info.value.mediaType === 'image')
 
-const TYPE_LABEL = { audio: '音频', video: '视频', pdf: '绘本', image: '图片' }
+const TYPE_LABEL = { audio: '音频', video: '视频', pdf: '绘本', image: '图片', ebook: '电子书' }
 const typeLabel = computed(() => TYPE_LABEL[info.value.mediaType] || '资源')
 
 const coverStyle = computed(() => {
@@ -721,11 +804,13 @@ async function toggleOffline() {
 // resumeAt > 0 时用它作为续播点（切换画质时用得上：那会儿还没上报，
 // 库里的 lastPosition 可能是十几秒前的旧值）。
 async function load(resumeAt = 0) {
-  // 记住 PDF 地址，等 loading 关掉再渲染（原因见下面的注释）
+  // 记住 PDF / 电子书地址，等 loading 关掉再渲染（原因见下面的注释）
   let pdfURL = ''
+  let ebookURL = ''
   loading.value = true
   error.value = ''
   errorRetried = false
+  autoFallbackTried = false
   cleanupMedia()
   stopTranscodePolling()
 
@@ -789,6 +874,10 @@ async function load(resumeAt = 0) {
       // （这个 bug 只有真去读 canvas 像素才抓得到：接口、DOM 都存在。）
       pdfURL = data.url
     }
+    if (isEbook.value) {
+      // 电子书的宿主同样在 v-if="loading" 里面，只能等 finally 之后再挂载
+      ebookURL = data.url
+    }
     if (isImage.value) {
       // 图片无需额外处理
     }
@@ -817,6 +906,7 @@ async function load(resumeAt = 0) {
       error.value = ''
       pendingSeek = resumeAt > 0 ? resumeAt : 0
       if (meta.mediaType === 'pdf') pdfURL = local
+      if (meta.mediaType === 'ebook') ebookURL = local
       setupMediaSession()
     } else {
       error.value = e?.message || '资源加载失败'
@@ -828,6 +918,7 @@ async function load(resumeAt = 0) {
   refreshOfflineState()
   // loading 关掉之后媒体区才挂载，PDF 的 canvas 这时候才存在
   if (pdfURL) await openPDF(pdfURL)
+  if (ebookURL) await openEbook(ebookURL)
 }
 
 /* ---------- 转码轮询 ---------- */
@@ -1119,6 +1210,389 @@ function pdfErrorText(e) {
   return '绘本打开失败'
 }
 
+/* ---------- 电子书：EPUB / TXT / CBZ ---------- */
+//
+// 为什么是这三个渲染器：
+//   - EPUB：epub.js（纯前端、分页/目录/字号齐全）。mobi/azw3/cbr/fb2
+//     由服务端先转成 EPUB，到达前端时统一是 epub；
+//   - TXT：没有排版可言，直接滚动显示，字号可调；
+//   - CBZ：本质是「一堆图片打进 zip」，解压后按自然序竖向排列。
+//
+// 三者共同点：都是**动态 import**。epub.js 有 400KB+，jszip 也有 100KB，
+// 不能因为它们让首页多等一秒 —— 只有真的打开一本电子书才加载。
+const FONT_KEY = 'kid_ebook_font'
+const FONT_MIN = 14
+const FONT_MAX = 30
+
+const epubHost = ref(null)
+const txtHost = ref(null)
+const ebookLoading = ref(false)
+const ebookLoadingText = ref('正在打开…')
+const ebookError = ref('')
+const ebookTocOpen = ref(false)
+const ebookTocItems = ref([])
+const ebookProgressText = ref('')
+const ebookFont = ref(readEbookFont())
+
+const cbzPages = ref([]) // 全部页的 blob: 地址
+const cbzShownCount = ref(0)
+const cbzTotal = ref(0)
+const cbzLoadingMore = ref(false)
+const cbzShown = computed(() => cbzPages.value.slice(0, cbzShownCount.value))
+
+let epubBook = null
+let epubRendition = null
+let ebookSeq = 0 // 让"慢的那次"不能覆盖"新的一次"
+let ebookPos = '' // 当前 CFI
+
+const isEbook = computed(() => info.value.mediaType === 'ebook')
+
+const ebookFormat = computed(() => String(info.value.ebookFormat || '').toLowerCase())
+
+// ebookMode 决定用哪个渲染器。认不出来时退回滚动文本 ——
+// 至少让孩子看到内容，而不是一个空白页。
+const ebookMode = computed(() => {
+  const f = ebookFormat.value
+  if (f === 'epub') return 'epub'
+  if (f === 'cbz') return 'cbz'
+  if (f === 'txt' || f === '') return 'txt'
+  return 'txt'
+})
+
+const ebookBadge = computed(() => {
+  const f = ebookFormat.value || 'book'
+  return f.toUpperCase()
+})
+
+function readEbookFont() {
+  try {
+    const v = Number(localStorage.getItem(FONT_KEY))
+    if (v >= FONT_MIN && v <= FONT_MAX) return v
+  } catch {
+    /* 隐私模式：用默认值 */
+  }
+  return 18
+}
+
+function ebookFontStep(d) {
+  const next = Math.max(FONT_MIN, Math.min(FONT_MAX, ebookFont.value + d * 2))
+  ebookFont.value = next
+  try {
+    localStorage.setItem(FONT_KEY, String(next))
+  } catch {
+    /* 存不下不影响本次阅读 */
+  }
+  if (epubRendition) {
+    try {
+      epubRendition.themes.fontSize(next + 'px')
+    } catch {
+      /* 老版本 epub.js 不支持运行时改字号，忽略 */
+    }
+  }
+}
+
+function resetEbook() {
+  ebookSeq++
+  if (epubRendition) {
+    try {
+      epubRendition.destroy()
+    } catch {
+      /* noop */
+    }
+    epubRendition = null
+  }
+  if (epubBook) {
+    try {
+      epubBook.destroy()
+    } catch {
+      /* noop */
+    }
+    epubBook = null
+  }
+  // blob: 地址必须显式释放，否则翻十几本漫画就把内存吃光了
+  cbzPages.value.forEach((u) => {
+    try {
+      URL.revokeObjectURL(u)
+    } catch {
+      /* noop */
+    }
+  })
+  cbzPages.value = []
+  cbzShownCount.value = 0
+  cbzTotal.value = 0
+  cbzLoadingMore.value = false
+  cbzZip = null
+  cbzNames = []
+  pendingTxt = null
+  ebookTocItems.value = []
+  ebookTocOpen.value = false
+  ebookProgressText.value = ''
+  ebookLoading.value = false
+  ebookError.value = ''
+}
+
+// fetchBook 取整本书的字节。
+//
+// 不用封装好的 axios 实例：它的 baseURL 是 /api，而这些地址本身
+// 已经是 /api/ebook/... 了，拼起来会变成 /api/api/...；
+// 另外票据鉴权不依赖 Authorization 头，用裸 fetch 最省事。
+async function fetchBook(url) {
+  const res = await fetch(url, { credentials: 'same-origin' })
+  if (!res.ok) {
+    let msg = ''
+    try {
+      const j = await res.json()
+      msg = j && (j.message || j.msg)
+    } catch {
+      /* 不是 JSON（比如网关的 HTML 错误页），走下面的兜底文案 */
+    }
+    throw new Error(msg || '这本书暂时打不开')
+  }
+  return res.arrayBuffer()
+}
+
+async function openEbook(url) {
+  resetEbook()
+  const seq = ebookSeq
+  if (!url) {
+    ebookError.value = '这本书没有可读的地址'
+    return
+  }
+  ebookLoading.value = true
+  ebookLoadingText.value = ebookMode.value === 'epub' ? '正在打开这本书…' : '正在准备…'
+  // EPUB 的"解析"和"渲染"必须分两步：渲染宿主在 loading 关掉之后才挂载。
+  let mount = null
+  try {
+    const buf = await fetchBook(url)
+    if (seq !== ebookSeq) return
+    if (ebookMode.value === 'epub') {
+      mount = await prepareEpub(buf, seq)
+    } else if (ebookMode.value === 'cbz') {
+      await openCbz(buf)
+    } else {
+      pendingTxt = decodeBookText(buf)
+    }
+  } catch (e) {
+    if (seq !== ebookSeq) return
+    ebookError.value = ebookErrorText(e)
+  } finally {
+    if (seq === ebookSeq) ebookLoading.value = false
+  }
+  if (seq !== ebookSeq) return
+  await nextTick()
+  if (seq !== ebookSeq) return
+  if (mount) {
+    await mount()
+  } else if (pendingTxt !== null) {
+    openTxt(pendingTxt)
+    pendingTxt = null
+  }
+}
+
+let pendingTxt = null
+
+// prepareEpub 只解析、不渲染，返回一个"DOM 就绪后再调"的函数。
+async function prepareEpub(buf, seq) {
+  // epub.js 对"不是 zip"的文件会抛一个很抽象的错误，先自己判一下
+  const head = new Uint8Array(buf.slice(0, 4))
+  if (!(head[0] === 0x50 && head[1] === 0x4b)) {
+    throw new Error('这个文件不是标准的 EPUB')
+  }
+  const mod = await import('epubjs')
+  const ePub = mod.default || mod
+  if (seq !== ebookSeq) return null
+
+  const book = ePub(buf)
+  epubBook = book
+  await book.ready
+  if (seq !== ebookSeq) return null
+
+  ebookTocItems.value = flattenToc(book.navigation && book.navigation.toc)
+  return () => mountEpub(book, seq)
+}
+
+async function mountEpub(book, seq) {
+  const host = epubHost.value
+  if (!host || seq !== ebookSeq) return
+  const rendition = book.renderTo(host, {
+    width: '100%',
+    height: '100%',
+    flow: 'paginated',
+    spread: 'none',
+  })
+  epubRendition = rendition
+  try {
+    rendition.themes.fontSize(ebookFont.value + 'px')
+    rendition.themes.override('line-height', '1.7')
+  } catch {
+    /* 字号主题失败不影响翻页 */
+  }
+
+  // 从上次读到的地方继续
+  const saved = readBookPos()
+  await rendition.display(saved || undefined)
+
+  rendition.on('relocated', (loc) => {
+    if (!loc || !loc.start) return
+    ebookPos = loc.start.cfi
+    saveBookPos(ebookPos)
+    if (loc.start.displayed && loc.start.displayed.page) {
+      const { page, total } = loc.start.displayed
+      ebookProgressText.value = `第 ${page} / ${total} 页`
+    } else {
+      ebookProgressText.value = `${Math.round((loc.start.percentage || 0) * 100)}%`
+    }
+  })
+}
+
+function flattenToc(items, depth = 0, out = []) {
+  if (!Array.isArray(items)) return out
+  for (const it of items) {
+    if (!it) continue
+    if (it.label) out.push({ label: String(it.label).trim(), href: it.href, depth })
+    if (it.subitems && it.subitems.length) flattenToc(it.subitems, depth + 1, out)
+  }
+  return out.slice(0, 200)
+}
+
+function readBookPos() {
+  try {
+    return localStorage.getItem('kid_ebook_pos_' + resourceId.value) || ''
+  } catch {
+    return ''
+  }
+}
+
+function saveBookPos(cfi) {
+  try {
+    localStorage.setItem('kid_ebook_pos_' + resourceId.value, cfi)
+  } catch {
+    /* 存不下不影响阅读 */
+  }
+}
+
+function epubPrev() {
+  epubRendition && epubRendition.prev()
+}
+
+function epubNext() {
+  epubRendition && epubRendition.next()
+}
+
+function goToc(it) {
+  ebookTocOpen.value = false
+  if (epubRendition && it && it.href) epubRendition.display(it.href)
+}
+
+// decodeBookText 解 TXT。国内大部分 txt 是 GBK，用 UTF-8 硬解会满屏问号。
+function decodeBookText(buf) {
+  let text = ''
+  try {
+    text = new TextDecoder('utf-8').decode(buf)
+  } catch {
+    text = ''
+  }
+  const bad = (text.match(/\uFFFD/g) || []).length
+  if (bad > 3 && bad / Math.max(text.length, 1) > 0.001) {
+    try {
+      text = new TextDecoder('gbk').decode(buf)
+    } catch {
+      /* 浏览器不支持 gbk 就保留 UTF-8 的结果 */
+    }
+  }
+  return text
+}
+
+function openTxt(text) {
+  const host = txtHost.value
+  if (!host) return
+  // textContent 而不是 innerHTML：书里的 "<" 就是字面量，
+  // 用 innerHTML 会把它们当标签解析（内容被吃掉，还有注入风险）
+  host.textContent = text || '（这本书是空的）'
+  host.scrollTop = Number(readTxtPos()) || 0
+  host.addEventListener(
+    'scroll',
+    () => {
+      try {
+        localStorage.setItem('kid_ebook_txtpos_' + resourceId.value, String(host.scrollTop))
+      } catch {
+        /* noop */
+      }
+    },
+    { passive: true },
+  )
+}
+
+function readTxtPos() {
+  try {
+    return localStorage.getItem('kid_ebook_txtpos_' + resourceId.value)
+  } catch {
+    return 0
+  }
+}
+
+async function openCbz(buf) {
+  const mod = await import('jszip')
+  const JSZip = mod.default || mod
+  const zip = await JSZip.loadAsync(buf)
+  const names = Object.keys(zip.files)
+    .filter((n) => !zip.files[n].dir && /\.(jpe?g|png|gif|webp|bmp)$/i.test(n))
+    .sort(naturalCompare)
+  if (!names.length) throw new Error('这个漫画包里没有图片')
+
+  cbzTotal.value = names.length
+  cbzPages.value = names.map(() => '') // 占位，按需填充
+  // 句柄留着给"滚到底加载下一批"用，离开页面时由 resetEbook 释放
+  cbzZip = zip
+  cbzNames = names
+  await loadCbzBatch(zip, names, 0, 6)
+}
+
+function naturalCompare(a, b) {
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+}
+
+async function loadCbzBatch(zip, names, from, count) {
+  cbzLoadingMore.value = true
+  try {
+    const end = Math.min(names.length, from + count)
+    for (let i = from; i < end; i++) {
+      const blob = await zip.files[names[i]].async('blob')
+      cbzPages.value[i] = URL.createObjectURL(blob)
+    }
+    cbzShownCount.value = end
+  } finally {
+    cbzLoadingMore.value = false
+  }
+}
+
+// onCbzScroll 到底了再解压下一批。
+//
+// 一话漫画 30~60 张图，一次性全部解成 blob 在低端机上会 OOM；
+// 分批加载让"打开第一页"和"内存占用"都保持在可接受范围。
+async function onCbzScroll(e) {
+  if (cbzLoadingMore.value || cbzShownCount.value >= cbzTotal.value) return
+  const el = e.target
+  if (el.scrollTop + el.clientHeight < el.scrollHeight - 600) return
+  if (!cbzZip || !cbzNames.length) return
+  await loadCbzBatch(cbzZip, cbzNames, cbzShownCount.value, 6)
+}
+
+let cbzZip = null
+let cbzNames = []
+
+function reloadEbook() {
+  load()
+}
+
+function ebookErrorText(e) {
+  const msg = String((e && e.message) || e || '')
+  if (/Failed to fetch|network|NetworkError/i.test(msg)) return '网络好像不太稳定，检查一下再试'
+  if (/不是标准|zip/i.test(msg)) return '这本书的文件好像损坏了'
+  if (/版权|DRM/i.test(msg)) return '这本书有版权保护，暂时打不开'
+  return msg || '这本书暂时打不开'
+}
+
 /* ---------- 媒体事件 ---------- */
 function onLoadedMetadata() {
   const el = mediaEl()
@@ -1200,6 +1674,26 @@ function onMediaError() {
     errorRetried = true
     // 稍微延迟一下：立刻重入会和此刻正在进行的错误处理抢媒体元素
     setTimeout(() => reloadInfo(), 600)
+    return
+  }
+
+  // —— 情况三：容器看着没问题，但里面的**编码**放不出来 ——
+  //
+  // mp4/mov 里封 HEVC、AC3、DTS 是最常见的坑：容器判定说"能播"，
+  // 播放器却直接给 code 4（HEVC 在部分设备）或者能出画面没声音。
+  // 这种只能等真的失败才知道，所以在这里自动切一次转码 ——
+  // 用户不需要理解"编码"是什么，只需要最后能看。
+  if (
+    code === 4 &&
+    errorRetried &&
+    !autoFallbackTried &&
+    !isSmooth.value &&
+    transcodeAvailable.value &&
+    isVideo.value
+  ) {
+    autoFallbackTried = true
+    showToast('这个格式要转一下，正在准备…')
+    setQuality(QUALITY_SMOOTH)
     return
   }
 
@@ -1514,6 +2008,7 @@ function goBack() {
 /* ---------- 生命周期 ---------- */
 function cleanupMedia() {
   resetPdf()
+  resetEbook()
   stopReportTimer()
   const el = mediaEl()
   if (el) {
@@ -1901,6 +2396,140 @@ watch(isPlaying, (v) => {
 }
 .dl-bar .qb.busy {
   opacity: 0.72;
+}
+
+/* ===== 电子书（EPUB / TXT / CBZ） ===== */
+.ebook-area {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ebook-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.ebook-badge {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  color: var(--c-primary);
+  background: #e8f6f5;
+  padding: 4px 10px;
+  border-radius: 999px;
+}
+.ebook-tools {
+  display: flex;
+  gap: 8px;
+}
+.eb-btn {
+  border: none;
+  background: #fff;
+  color: var(--c-text);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 12px;
+  border-radius: 999px;
+  box-shadow: var(--shadow-sm);
+  min-width: 40px;
+}
+.eb-btn.on {
+  background: var(--c-primary);
+  color: #fff;
+}
+.ebook-wait {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 48px 20px;
+}
+.ebook-wait-text {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--c-text-sub);
+  text-align: center;
+}
+
+/* epub.js 会在这个容器里塞一个 iframe；必须给它一个明确的高度，
+   否则 iframe 会缩成 0 —— 表现是"目录出来了、正文区域一片空白" */
+.epub-host {
+  width: 100%;
+  height: 66vh;
+  min-height: 320px;
+  background: #fff;
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+/* 纯文本：保留换行与缩进，长段落自动折行 */
+.txt-host {
+  width: 100%;
+  height: 62vh;
+  min-height: 300px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.85;
+  color: var(--c-text);
+  background: #fff;
+  padding: 18px 16px;
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-sm);
+  font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+/* 漫画：竖向滚动，一页一张图 */
+.cbz-host {
+  width: 100%;
+  height: 70vh;
+  min-height: 320px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  background: #111;
+  border-radius: var(--r-md);
+  padding: 6px 0;
+}
+.cbz-page {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 0 0 6px;
+  background: #111;
+}
+.cbz-more {
+  margin: 12px 0 18px;
+  text-align: center;
+  font-size: 12.5px;
+  color: #bbb;
+}
+
+.ebook-toc {
+  max-height: 44vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  background: #fff;
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-sm);
+  padding: 6px 0;
+}
+.toc-item {
+  padding: 11px 14px;
+  font-size: 14px;
+  color: var(--c-text);
+  border-bottom: 1px solid #f0f3f8;
+}
+.toc-item:last-child {
+  border-bottom: none;
+}
+.ebook-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
 }
 
 /* PDF */
