@@ -2125,6 +2125,21 @@ function ticketFrom(url) {
   }
 }
 
+// decodeSubtitleSource 解服务端编码过的字幕来源。
+//
+// HTTP 头只能是 ASCII，而来源里有中文（「同目录字幕 · xxx.srt」），
+// 服务端用 url.QueryEscape 编过一道，这里解回来。
+// 解不开就原样显示 —— 宁可难看一点，也不要因为一个展示字段让字幕整体失败。
+function decodeSubtitleSource(v) {
+  if (!v) return ''
+  try {
+    // QueryEscape 把空格编成 '+'，decodeURIComponent 不认，先换回来
+    return decodeURIComponent(String(v).replace(/\+/g, ' '))
+  } catch {
+    return String(v)
+  }
+}
+
 async function loadSubtitle() {
   resetSubtitle()
   if (!isVideo.value && !isAudio.value) return
@@ -2162,7 +2177,7 @@ async function loadSubtitle() {
       return
     }
     subtitleCues.value = cues
-    subtitleSource.value = res.headers.get('X-Subtitle-Source') || ''
+    subtitleSource.value = decodeSubtitleSource(res.headers.get('X-Subtitle-Source'))
     subtitleState.value = 'ok'
   } catch {
     subtitleState.value = 'none'

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"context"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -227,7 +228,11 @@ func (h *SubtitleHandler) serveFile(c *gin.Context, path, source string) {
 	c.Header("Cache-Control", "private, max-age=600")
 	// <track> 在某些内核里按跨域请求走，带上 CORS 头避免整条被拒
 	c.Header("Access-Control-Allow-Origin", "*")
-	c.Header("X-Subtitle-Source", source)
+	// ⚠️ 头值必须是 ASCII。中文直接塞进头里，Go 会原样吐 UTF-8 字节，
+	// 浏览器按 ISO-8859-1 解 → 孩子端看到的是「å†…åµŒâ€¦」这种乱码；
+	// 有些 HTTP 客户端（Node 的 http）干脆拒发，报 Invalid character。
+	// 所以这里做一次 form 编码，前端再解回来。
+	c.Header("X-Subtitle-Source", url.QueryEscape(source))
 	c.File(path)
 }
 
