@@ -42,9 +42,41 @@ const TYPE_META = {
   video: { emoji: '🎬', label: '视频', color: '#FF9D4D' },
   pdf: { emoji: '📄', label: '绘本', color: '#7F8C9A' },
   image: { emoji: '🖼️', label: '图片', color: '#F08BB4' },
+  ebook: { emoji: '📖', label: '电子书', color: '#8B7BD8' },
+  unknown: { emoji: '📦', label: '文件', color: '#9AA5B1' },
 }
 
-const meta = computed(() => TYPE_META[props.node.mediaType] || TYPE_META.audio)
+// ⚠️ 未知类型**不能回退成 audio**。
+//
+// 曾经的写法是 `|| TYPE_META.audio`，后果是：ebook 这种后加的类型在
+// 这里的白名单里没有 → 整本 epub 在列表上显示成「🎧 音频」。
+// 资源本身没错（mediaType 就是 ebook），错在展示层把它当成了兜底默认值。
+//
+// 现在分三步：① 认识就按类型；② 不认识但 ext 能对上表，按 ext；
+// ③ 都不行给中性的「文件」——宁可没有信息，也不要给错的信息。
+const EXT_TYPE = {
+  mp3: 'audio', m4a: 'audio', m4b: 'audio', aac: 'audio', wav: 'audio',
+  flac: 'audio', ogg: 'audio', oga: 'audio', opus: 'audio', weba: 'audio',
+  wma: 'audio', ape: 'audio', amr: 'audio', ac3: 'audio', eac3: 'audio',
+  dts: 'audio', mka: 'audio', tta: 'audio', wv: 'audio', aiff: 'audio',
+  mp4: 'video', mkv: 'video', avi: 'video', mov: 'video', flv: 'video',
+  ts: 'video', m2ts: 'video', webm: 'video', wmv: 'video', rmvb: 'video',
+  rm: 'video', m4v: 'video', '3gp': 'video', mpg: 'video', mpeg: 'video',
+  pdf: 'pdf',
+  jpg: 'image', jpeg: 'image', png: 'image', webp: 'image', gif: 'image',
+  bmp: 'image', avif: 'image', heic: 'image', tif: 'image', tiff: 'image',
+  epub: 'ebook', mobi: 'ebook', azw: 'ebook', azw3: 'ebook', cbz: 'ebook',
+  cbr: 'ebook', cb7: 'ebook', txt: 'ebook', fb2: 'ebook',
+}
+
+const typeKey = computed(() => {
+  const t = (props.node.mediaType || '').trim().toLowerCase()
+  if (TYPE_META[t]) return t
+  const ext = (props.node.ext || '').trim().toLowerCase().replace(/^\./, '')
+  return EXT_TYPE[ext] || 'unknown'
+})
+
+const meta = computed(() => TYPE_META[typeKey.value] || TYPE_META.unknown)
 const typeEmoji = computed(() => meta.value.emoji)
 const typeLabel = computed(() => meta.value.label)
 const typeColor = computed(() => meta.value.color)

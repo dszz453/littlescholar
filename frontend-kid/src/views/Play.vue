@@ -10,6 +10,17 @@
       <button class="more pressable" @click="showPlaylist = true" aria-label="播放列表">
         ☰
       </button>
+      <!-- 字幕开关：只有真的配到字幕时才出现。
+           没有字幕时留一个灰按钮只会让孩子反复点它。 -->
+      <button
+        v-if="subtitleState === 'ok'"
+        class="more pressable cc"
+        :class="{ on: subtitleOn }"
+        @click="toggleSubtitle"
+        aria-label="字幕"
+      >
+        CC
+      </button>
     </header>
 
     <!-- ===== 加载 / 错误 ===== -->
@@ -47,6 +58,9 @@
         <div class="wave" :class="{ playing: isPlaying }">
           <span v-for="n in 5" :key="n" :style="{ animationDelay: n * 90 + 'ms' }"></span>
         </div>
+
+        <!-- 音频也有字幕：很多"听故事"其实是英语启蒙，字幕是刚需 -->
+        <p v-if="subtitleOn && subtitleHTML" class="sub-audio-line" v-html="subtitleHTML"></p>
 
         <audio
           v-if="info.url"
@@ -95,6 +109,11 @@
           <div class="spinner big"></div>
           <p class="prep-title">正在把这集转成能播的版本…</p>
         </div>
+        <!-- 字幕层：自己渲染，不用 <track>。
+             ① <track> 挂在 <audio> 上根本不显示，"听故事"就没有字幕了；
+             ② 原生 cue 的字号/描边/位置几乎不可调。
+             一套渲染逻辑两处共用，行为才一致。 -->
+        <div v-if="subtitleOn && subtitleHTML" class="sub-overlay" v-html="subtitleHTML"></div>
         <p class="tip-lock">
           <span class="lock-emoji">🔒</span>
           播放中直接锁屏也不会停，把手机翻过来听也行
@@ -387,6 +406,11 @@
         <div v-if="info.categoryName" class="detail-row">
           <span class="k">分类</span>
           <span class="v ellipsis">{{ info.categoryName }}</span>
+        </div>
+        <!-- 字幕来自哪里：家长最常问的就是"这字幕是片子自带的还是网上找的" -->
+        <div v-if="subtitleState === 'ok' && subtitleSource" class="detail-row">
+          <span class="k">字幕</span>
+          <span class="v ellipsis">{{ subtitleSource }}</span>
         </div>
         <div v-if="duration > 0" class="detail-row">
           <span class="k">时长</span>
@@ -882,7 +906,12 @@ async function load(resumeAt = 0) {
       // 图片无需额外处理
     }
     setupMediaSession()
-
+    // 系统媒体面板要的是"标题/封面/时长"，这些此刻才拿到
+    lastNativePush = Date.now()
+    pushNativeMedia()
+    // 不 await：字幕要打网盘/ffprobe/联网匹配，慢的时候十几秒，
+    // 但播放本身一秒都不该等它。
+    loadSubtitle()
     loadSiblings()
     loadPlaylist()
   } catch (e) {
@@ -908,6 +937,8 @@ async function load(resumeAt = 0) {
       if (meta.mediaType === 'pdf') pdfURL = local
       if (meta.mediaType === 'ebook') ebookURL = local
       setupMediaSession()
+      lastNativePush = Date.now()
+      pushNativeMedia()
     } else {
       error.value = e?.message || '资源加载失败'
     }
@@ -1626,6 +1657,13 @@ function onTimeUpdate() {
   if (Number.isFinite(el.duration) && el.duration > 0) {
     duration.value = el.duration
   }
+  // 系统媒体面板的进度条：5 秒推一次就够（更频繁只会白耗电，
+  // 系统自己会根据播放速度往上推）。
+  const now = Date.now()
+  if (now - lastNativePush > 5000) {
+    lastNativePush = now
+    pushNativeMedia()
+  }
 }
 
 function onEnded() {
@@ -1904,6 +1942,233 @@ function setupMediaSession() {
   }
 }
 
+/* ---------- 系统媒体控制中心（原生壳） ----------
+ *
+ * WebView 里的 `navigator.mediaSession` **不会**出现在 Android 的系统媒体区
+ * （那是 Chrome 浏览器自己的实现）。所以真正的常驻控制必须由壳里的
+ * 前台服务 + MediaSessionCompat 来做，这里只负责把状态推过去。
+ *
+ * 只在标准版/PRO 里有效：纯浏览器打开时没有 KidNative 桥，静默跳过。
+ */
+let lastNativePush = 0
+
+function pushNativeMedia() {
+  // 标准版的桥叫 KidNative，PRO 的叫 EdgeNative —— 两个壳各自独立，
+  // 这里都认（纯浏览器里两个都没有，静默跳过）。
+  const bridge = window.KidNative || window.EdgeNative
+  if (!bridge || typeof bridge.mediaState !== 'function') return
+  if (!isVideo.value && !isAudio.value) return
+  try {
+    bridge.mediaState(
+      JSON.stringify({
+        active: true,
+        playing: !!isPlaying.value,
+        title: info.value.title || '',
+        subtitle: info.value.categoryName || '',
+        poster: info.value.poster || '',
+        duration: Math.round(Number(duration.value) || 0),
+        position: Math.round(Number(current.value) || 0),
+        hasPrev: !!prevTrackId(),
+        hasNext: !!nextTrackId(),
+      })
+    )
+  } catch {
+    /* 桥挂了不能影响播放 */
+  }
+}
+
+// 播放/暂停要立刻反映到系统面板（不能等下一个 5 秒节拍）
+watch(isPlaying, () => {
+  lastNativePush = Date.now()
+  pushNativeMedia()
+})
+
+// 离开播放页：让系统面板收起。壳里会等 20 秒宽限再停服务 ——
+// 切集时"清理→重新加载"必然会走一次 inactive，不能立刻停。
+function pushNativeInactive() {
+  const bridge = window.KidNative || window.EdgeNative
+  if (!bridge || typeof bridge.mediaState !== 'function') return
+  try {
+    bridge.mediaState(JSON.stringify({ active: false }))
+  } catch {
+    /* 同上 */
+  }
+}
+
+/* ---------- 字幕 ----------
+ *
+ * 三条来源都在服务端做完了（同目录文件 → 容器内嵌轨 → 联网匹配），
+ * 这里只负责"取回 VTT + 按时间显示"。前端不做匹配逻辑：
+ * 标题清洗、集数识别、语言优先级这些规则放一份，两端才不会各说各话。
+ */
+const SUB_KEY = 'kid_subtitle_on'
+
+const subtitleCues = ref([])
+const subtitleState = ref('idle') // idle | loading | ok | none
+const subtitleSource = ref('')
+const subtitleOn = ref(readSubtitlePref())
+
+function readSubtitlePref() {
+  try {
+    return localStorage.getItem(SUB_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
+
+function toggleSubtitle() {
+  subtitleOn.value = !subtitleOn.value
+  try {
+    localStorage.setItem(SUB_KEY, subtitleOn.value ? '1' : '0')
+  } catch {
+    /* 隐私模式下写不了，只影响本次会话 */
+  }
+}
+
+// vttSeconds 把 `00:01:02.500` / `01:02.500` 转成秒。
+function vttSeconds(s) {
+  const parts = String(s || '').trim().split(':')
+  if (parts.length < 2 || parts.length > 3) return NaN
+  const sec = Number(parts[parts.length - 1].replace(',', '.'))
+  const min = Number(parts[parts.length - 2])
+  const hr = parts.length === 3 ? Number(parts[0]) : 0
+  if (!isFinite(sec) || !isFinite(min) || !isFinite(hr)) return NaN
+  return hr * 3600 + min * 60 + sec
+}
+
+// parseVTT 解析成 [{start, end, text}]。
+//
+// 只认 WebVTT 的核心结构：时间轴行 + 其后的文本块。
+// STYLE/NOTE/REGION 这些块直接跳过 —— 我们不渲染它们，解析了也是死代码。
+function parseVTT(raw) {
+  const lines = String(raw || '').replace(/\r\n?/g, '\n').split('\n')
+  const cues = []
+  let i = 0
+  while (i < lines.length) {
+    const ln = lines[i]
+    if (ln.includes('-->')) {
+      const [a, b] = ln.split('-->')
+      const start = vttSeconds(a)
+      // 结束时间后面可能跟着位置设置（`00:00:03.000 align:start`），只取第一段
+      const end = vttSeconds((b || '').trim().split(/\s+/)[0])
+      i++
+      const buf = []
+      while (i < lines.length && lines[i].trim() !== '') {
+        buf.push(lines[i])
+        i++
+      }
+      if (isFinite(start) && isFinite(end) && end > start && buf.length) {
+        cues.push({ start, end, text: buf.join('\n') })
+      }
+    } else {
+      i++
+    }
+  }
+  // 二分查找要求按开始时间有序，正常 VTT 本来就有序，这里兜一下
+  cues.sort((x, y) => x.start - y.start)
+  return cues
+}
+
+// cueHTML 把 cue 文本变成安全的 HTML。
+//
+// ⚠️ 字幕可能来自网上（OpenSubtitles），**绝不能直接 v-html**：
+// 那等于把任意 HTML/脚本注入到孩子端页面里。
+// 做法是先全量转义，再只把 <i>/<b>/<u>/<br> 这四种无害标签放回来。
+function cueHTML(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/&lt;(\/?)(i|b|u)&gt;/gi, '<$1$2>')
+    .replace(/\n/g, '<br>')
+}
+
+// subtitleHTML 当前时刻应该显示的那句。
+//
+// 用"最后一个 start <= t < end"而不是"第一个匹配"：
+// 有的字幕条会重叠（歌词/多角色对白），显示最后开始的那条更符合直觉。
+const subtitleHTML = computed(() => {
+  const cues = subtitleCues.value
+  if (!cues.length) return ''
+  const t = current.value
+  let lo = 0
+  let hi = cues.length - 1
+  let hit = -1
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    if (cues[mid].start <= t) {
+      hit = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  // 从命中的位置往回找一小段，兼容"后一条还没到结束、前一条还该显示"的重叠
+  for (let i = hit; i >= 0 && i > hit - 8; i--) {
+    if (t >= cues[i].start && t < cues[i].end) return cueHTML(cues[i].text)
+  }
+  return ''
+})
+
+function resetSubtitle() {
+  subtitleCues.value = []
+  subtitleState.value = 'idle'
+  subtitleSource.value = ''
+}
+
+// ticketFrom 从播放地址里取票据（本地缓存播放时没有票据）。
+function ticketFrom(url) {
+  try {
+    return new URL(url, location.origin).searchParams.get('t') || ''
+  } catch {
+    return ''
+  }
+}
+
+async function loadSubtitle() {
+  resetSubtitle()
+  if (!isVideo.value && !isAudio.value) return
+  // 离线缓存播放：没有网络也没有票据，直接跳过
+  if (offlinePlay.value) return
+
+  // 服务端签好的地址优先（PRO 会把 url 换成自己的加速流，票据就取不到了）
+  let target = info.value.subtitleUrl || ''
+  if (!target) {
+    const t = ticketFrom(info.value.url)
+    if (!t) {
+      subtitleState.value = 'none'
+      return
+    }
+    target = `/api/subtitle/${resourceId.value}?t=${encodeURIComponent(t)}`
+  }
+
+  subtitleState.value = 'loading'
+  try {
+    const res = await fetch(target, { cache: 'no-store' })
+    if (res.status === 204 || !res.ok) {
+      // 204 = 服务端明确说"没有字幕"。这是常态，不提示。
+      subtitleState.value = 'none'
+      return
+    }
+    const text = await res.text()
+    // 鉴权失败时后端会回 JSON（200 + code:401），别把它当字幕解析
+    if (/^\s*\{/.test(text)) {
+      subtitleState.value = 'none'
+      return
+    }
+    const cues = parseVTT(text)
+    if (!cues.length) {
+      subtitleState.value = 'none'
+      return
+    }
+    subtitleCues.value = cues
+    subtitleSource.value = res.headers.get('X-Subtitle-Source') || ''
+    subtitleState.value = 'ok'
+  } catch {
+    subtitleState.value = 'none'
+  }
+}
+
 /* ---------- 列表加载 ---------- */
 async function loadSiblings() {
   try {
@@ -2009,6 +2274,8 @@ function goBack() {
 function cleanupMedia() {
   resetPdf()
   resetEbook()
+  resetSubtitle()
+  pushNativeInactive()
   stopReportTimer()
   const el = mediaEl()
   if (el) {
@@ -2051,6 +2318,19 @@ onMounted(() => {
     next: goNextTrack,
     toggle: () => togglePlay(),
     isPlaying: () => isPlaying.value,
+    // 系统媒体面板拖动进度条 → 原生 → 这里
+    seekTo: (sec) => {
+      const el = mediaEl()
+      if (!el) return
+      const t = Number(sec)
+      if (!Number.isFinite(t) || t < 0) return
+      try {
+        el.currentTime = t
+        current.value = t
+      } catch {
+        /* 元数据还没加载时设 currentTime 会抛，忽略即可 */
+      }
+    },
   }
   load()
   startReportTimer()
@@ -2256,6 +2536,51 @@ watch(isPlaying, (v) => {
 /* 视频 */
 .video-area {
   padding: 14px 0 0;
+  /* 字幕层用 absolute 定位压在上面，必须给一个定位上下文 */
+  position: relative;
+}
+
+/* ---------- 字幕 ---------- */
+.cc {
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  opacity: 0.5;
+}
+.cc.on {
+  opacity: 1;
+  color: #4a7ef0;
+  background: #eef3ff;
+}
+
+/* 视频字幕：压在下缘之上一点点，避开原生控制条（约 44px 高） */
+.sub-overlay {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 62px;
+  text-align: center;
+  font-size: 16px;
+  line-height: 1.42;
+  font-weight: 600;
+  color: #fff;
+  /* 白字压在亮画面上会看不见，双层阴影是最省事也最稳的描边 */
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.95), 0 0 6px rgba(0, 0, 0, 0.85);
+  pointer-events: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  z-index: 3;
+}
+
+/* 音频字幕：页面流内，不遮挡封面与进度 */
+.sub-audio-line {
+  margin: 10px 18px 0;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--c-text);
+  text-align: center;
+  min-height: 23px;
+  word-break: break-word;
 }
 .video {
   width: 100%;

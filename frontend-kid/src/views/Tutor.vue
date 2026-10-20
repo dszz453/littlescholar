@@ -112,7 +112,7 @@ const suggestions = computed(() => {
 })
 
 function recEmoji(r) {
-  const map = { audio: '🎧', video: '🎬', pdf: '📄', image: '🖼️' }
+  const map = { audio: '🎧', video: '🎬', pdf: '📄', image: '🖼️', ebook: '📖' }
   return map[r.mediaType] || '📚'
 }
 

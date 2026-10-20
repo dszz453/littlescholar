@@ -7,34 +7,48 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
+import androidx.media.app.NotificationCompat as MediaNotificationCompat
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executors
 
 /**
- * 媒体播放前台服务。
+ * 媒体播放前台服务（保活 + 系统媒体控制中心）。
  *
- * 存在的唯一理由：Android 8+ 中，App 退到后台后普通进程随时可能被回收，
- * 导致 WebView 里的音频被系统杀掉。挂一个前台服务可以把进程优先级提到
- * 最高，从而让"锁屏听故事"稳定工作。
+ * 两个职责，缺一不可：
  *
- * 它不接管播放控制 —— 播放控制由 WebView 内的 MediaSession 完成，
- * 通知栏的播放/暂停按钮由系统媒体面板（MediaStyle）呈现。
+ *  1. **保活**：Android 8+ 里，App 退到后台后进程随时可能被回收，
+ *     WebView 里的音频会被系统杀掉。前台服务把进程优先级提到最高。
+ *     再加上 CPU 唤醒锁与 WiFi 锁，锁屏播放才真的稳。
  *
- * ============ ⚠️ 2026-10-16：这个服务曾经**从来没有被启动过** ============
+ *  2. **系统媒体控制中心**：这是 2.4.0 补的。
  *
- * `start()` / `stop()` 写好了、清单声明了、唤醒锁也写了，但**全项目没有
- * 任何一处调用** —— 一段完整的死代码。后果是"息屏播放"这件事表面上
- * 有实现、实际全靠运气：
- *   · 没有前台服务 → App 一进后台进程优先级就掉下去，可能被回收/冻结；
- *   · 唤醒锁随之**永远不会被 acquire**（服务都没起，谁来拿锁），
- *     `WAKE_LOCK` 权限白声明；
- *   · 表现就是「息屏播完一集不切下一集，点开提示网络错误」。
+ * ============ ⚠️ 为什么以前"没有常驻控制中心" ============
  *
- * 接线补在 [MainActivity] 的 PlaybackBridge（外壳侧），**没有动孩子端一行**：
- * 这个壳的职责本来就写着「息屏播放、返回键、下载/外链」。
+ * 旧实现只 `addAction(上一集/暂停/下一集)` 建了一条**普通通知**：
+ *   · 没有 `MediaStyle` → 系统不认这是媒体通知，
+ *     下拉通知栏不会展开成大卡片，也没有进度条；
+ *   · 没有 `setMediaSession(token)` → Android 11+ 的媒体控制区
+ *     （通知栏顶部那块、锁屏、蓝牙/车机）**根本不知道有东西在播**；
+ *   · 网页里的 `navigator.mediaSession` 在 WebView 里**不会**注册到系统
+ *     （那是 Chrome 浏览器自己的能力），所以等它也等不到。
+ *
+ * 结果就是：播着音频，通知栏只有一条普通消息，锁屏上什么都没有。
+ *
+ * 现在补上 MediaSessionCompat + MediaStyle：标题/副标题/封面/进度/
+ * 上一集/暂停/下一集 全在系统面板里，锁屏、耳机线控、车机都能控制。
  */
 class MediaPlaybackService : Service() {
 
@@ -44,8 +58,6 @@ class MediaPlaybackService : Service() {
 
         const val ACTION_START = "xyz.littlescholar.kid.START"
         const val ACTION_STOP = "xyz.littlescholar.kid.STOP"
-        // 通知栏上的三个按钮。它们不自己实现换集，而是通过 MediaBridge
-        // 转给播放页 —— 换集逻辑只存在一份（见 MediaBridge 的注释）。
         const val ACTION_PREV = "xyz.littlescholar.kid.PREV"
         const val ACTION_TOGGLE = "xyz.littlescholar.kid.TOGGLE"
         const val ACTION_NEXT = "xyz.littlescholar.kid.NEXT"
@@ -55,11 +67,13 @@ class MediaPlaybackService : Service() {
          *
          * ⚠️ 外面**不能靠自己的布尔字段判断** —— 通知栏按钮、Activity 重建、
          * 系统重启服务都会让两边的状态漂。漂了的后果很隐蔽：play 事件看到
-         * "我以为还开着"就跳过 start，于是**整个播放期间一条保活都没有**，
-         * 而日志上看不出任何异常。所以状态只有一份，放在服务的生命周期里。
+         * "我以为还开着"就跳过 start，于是整个播放期间一条保活都没有。
          */
         @Volatile
         private var running = false
+
+        @Volatile
+        private var instance: MediaPlaybackService? = null
 
         fun isRunning(): Boolean = running
 
@@ -76,16 +90,11 @@ class MediaPlaybackService : Service() {
             } catch (e: Exception) {
                 // Android 12+ 从后台启动前台服务有限制。失败不该让播放挂掉，
                 // 只是没有保活而已 —— 所以吞掉，由播放链路自己继续。
+                Diagnostics.add("媒体", "前台服务启动失败：${e.message}")
             }
         }
 
         fun stop(ctx: Context) {
-            // ⚠️ 这里用 startService 送一个 ACTION_STOP，而不是 stopService()：
-            // 我们要**先释放唤醒锁、再摘掉通知**，这段顺序逻辑在服务的
-            // onStartCommand 里。而且此刻服务一定在运行（前台），
-            // 所以不触发"后台不能启动服务"的限制。
-            // 兜底：万一 startService 抛了（ROM 差异），退回 stopService，
-            // 至少 onDestroy 还会释放锁。
             try {
                 ctx.startService(
                     Intent(ctx, MediaPlaybackService::class.java).apply { action = ACTION_STOP }
@@ -98,29 +107,46 @@ class MediaPlaybackService : Service() {
                 }
             }
         }
+
+        /**
+         * 网页推来的播放状态（标题/封面/进度…）。
+         *
+         * 走静态方法而不是 bind：Activity 与服务本来就不该有生命周期耦合，
+         * 而页面调用发生在 JavaBridge 线程，只需要一份"最新状态"。
+         */
+        fun pushState(json: String) {
+            val st = MediaState.parse(json) ?: return
+            instance?.applyState(st)
+        }
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
+    private var session: MediaSessionCompat? = null
+    private var state: MediaState = MediaState()
+    private var lastPosterUrl = ""
+    private var poster: Bitmap? = null
+    private val io = Executors.newSingleThreadExecutor()
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         createChannel()
+        createSession()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
                 releaseLocks()
+                session?.isActive = false
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
             }
-            // 通知栏按钮：转给网页执行。服务本身不持播放状态，
-            // 也不刷新通知文案 —— "正在播放哪一集"由页面文案承担，
-            // 这里只做"按一下就换集"，简单可靠。
             ACTION_PREV -> {
                 MediaBridge.prev()
                 return START_STICKY
@@ -137,11 +163,114 @@ class MediaPlaybackService : Service() {
                 startForeground(NOTI_ID, buildNotification())
                 acquireLocks()
                 running = true
+                session?.isActive = true
             }
         }
-        // 被系统杀掉后自动重启，避免长音频中途断掉
         return START_STICKY
     }
+
+    // ============================================================
+    //  MediaSession：系统媒体控制中心
+    // ============================================================
+
+    private fun createSession() {
+        val s = MediaSessionCompat(this, "LittleScholar")
+        s.setCallback(object : MediaSessionCompat.Callback() {
+            // 这些回调来自**系统**（锁屏、耳机线控、车机、蓝牙），
+            // 一律转给网页执行 —— 换集/播放逻辑只存在一份。
+            override fun onPlay() = MediaBridge.toggle()
+            override fun onPause() = MediaBridge.toggle()
+            override fun onSkipToNext() = MediaBridge.next()
+            override fun onSkipToPrevious() = MediaBridge.prev()
+            override fun onSeekTo(pos: Long) = MediaBridge.seekTo(pos)
+            override fun onStop() = MediaBridge.toggle()
+        })
+        s.isActive = true
+        session = s
+        updateSession()
+    }
+
+    /** 把最新状态灌进 session（元数据 + 播放状态 + 通知）。 */
+    fun applyState(st: MediaState) {
+        state = st
+        if (st.poster.isNotEmpty() && st.poster != lastPosterUrl) {
+            lastPosterUrl = st.poster
+            loadPoster(st.poster)
+        }
+        updateSession()
+        // 通知要跟着换（标题、封面、按钮），但只在服务已经在前台时刷新
+        if (running) {
+            val mgr = getSystemService(NotificationManager::class.java)
+            mgr?.notify(NOTI_ID, buildNotification())
+        }
+    }
+
+    private fun updateSession() {
+        val s = session ?: return
+        val md = MediaMetadataCompat.Builder()
+            .putString(MediaMetadataCompat.METADATA_KEY_TITLE, state.title.ifBlank { "小书童" })
+            .putString(
+                MediaMetadataCompat.METADATA_KEY_ARTIST,
+                state.subtitle.ifBlank { "小书童 · 学习空间" }
+            )
+            .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, "小书童")
+            .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, state.duration * 1000)
+            .apply {
+                poster?.let { putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, it) }
+            }
+            .build()
+        s.setMetadata(md)
+
+        var actions = PlaybackStateCompat.ACTION_PLAY or
+            PlaybackStateCompat.ACTION_PAUSE or
+            PlaybackStateCompat.ACTION_PLAY_PAUSE or
+            PlaybackStateCompat.ACTION_SEEK_TO or
+            PlaybackStateCompat.ACTION_STOP
+        if (state.hasPrev) actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
+        if (state.hasNext) actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_NEXT
+
+        val pb = PlaybackStateCompat.Builder()
+            .setActions(actions)
+            .setState(
+                if (state.playing) PlaybackStateCompat.STATE_PLAYING
+                else PlaybackStateCompat.STATE_PAUSED,
+                state.position * 1000,
+                if (state.playing) 1f else 0f,
+                SystemClock.elapsedRealtime()
+            )
+            .build()
+        s.setPlaybackState(pb)
+    }
+
+    private fun loadPoster(url: String) {
+        io.execute {
+            try {
+                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 4000
+                    readTimeout = 6000
+                    instanceFollowRedirects = true
+                }
+                conn.inputStream.use { input ->
+                    val bmp = BitmapFactory.decodeStream(input)
+                    if (bmp != null) {
+                        poster = bmp
+                        updateSession()
+                        if (running) {
+                            getSystemService(NotificationManager::class.java)
+                                ?.notify(NOTI_ID, buildNotification())
+                        }
+                    }
+                }
+                conn.disconnect()
+            } catch (e: Exception) {
+                // 封面只是锦上添花，失败了通知仍然可用
+            }
+        }
+    }
+
+    // ============================================================
+    //  通知
+    // ============================================================
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -154,6 +283,8 @@ class MediaPlaybackService : Service() {
         ).apply {
             description = getString(R.string.noti_channel_desc)
             setShowBadge(false)
+            // 媒体通知必须让它显示在锁屏上（Android 10+ 由系统媒体区接管）
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
         }
         mgr.createNotificationChannel(ch)
     }
@@ -167,22 +298,51 @@ class MediaPlaybackService : Service() {
         )
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.noti_title))
-            .setContentText(getString(R.string.noti_text))
+            .setContentTitle(state.title.ifBlank { getString(R.string.noti_title) })
+            .setContentText(state.subtitle.ifBlank { getString(R.string.noti_text) })
             .setSmallIcon(R.drawable.ic_stat_play)
             .setContentIntent(pi)
             .setOngoing(true)
             .setSilent(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            // 上一首 / 播放暂停 / 下一首。
-            // 系统媒体面板（MediaSession）也会出现这三个，两者并存不冲突：
-            // 面板在锁屏与下拉通知里，这里的按钮则保证"通知卡片被展开/被折叠"
-            // 的机型上也有入口。
-            .addAction(0, getString(R.string.noti_prev), action(ACTION_PREV))
-            .addAction(0, getString(R.string.noti_toggle), action(ACTION_TOGGLE))
-            .addAction(0, getString(R.string.noti_next), action(ACTION_NEXT))
+            .setOnlyAlertOnce(true)
 
-        // O 以下用大图样式占位；O+ 由系统媒体面板接管
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            builder.setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+        }
+        poster?.let { builder.setLargeIcon(it) }
+
+        // 进度条：只在有总时长时给（直播/未知时长给了会是 0/0）
+        if (state.duration > 0) {
+            builder.setProgress(
+                state.duration.toInt(),
+                state.position.coerceIn(0, state.duration).toInt(),
+                false
+            )
+        }
+
+        val actions = mutableListOf<NotificationCompat.Action>()
+        var compact = mutableListOf<Int>()
+        if (state.hasPrev) {
+            compact.add(actions.size)
+            actions.add(NotificationCompat.Action(0, getString(R.string.noti_prev), action(ACTION_PREV)))
+        }
+        compact.add(actions.size)
+        actions.add(NotificationCompat.Action(0, getString(R.string.noti_toggle), action(ACTION_TOGGLE)))
+        if (state.hasNext) {
+            compact.add(actions.size)
+            actions.add(NotificationCompat.Action(0, getString(R.string.noti_next), action(ACTION_NEXT)))
+        }
+        actions.forEach { builder.addAction(it) }
+
+        // ⚠️ 这一行才是"常驻控制中心"的关键：
+        // 没有 MediaStyle + setMediaSession，系统不会把这 App 当成正在播放的媒体。
+        val style = MediaNotificationCompat.MediaStyle()
+            .setShowActionsInCompactView(*compact.take(3).toIntArray())
+        session?.sessionToken?.let { style.setMediaSession(it) }
+        builder.setStyle(style)
+
         return builder.build()
     }
 
@@ -197,28 +357,6 @@ class MediaPlaybackService : Service() {
         )
     }
 
-    /**
-     * 拿两道锁。
-     *
-     * ⚠️ **前台服务只解决"进程优先级"，不解决"CPU 睡下去"**，所以两件事都要做：
-     *
-     *   · `PARTIAL_WAKE_LOCK`：屏幕熄灭后 CPU 会进入 suspend。没有它，
-     *     音频会在播到一半断掉，而且 `ended` 事件不再触发 —— 定时器停在半路，
-     *     于是"播完一集不切下一集"，而用户点开 App 时看到的是页面超时报的错。
-     *
-     *   · WiFi 锁：WLAN 在息屏几分钟后会进省电模式。没有它，取流会卡住/超时，
-     *     而**同一条 URL 在亮屏时完全正常** —— 这是最容易被误判成
-     *     "网盘限速"或"服务端有问题"的那一类现象。
-     *     模式要按版本挑：`WIFI_MODE_FULL_HIGH_PERF` 在 Android 10+ 已被 OEM
-     *     普遍无视（就是它被 deprecated 的原因），拿它等于锁了个寂寞；
-     *     API 29+ 用 `WIFI_MODE_FULL_LOW_LATENCY`（专为实时音视频设计，
-     *     且要求调用方持有 mediaPlayback 前台服务 —— 我们正好有）。
-     *
-     * ⚠️ `acquire()` 不带超时会被 lint 报 `WakelockTimeout`。这里**故意**不给超时：
-     * 服务的生命周期就是"播放期间"，由播放事件精确启停；而唤醒锁是**随进程
-     * 一起释放**的，不存在"忘记释放导致一直耗电"的路径。给固定超时反而会在
-     * 长音频播到一半时丢锁。
-     */
     @android.annotation.SuppressLint("WakelockTimeout")
     private fun acquireLocks() {
         if (wakeLock?.isHeld != true) {
@@ -260,12 +398,10 @@ class MediaPlaybackService : Service() {
         try {
             wakeLock?.let { if (it.isHeld) it.release() }
         } catch (_: RuntimeException) {
-            // 重复释放会抛异常，忽略
         }
         try {
             wifiLock?.let { if (it.isHeld) it.release() }
         } catch (_: RuntimeException) {
-            // 同上
         }
         wakeLock = null
         wifiLock = null
@@ -273,7 +409,52 @@ class MediaPlaybackService : Service() {
 
     override fun onDestroy() {
         running = false
+        instance = null
         releaseLocks()
+        session?.release()
+        session = null
+        io.shutdownNow()
         super.onDestroy()
+    }
+}
+
+/**
+ * 页面推来的一次播放状态。
+ *
+ * 解析一律容错：参数来自 WebView 里的 JS，可能被改成任何东西。
+ * 解析失败就返回 null（当作"没收到"），绝不让桥抛异常 ——
+ * 桥一抛，页面的后续脚本就断了。
+ */
+data class MediaState(
+    val active: Boolean = false,
+    val playing: Boolean = false,
+    val title: String = "",
+    val subtitle: String = "",
+    val poster: String = "",
+    val duration: Long = 0,
+    val position: Long = 0,
+    val hasPrev: Boolean = false,
+    val hasNext: Boolean = false,
+) {
+    companion object {
+        fun parse(json: String?): MediaState? {
+            if (json.isNullOrBlank()) return null
+            return try {
+                val o = JSONObject(json)
+                MediaState(
+                    active = o.optBoolean("active", false),
+                    playing = o.optBoolean("playing", false),
+                    title = o.optString("title", "").take(120),
+                    subtitle = o.optString("subtitle", "").take(120),
+                    poster = o.optString("poster", "").take(2048),
+                    duration = o.optLong("duration", 0).coerceIn(0, 24 * 3600),
+                    position = o.optLong("position", 0).coerceIn(0, 24 * 3600),
+                    hasPrev = o.optBoolean("hasPrev", false),
+                    hasNext = o.optBoolean("hasNext", false),
+                )
+            } catch (e: Exception) {
+                null
+            }
+        }
     }
 }

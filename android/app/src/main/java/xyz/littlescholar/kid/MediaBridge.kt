@@ -44,4 +44,15 @@ object MediaBridge {
     fun next() = call("window.__kidMedia && window.__kidMedia.next && window.__kidMedia.next()")
 
     fun toggle() = call("window.__kidMedia && window.__kidMedia.toggle && window.__kidMedia.toggle()")
+
+    /**
+     * 系统媒体面板拖动进度条。
+     *
+     * 秒数由系统给（PlaybackStateCompat 的 position），这里只做范围钳制后
+     * 交给页面 —— 页面自己知道时长与当前播放器，别在原生侧再算一遍。
+     */
+    fun seekTo(sec: Long) {
+        if (sec < 0) return
+        call("window.__kidMedia && window.__kidMedia.seekTo && window.__kidMedia.seekTo(${sec})")
+    }
 }

@@ -66,7 +66,7 @@ const items = ref([])
 const used = ref(0)
 const loading = ref(true)
 
-const TE = { video: '🎬', audio: '🎧', pdf: '📖', image: '🖼️' }
+const TE = { video: '🎬', audio: '🎧', pdf: '📖', image: '🖼️', ebook: '📖' }
 function typeEmoji(t) {
   return TE[t] || '📄'
 }

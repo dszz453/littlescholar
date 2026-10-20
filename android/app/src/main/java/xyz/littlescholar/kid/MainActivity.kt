@@ -701,6 +701,24 @@ class MainActivity : AppCompatActivity() {
         fun setPlaying(on: Boolean) {
             runOnUiThread { setPlaybackActive(on) }
         }
+
+        /**
+         * 页面推来的播放详情（标题、封面、时长、进度、有没有上一集/下一集）。
+         *
+         * 只往系统媒体面板里送，**不读任何本机信息、不发网络请求** ——
+         * 这个桥挂在任何被加载的页面上，能做的事越少越安全。
+         *
+         * 解析失败静默（见 [MediaState.parse]）：桥里抛异常会把页面后续
+         * 脚本一起带断，而这只是"面板上少显示一行字"的程度。
+         */
+        @JavascriptInterface
+        fun mediaState(json: String?) {
+            try {
+                MediaPlaybackService.pushState(json ?: "")
+            } catch (e: Exception) {
+                Diagnostics.add("媒体", "状态推送失败：${e.message}")
+            }
+        }
     }
 
     /**

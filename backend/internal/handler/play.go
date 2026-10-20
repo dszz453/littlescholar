@@ -361,7 +361,23 @@ func (h *PlayHandler) Info(c *gin.Context) {
 		// 电子书用哪个渲染器：epub / txt / cbz / pdf（转换过的统一是 epub）。
 		// 前端据此决定用 epub.js、纯文本、图片序列还是 pdf.js。
 		"ebookFormat": ebookFormat,
+		// 字幕地址（服务端签好票据）。
+		//
+		// 为什么不让前端自己拼 `/api/subtitle/<id>?t=`：PRO 会把 url 换成
+		// 自己的加速流（`/edge/stream/...`），前端手里就没有小书童的票据了，
+		// 字幕请求必然 401。由服务端签好带过来，两条链路都能直接用。
+		// 非音视频返回空串，前端据此不显示字幕按钮。
+		"subtitleUrl": subtitleURLFor(h.secret, res.ID, mediaType),
 	})
+}
+
+// subtitleURLFor 签发字幕地址。只有音视频才有字幕。
+func subtitleURLFor(secret string, id uint64, mediaType string) string {
+	if mediaType != model.MediaTypeVideo && mediaType != model.MediaTypeAudio {
+		return ""
+	}
+	exp := time.Now().Add(StreamTicketTTL).Unix()
+	return fmt.Sprintf("/api/subtitle/%d?t=%s", id, SignStreamTicket(secret, id, exp))
 }
 
 // fallbackDirect 回退到网盘直链；取不到直链则退到网盘页面。

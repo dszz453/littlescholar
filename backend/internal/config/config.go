@@ -17,8 +17,19 @@ type Config struct {
 	External ExternalConfig `mapstructure:"external"`
 	Storage  StorageConfig  `mapstructure:"storage"`
 	Transcode TranscodeConfig `mapstructure:"transcode"`
+	Subtitle  SubtitleConfig  `mapstructure:"subtitle"`
 	Alive    AliveConfig    `mapstructure:"alive"`
 	Log      LogConfig      `mapstructure:"log"`
+}
+
+// SubtitleConfig 字幕相关。
+//
+// 不配 Key 时联网匹配整条链**静默跳过**（不是禁用字幕功能）：
+// 本地同名字幕、容器内嵌轨两条路照常工作，覆盖绝大多数自带字幕的资源。
+type SubtitleConfig struct {
+	// OpenSubtitlesKey 填了才启用"网上自动匹配"。
+	// 免费申请：https://www.opensubtitles.com → API consumers
+	OpenSubtitlesKey string `mapstructure:"opensubtitles_key"`
 }
 
 type ServerConfig struct {
@@ -141,6 +152,9 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("jwt.access_expire_hours", 2)
 	v.SetDefault("jwt.refresh_expire_hours", 168)
 	v.SetDefault("jwt.issuer", "littlescholar")
+
+	// 字幕：默认不联网（没 key 时自动跳过，不影响本地/内嵌两条路）
+	v.SetDefault("subtitle.opensubtitles_key", "")
 
 	v.SetDefault("security.cookie_encrypt_key", "0123456789abcdef0123456789abcdef")
 

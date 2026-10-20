@@ -97,6 +97,11 @@ func Setup(deps *Deps) *gin.Engine {
 	imageFmtDir := filepath.Join(filepath.Dir(deps.Cfg.Storage.TranscodeDir), "imagefmt")
 	imageFmtH := handler.NewImageFormatHandler(deps.DB, deps.Encryptor, nil,
 		deps.Cfg.Transcode.FFmpegPath, imageFmtDir, deps.Cfg.JWT.Secret)
+	// 字幕产物同样放在 data 下未被 r.Static 暴露的目录
+	subtitleDir := filepath.Join(filepath.Dir(deps.Cfg.Storage.TranscodeDir), "subtitle")
+	subtitleH := handler.NewSubtitleHandler(deps.DB, deps.Perm, deps.Encryptor, nil,
+		deps.Cfg.Transcode.FFmpegPath, subtitleDir, deps.Cfg.JWT.Secret,
+		deps.Cfg.Subtitle.OpenSubtitlesKey)
 	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret).
 		WithEbook(ebookH).
 		WithAudioFormat(audioFmtH).
@@ -150,6 +155,9 @@ func Setup(deps *Deps) *gin.Engine {
 	api.GET("/audio/:id", audioFmtH.Serve)
 	// 图片格式转换（heic/tiff → jpeg）
 	api.GET("/image/:id", imageFmtH.Serve)
+	// 字幕（WebVTT）。本地同名字幕 → 容器内嵌轨 → 联网匹配；
+	// 没有字幕时回 204，前端不显示任何东西（不弹错误）。
+	api.GET("/subtitle/:id", subtitleH.Serve)
 
 	// 静态资源（媒体文件）
 	r.Static("/media", deps.Cfg.Storage.MediaDir)
