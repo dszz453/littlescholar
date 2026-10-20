@@ -144,11 +144,20 @@ func TestAlignCuesUsesSpeechSpans(t *testing.T) {
 	if len(cues) != 3 {
 		t.Fatalf("条数 = %d", len(cues))
 	}
-	want := []Span{{0, 2}, {3, 5}, {6, 8}}
+	// 起点必须落在有声区间里；结尾接到下一句起点（连续字幕），最后一条到片尾
+	wantStart := []float64{0, 3, 6}
 	for i, c := range cues {
-		if !near(c.Start, want[i].Start) || !near(c.End, want[i].End) {
-			t.Fatalf("第 %d 条 = [%.2f, %.2f]，想要 [%.2f, %.2f]",
-				i, c.Start, c.End, want[i].Start, want[i].End)
+		if !near(c.Start, wantStart[i]) {
+			t.Fatalf("第 %d 条起点 = %.2f，想要 %.2f", i, c.Start, wantStart[i])
+		}
+	}
+	if !near(cues[2].End, 10) {
+		t.Fatalf("最后一条应持续到片尾，实际结束于 %.2f", cues[2].End)
+	}
+	for i := 1; i < len(cues); i++ {
+		if cues[i].Start-cues[i-1].End > 0.2 {
+			t.Fatalf("第 %d 条与上一条之间有 %.2f 秒空白（字幕会「消失」）",
+				i, cues[i].Start-cues[i-1].End)
 		}
 	}
 	// 顺带钉住"不许落进停顿"：[2,3) 与 [5,6) 是静音
@@ -168,8 +177,9 @@ func TestAlignCuesFallbackEven(t *testing.T) {
 	if len(cues) != 3 {
 		t.Fatalf("条数 = %d", len(cues))
 	}
-	if !near(cues[0].Start, 0) || !near(cues[0].End, 3) {
-		t.Fatalf("第一条 = [%.2f, %.2f]", cues[0].Start, cues[0].End)
+	// 结尾会在下一条起点前让出 0.04 秒（aiCueGapSeconds）
+	if !near(cues[0].Start, 0) || cues[0].End < 2.9 || cues[0].End > 3.0 {
+		t.Fatalf("第一条 = [%.2f, %.2f]（应到 3 秒前让位给下一条）", cues[0].Start, cues[0].End)
 	}
 	if !near(cues[2].End, 9) {
 		t.Fatalf("最后一条结束于 %.2f，想要 9", cues[2].End)

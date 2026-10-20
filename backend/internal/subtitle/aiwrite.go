@@ -230,24 +230,6 @@ const (
 	aiCueGapSeconds = 0.04
 )
 
-// mapSpeechEnd 把「有声时间轴上的一点」换算成真实时间，**用于结尾**。
-//
-// 与 locateSpan（起点）的边界语义相反：t 恰好等于某段长度时，结尾就该收在
-// 这一段的末尾，而不是跳到下一段开头。
-func mapSpeechEnd(spans []Span, t float64) float64 {
-	if t <= 0 || len(spans) == 0 {
-		return spans[0].Start
-	}
-	for _, s := range spans {
-		d := s.End - s.Start
-		if t <= d {
-			return s.Start + t
-		}
-		t -= d
-	}
-	return spans[len(spans)-1].End
-}
-
 // PrepareLines 清洗 + 拆长句 + 截断。
 //
 // 拆句不是"为了好看"：模型偶尔会整段返回（尤其是儿歌、韵文），
@@ -446,29 +428,33 @@ func AlignCues(lines []AILine, duration float64, speech []Span) []Cue {
 		wsum += w
 	}
 
-	cues := make([]Cue, 0, len(lines))
+	// ① 先定每条字幕的**起点**：把"按字数分好的份额"映射到有声时间轴上。
+	//    起点永远落在有人说话的地方 —— 这是"字幕跟得上朗读"的关键。
+	starts := make([]float64, len(lines))
 	var acc float64
-	for i, l := range lines {
+	for i := range lines {
 		startT := spanTotal * acc / wsum
-		endT := spanTotal * (acc + weights[i]) / wsum
 		acc += weights[i]
-
-		// 起点落在哪一段有声区间里（边界归下一段）。
-		//
-		// ⚠️ 结尾**不能**截在"这一段有声区间"的末尾。踩过的坑：绘本音频
-		// 底噪低、语速慢，silencedetect 会切出上百个 0.5 秒左右的碎片；
-		// 模型只给 20 句时，每句的时间份额横跨好几个碎片，一截断就只剩
-		// 0.6 秒（aiMinCueSeconds 兜底）—— 22 条字幕只覆盖 30 秒，
-		// 剩下 4 分钟整段空白。用户的原话就是"字幕在客户端上看不到"。
-		//
-		// 正确做法：结尾按**有声时间轴**累加换算成真实时间（允许跨过停顿），
-		// 一条字幕自然持续到它该结束的位置。
 		idx, offset := locateSpan(spans, startT)
-		start := spans[idx].Start + offset
-		end := mapSpeechEnd(spans, endT)
+		starts[i] = spans[idx].Start + offset
+	}
+
+	// ② 结尾**接到下一句的起点**（连续字幕），而不是给结尾设一个边界。
+	//
+	// 两次线上故障都出在"给结尾设边界"上：
+	//   · 截在"起点所在那段有声区间"末尾 → 绘本被切成上百个 0.5 秒碎片，
+	//     22 条字幕只覆盖 30 秒，剩下 4 分钟整段空白（用户："客户端上根本看不到字幕"）；
+	//   · 只按份额换算真实时间 → 语音稀疏时句与句之间出现十几秒空白，同样像没有字幕。
+	// 连续起来最稳：下一句该出现时，上一句自然让位。只在极端情况封顶
+	// （句子远少于内容、中间大段音乐），避免一条字幕霸屏半分钟以上。
+	cues := make([]Cue, 0, len(lines))
+	for i, l := range lines {
+		start := starts[i]
+		end := total
+		if i+1 < len(starts) {
+			end = starts[i+1] - aiCueGapSeconds
+		}
 		if maxEnd := start + aiMaxCueSeconds; end > maxEnd {
-			// 极长的分享（模型给的句子远少于实际内容，或中间是大段音乐）：
-			// 让字幕停留十几秒就够了，再久反而挡画面。
 			end = maxEnd
 		}
 		if end <= start+aiMinCueSeconds {
@@ -477,8 +463,8 @@ func AlignCues(lines []AILine, duration float64, speech []Span) []Cue {
 		if end > total {
 			end = total
 		}
-		if start > total {
-			start = total
+		if start >= total {
+			break
 		}
 		cues = append(cues, Cue{Start: start, End: end, Text: l.Text, Trans: l.Trans})
 	}
