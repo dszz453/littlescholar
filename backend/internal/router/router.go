@@ -49,6 +49,10 @@ type Deps struct {
 	// 一进去就起一个"每 6 小时列一遍网盘目录"的 goroutine，
 	// 单测会莫名其妙地变慢、还会打真实接口。
 	SubtitleCollector *handler.SubtitleCollector
+	// AISubtitle 大模型批量生成字幕（队列 + 夜间计划）。
+	// 同样由 Setup 构造、main 决定何时 Start —— 心跳里会调模型，
+	// 单测里不该被自动拉起来。
+	AISubtitle *handler.AISubtitleService
 	Plan              *handler.PlanHandler
 	// Digest 同上：每日知识沉淀的定时任务也挂在 main 的优雅退出链上。
 	Digest *handler.DigestHandler
@@ -134,6 +138,13 @@ func Setup(deps *Deps) *gin.Engine {
 	// 没配就是关闭状态）。复用 handler 那套 key，别读两遍配置。
 	subtitleCollector.SetOnline(subtitle.NewOnline(deps.Cfg.Subtitle.OpenSubtitlesKey))
 	deps.SubtitleCollector = subtitleCollector
+	// AI 批量写字幕：模型只给文本，时间轴由音频的停顿位置算（见 aiwrite.go）。
+	// 产物落 data/subtitle/ai（与播放缓存同目录但不在同一层），
+	// 同时写 resource_subtitles（origin='ai'）——播放链路只认后者。
+	aiSubtitleH := handler.NewAISubtitleService(deps.DB, subtitleStore, aiH,
+		deps.Cfg.Transcode.FFmpegPath,
+		filepath.Join(subtitleDir, "ai"), subtitleDir)
+	deps.AISubtitle = aiSubtitleH
 	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret).
 		WithEbook(ebookH).
 		WithAudioFormat(audioFmtH).
@@ -272,6 +283,23 @@ func Setup(deps *Deps) *gin.Engine {
 		admin.PUT("/ai/configs/:id", aiH.UpdateConfig)
 		admin.DELETE("/ai/configs/:id", aiH.DeleteConfig)
 		admin.POST("/ai/configs/:id/test", aiH.TestConfig)
+
+		// AI 批量写字幕：选文件 → 排队 → 夜间时段自动消费。
+		//
+		// 和上面的 /subtitle/* 是两条独立的链路：
+		//   /subtitle/*          = 找"现成"的字幕（同目录/内嵌/字幕站），扫全库；
+		//   /ai/subtitles/*      = 让模型按标题复原原文 + 中文对照，只处理勾选的。
+		admin.GET("/ai/subtitles/plan", aiSubtitleH.AdminPlan)
+		admin.PUT("/ai/subtitles/plan", aiSubtitleH.AdminSavePlan)
+		admin.GET("/ai/subtitles/candidates", aiSubtitleH.AdminCandidates)
+		admin.GET("/ai/subtitles/tasks", aiSubtitleH.AdminTasks)
+		admin.POST("/ai/subtitles/tasks", aiSubtitleH.AdminEnqueue)
+		admin.POST("/ai/subtitles/tasks/clear", aiSubtitleH.AdminClearTasks)
+		admin.POST("/ai/subtitles/tasks/:id/retry", aiSubtitleH.AdminRetry)
+		admin.DELETE("/ai/subtitles/tasks/:id", aiSubtitleH.AdminDeleteTask)
+		admin.POST("/ai/subtitles/run", aiSubtitleH.AdminRun)
+		admin.POST("/ai/subtitles/preview", aiSubtitleH.AdminPreview)
+		admin.GET("/ai/subtitles/file/:id", aiSubtitleH.AdminFile)
 
 		// 知识沉淀（小书童每天把目录读成人话）
 		admin.GET("/digests", digestH.List)

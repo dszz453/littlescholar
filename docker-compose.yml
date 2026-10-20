@@ -54,6 +54,10 @@ services:
     volumes:
       - ./data/media:/app/data/media
       - ./data/transcode:/app/data/transcode
+      # 字幕：播放缓存 + AI 批量生成的 .vtt/.txt（data/subtitle/ai）。
+      # 不挂出来换容器就没了 —— 数据库里那份还在（播放照常），
+      # 但「存到文件夹」就成了只活一个容器生命周期。
+      - ./data/subtitle:/app/data/subtitle
       - ./backend/config.yaml:/app/config.yaml:ro
       # 本地硬盘接入源：把宿主机上放影片/资料的目录挂进容器。
       # 挂载后到「资源接入 → 本地硬盘」里填**容器内**路径（如 /media/local）。

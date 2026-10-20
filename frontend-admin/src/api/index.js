@@ -224,6 +224,25 @@ export const aiApi = {
   testConfig: (id) => http.post(`/admin/ai/configs/${id}/test`),
 }
 
+// AI 批量写字幕：选文件 → 排队 → 夜间时段自动生成。
+//
+// 和 subtitleApi（找现成字幕）不是一回事：这条是让模型按标题+目录复原原文
+// 和中英对照，时间轴由后端用音频停顿位置算。
+export const aiSubtitleApi = {
+  plan: () => http.get('/admin/ai/subtitles/plan'),
+  savePlan: (data) => http.put('/admin/ai/subtitles/plan', data),
+  candidates: (params) => http.get('/admin/ai/subtitles/candidates', { params }),
+  enqueue: (resourceIds) => http.post('/admin/ai/subtitles/tasks', { resourceIds }),
+  tasks: (params) => http.get('/admin/ai/subtitles/tasks', { params }),
+  retry: (id) => http.post(`/admin/ai/subtitles/tasks/${id}/retry`),
+  remove: (id) => http.delete(`/admin/ai/subtitles/tasks/${id}`),
+  clear: (status) => http.post('/admin/ai/subtitles/tasks/clear', { status }),
+  run: () => http.post('/admin/ai/subtitles/run'),
+  // 预览会真的调一次模型（可能几十秒），单独放宽超时
+  preview: (resourceId) =>
+    http.post('/admin/ai/subtitles/preview', { resourceId }, { timeout: 260000 }),
+}
+
 // 知识沉淀：小书童每天把目录读成人话
 export const digestApi = {
   list: () => http.get('/admin/digests'),

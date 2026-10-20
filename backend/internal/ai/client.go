@@ -89,6 +89,14 @@ type chatResponse struct {
 	} `json:"error"`
 }
 
+// Model 返回当前使用的模型名（写进产物/任务记录，方便回看是谁生成的）。
+func (c *Client) Model() string {
+	if c == nil {
+		return ""
+	}
+	return c.model
+}
+
 // Chat 发起对话
 func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	reqBody := chatRequest{
