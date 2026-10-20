@@ -341,3 +341,66 @@ func near(a, b float64) bool {
 	}
 	return d < 0.01
 }
+
+// 有声片段被切得很碎时，字幕不能"每条只闪 0.6 秒、其余时间全空"。
+//
+// 这是一次真实故障的回归：线上绘本（Fly Guy，4:23）切出上百个 0.5 秒碎片，
+// 模型只给 22 句，旧实现把每条截在"它起点所在的那个碎片"末尾 ——
+// 22 条字幕总共只覆盖 30 秒，家长看到的就是"客户端上根本没有字幕"。
+func TestAlignCuesCoversTimelineWithFragmentedSpeech(t *testing.T) {
+	const duration = 100.0
+	var speech []Span
+	// 100 个 0.5 秒碎片，间隔 0.5 秒 → 有声占比 50%（刚好过可信门槛）
+	for i := 0; i < 100; i++ {
+		s := float64(i)
+		speech = append(speech, Span{Start: s, End: s + 0.5})
+	}
+	// 21 句：均分的话起点会落在 4.76、9.52… 这些**静音缝**里，
+	// 于是"起点必须在有声区间内"这条断言就能区分"按停顿对齐"和"退回均分"。
+	lines := make([]AILine, 21)
+	for i := range lines {
+		lines[i] = AILine{Text: "The quick brown fox jumps."}
+	}
+	cues := AlignCues(lines, duration, speech)
+	if len(cues) != len(lines) {
+		t.Fatalf("条数 = %d，想要 %d", len(cues), len(lines))
+	}
+	covered := coveredSeconds(cues)
+	if covered < duration*0.8 {
+		t.Fatalf("字幕只覆盖了 %.1f/%.0f 秒（%.0f%%）—— 又会表现成「看不到字幕」",
+			covered, duration, covered/duration*100)
+	}
+	for i, c := range cues {
+		// 每条都要持续够久，不能"闪一下就没"
+		if c.End-c.Start < 1.5 {
+			t.Fatalf("第 %d 条只有 %.2f 秒：%+v", i, c.End-c.Start, c)
+		}
+		// 起点仍在有声区间里（说明没有偷偷退回均分）
+		if !insideAny(speech, c.Start) {
+			t.Fatalf("第 %d 条起点 %.2f 落在静音里：%+v", i, c.Start, c)
+		}
+	}
+}
+
+// 容差 0.08 秒：normalizeCues 会把与上一条重叠的起点往后推 0.04 秒，
+// 起点因此可能刚好越过碎片末尾；这一点点不算"落在静音里"。
+func insideAny(spans []Span, t float64) bool {
+	for _, s := range spans {
+		if t >= s.Start-0.08 && t <= s.End+0.08 {
+			return true
+		}
+	}
+	return false
+}
+
+// 句子远少于内容时，一条字幕不能停在画面上几十秒。
+func TestAlignCuesCapsLongCue(t *testing.T) {
+	lines := []AILine{{Text: "Only one line."}}
+	cues := AlignCues(lines, 300, nil)
+	if len(cues) != 1 {
+		t.Fatalf("条数 = %d", len(cues))
+	}
+	if d := cues[0].End - cues[0].Start; d > aiMaxCueSeconds+0.01 {
+		t.Fatalf("单条持续 %.1f 秒，超过上限 %.0f", d, aiMaxCueSeconds)
+	}
+}

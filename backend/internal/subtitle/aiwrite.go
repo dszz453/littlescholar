@@ -226,8 +226,27 @@ const (
 	aiMaxLineRunes  = 80
 	aiMaxLines      = 200
 	aiMinCueSeconds = 0.6
+	aiMaxCueSeconds = 15.0
 	aiCueGapSeconds = 0.04
 )
+
+// mapSpeechEnd 把「有声时间轴上的一点」换算成真实时间，**用于结尾**。
+//
+// 与 locateSpan（起点）的边界语义相反：t 恰好等于某段长度时，结尾就该收在
+// 这一段的末尾，而不是跳到下一段开头。
+func mapSpeechEnd(spans []Span, t float64) float64 {
+	if t <= 0 || len(spans) == 0 {
+		return spans[0].Start
+	}
+	for _, s := range spans {
+		d := s.End - s.Start
+		if t <= d {
+			return s.Start + t
+		}
+		t -= d
+	}
+	return spans[len(spans)-1].End
+}
 
 // PrepareLines 清洗 + 拆长句 + 截断。
 //
@@ -434,14 +453,23 @@ func AlignCues(lines []AILine, duration float64, speech []Span) []Cue {
 		endT := spanTotal * (acc + weights[i]) / wsum
 		acc += weights[i]
 
-		// 起点落在哪一段有声区间里，本条字幕就**限制在这一段内**。
-		// 跨过停顿的两条字幕会在屏幕上"提前出现 / 拖后消失"，
-		// 比时长短一点更出戏；下一句自然从下一段开始。
+		// 起点落在哪一段有声区间里（边界归下一段）。
+		//
+		// ⚠️ 结尾**不能**截在"这一段有声区间"的末尾。踩过的坑：绘本音频
+		// 底噪低、语速慢，silencedetect 会切出上百个 0.5 秒左右的碎片；
+		// 模型只给 20 句时，每句的时间份额横跨好几个碎片，一截断就只剩
+		// 0.6 秒（aiMinCueSeconds 兜底）—— 22 条字幕只覆盖 30 秒，
+		// 剩下 4 分钟整段空白。用户的原话就是"字幕在客户端上看不到"。
+		//
+		// 正确做法：结尾按**有声时间轴**累加换算成真实时间（允许跨过停顿），
+		// 一条字幕自然持续到它该结束的位置。
 		idx, offset := locateSpan(spans, startT)
 		start := spans[idx].Start + offset
-		end := start + (endT - startT)
-		if end > spans[idx].End {
-			end = spans[idx].End
+		end := mapSpeechEnd(spans, endT)
+		if maxEnd := start + aiMaxCueSeconds; end > maxEnd {
+			// 极长的分享（模型给的句子远少于实际内容，或中间是大段音乐）：
+			// 让字幕停留十几秒就够了，再久反而挡画面。
+			end = maxEnd
 		}
 		if end <= start+aiMinCueSeconds {
 			end = start + aiMinCueSeconds
@@ -455,7 +483,25 @@ func AlignCues(lines []AILine, duration float64, speech []Span) []Cue {
 		cues = append(cues, Cue{Start: start, End: end, Text: l.Text, Trans: l.Trans})
 	}
 
-	return normalizeCues(cues, total)
+	cues = normalizeCues(cues, total)
+	// 兜底：按停顿对齐之后，如果字幕加起来覆盖不到一半时长，说明探测结果
+	// 把语音切碎了（碎片多、每段极短），按它排出来的字幕会"闪一下就没了"。
+	// 这时整段均分反而稳定 —— 时间轴糙一点，但孩子一直能看到字幕。
+	if len(spans) > 1 && total > 0 && coveredSeconds(cues) < total*0.5 {
+		return AlignCues(lines, total, nil)
+	}
+	return cues
+}
+
+// coveredSeconds 统计这一组字幕总共占了多少秒（用于"覆盖太差不该信"的兜底）。
+func coveredSeconds(cues []Cue) float64 {
+	var sum float64
+	for _, c := range cues {
+		if c.End > c.Start {
+			sum += c.End - c.Start
+		}
+	}
+	return sum
 }
 
 // normalizeCues 保证时间轴单调、不重叠、不超出总时长。
