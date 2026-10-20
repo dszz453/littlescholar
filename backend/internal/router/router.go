@@ -2,8 +2,10 @@ package router
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -114,12 +116,44 @@ func Setup(deps *Deps) *gin.Engine {
 		deps.Cfg.Transcode.FFmpegPath, subtitleDir, deps.Cfg.JWT.Secret,
 		deps.Cfg.Subtitle.OpenSubtitlesKey, subtitleStore)
 	// 语音听写（按需）：学习资料网上没有现成字幕，只能把音轨转成字幕。
-	// 复用后台「AI 配置」的 base_url + key，模型单独取（whisper-1 之类）。
-	// 取不到就静默跳过 —— 没配 AI 时字幕只是"少一种来源"，不该让服务起不来。
-	if base, key, _, err := aiH.DefaultEndpoint(); err == nil && base != "" && key != "" {
-		subtitleH.WithASR(subtitle.NewTranscriber(base, key,
-			deps.Cfg.Subtitle.ASRModel, deps.Cfg.Subtitle.ASRLanguage))
+	//
+	// 两条引擎，由 subtitle.asr_engine 选：
+	//   local 本机 whisper.cpp（镜像自带 whisper-cli + 模型，不联网、不耗额度）
+	//   http  OpenAI 兼容网关（复用后台「AI 配置」的 base_url + key）
+	// auto 优先本地。两条都不可用就静默跳过 —— 没听写只是"少一种来源"，
+	// 不该让服务起不来。
+	asrTr := subtitle.NewTranscriber("", "", deps.Cfg.Subtitle.ASRModel,
+		deps.Cfg.Subtitle.ASRLanguage)
+	switch engine := strings.ToLower(strings.TrimSpace(deps.Cfg.Subtitle.ASREngine)); engine {
+	case "off", "none", "false":
+		// 明确关掉：什么都不挂
+	case "local":
+		asrTr.Local = subtitle.NewLocalWhisper(deps.Cfg.Subtitle.WhisperBin,
+			deps.Cfg.Subtitle.WhisperModel, deps.Cfg.Subtitle.ASRLanguage,
+			deps.Cfg.Subtitle.WhisperThreads)
+	case "http":
+		if base, key, _, err := aiH.DefaultEndpoint(); err == nil && base != "" && key != "" {
+			asrTr.Base, asrTr.Key = base, key
+		}
+	default: // auto
+		asrTr.Local = subtitle.NewLocalWhisper(deps.Cfg.Subtitle.WhisperBin,
+			deps.Cfg.Subtitle.WhisperModel, deps.Cfg.Subtitle.ASRLanguage,
+			deps.Cfg.Subtitle.WhisperThreads)
+		if base, key, _, err := aiH.DefaultEndpoint(); err == nil && base != "" && key != "" {
+			asrTr.Base, asrTr.Key = base, key
+		}
 	}
+	// 配置了 local 但文件不在（镜像没带上、模型没挂）就摘掉，
+	// 否则每次播放都会起一个注定失败的转写，还顺手写 24 小时冷却。
+	if asrTr.Local != nil && !asrTr.Local.Enabled() {
+		log.Printf("字幕：本地 whisper 不可用（bin=%s model=%s），需要时退回网关",
+			deps.Cfg.Subtitle.WhisperBin, deps.Cfg.Subtitle.WhisperModel)
+		asrTr.Local = nil
+	}
+	if asrTr.Enabled() {
+		subtitleH.WithASR(asrTr)
+	}
+	log.Printf("字幕：听写引擎 = %s", asrTr.Engine())
 	// 后台采集：AI 参与"标题解析"和"候选打分"，命中后存进上面那个 store。
 	//
 	// chat 用惰性函数传入：AI 配置存在数据库里、可能被管理员随时改，
@@ -140,6 +174,9 @@ func Setup(deps *Deps) *gin.Engine {
 	// 同目录找不到字幕时去字幕站搜一份（需要 SUBTITLE_OPENSUBTITLES_KEY，
 	// 没配就是关闭状态）。复用 handler 那套 key，别读两遍配置。
 	subtitleCollector.SetOnline(subtitle.NewOnline(deps.Cfg.Subtitle.OpenSubtitlesKey))
+	// 管理页要能回答"这台机器现在用哪个引擎听写"，
+	// 否则"以为切本地了、其实还在打网关"只能靠翻启动日志。
+	subtitleCollector.SetASR(asrTr)
 	deps.SubtitleCollector = subtitleCollector
 	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret).
 		WithEbook(ebookH).

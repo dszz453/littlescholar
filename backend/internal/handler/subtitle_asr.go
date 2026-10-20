@@ -44,6 +44,12 @@ const (
 	// asrTimeout 单条资源的总超时。一小时音频在网关侧通常几分钟出结果，
 	// 留 30 分钟兜住"排长队"的情况。
 	asrTimeout = 30 * time.Minute
+	// asrTimeoutLocal 本地 whisper 的总超时。
+	//
+	// 比云端宽松：CPU 推理的耗时和音频长度成正比（4 核 NAS 上 small 模型
+	// 大约 2~4 倍实时），一小时的课文要跑十几分钟；
+	// 而云端是"上传完等它排队"，30 分钟兜不住的场景在本地反而常见。
+	asrTimeoutLocal = 60 * time.Minute
 )
 
 // subtitlePendingHeader 转写进行中时回给前端的提示头。
@@ -133,7 +139,7 @@ func (h *SubtitleHandler) runASR(res model.Resource) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), asrTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), h.asrTimeout())
 	defer cancel()
 
 	start := time.Now()
@@ -145,15 +151,23 @@ func (h *SubtitleHandler) runASR(res model.Resource) {
 
 	dir := h.asrDir()
 	base := fmt.Sprintf("%d-%d", res.ID, time.Now().Unix())
-	mp3 := filepath.Join(dir, base+".mp3")
+	// 容器格式跟引擎走：
+	//   本地 whisper.cpp 不开 ffmpeg 支持时**只认 16kHz 单声道 PCM WAV**，
+	//   喂 mp3 的报错是 "failed to read audio file" —— 看起来像文件坏了；
+	//   云端网关则要小体积，mp3 32kbps 更省上传时间。
+	ext := ".mp3"
+	if h.asr.LocalEnabled() {
+		ext = ".wav"
+	}
+	audio := filepath.Join(dir, base+ext)
 
-	if err := h.extractAudio(ctx, link, mp3); err != nil {
+	if err := h.extractAudio(ctx, link, audio); err != nil {
 		h.markASRFailed(res.ID, "抽音轨失败："+err.Error())
 		return
 	}
-	defer os.Remove(mp3)
+	defer os.Remove(audio)
 
-	parts, offsets, err := h.splitIfNeeded(mp3, dir, base)
+	parts, offsets, err := h.splitIfNeeded(audio, dir, base)
 	if err != nil {
 		h.markASRFailed(res.ID, "切片失败："+err.Error())
 		return
@@ -251,10 +265,8 @@ func (h *SubtitleHandler) extractAudio(ctx context.Context, link *adapter.Direct
 		}
 		args = append(args, "-headers", b.String())
 	}
-	args = append(args,
-		"-i", src,
-		"-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
-		"-f", "mp3", dst)
+	args = append(args, "-i", src)
+	args = append(args, audioEncodeArgs(dst)...)
 
 	cmd := exec.CommandContext(ctx, h.ffmpeg, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -270,22 +282,50 @@ func (h *SubtitleHandler) extractAudio(ctx context.Context, link *adapter.Direct
 	return nil
 }
 
+// audioEncodeArgs 按目标扩展名给出编码参数。
+//
+// 为什么按扩展名分而不是加一个 bool 参数：调用链上已经有"目标文件"了，
+// 再加一个 flag 就有两处必须保持一致 —— 而这类"参数说 wav、文件名是 mp3"
+// 的错配，ffmpeg 会照着参数写，whisper 再照着后缀判容器，最后报
+// "failed to read audio file"，从报错完全看不出是这里错了。
+func audioEncodeArgs(dst string) []string {
+	if strings.EqualFold(filepath.Ext(dst), ".wav") {
+		// whisper.cpp 内部要求 16kHz 单声道 16bit PCM，采样率不对会直接报错
+		return []string{"-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", dst}
+	}
+	return []string{"-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", "-f", "mp3", dst}
+}
+
+// asrTimeout 本轮听写的总超时，跟引擎走。
+func (h *SubtitleHandler) asrTimeout() time.Duration {
+	if h.asr != nil && h.asr.LocalEnabled() {
+		return asrTimeoutLocal
+	}
+	return asrTimeout
+}
+
 // splitIfNeeded 体积超限时按固定时长切片，返回各片路径与各自的起始秒数。
 //
 // 用"整 600 秒"切片而不是按静音切：ffmpeg 的 segment 对音频是精确切，
 // 每片起点正好是 i×600，拼回去的偏移量就是确定的 —— 不需要再读时长。
-func (h *SubtitleHandler) splitIfNeeded(mp3, dir, base string) ([]string, []float64, error) {
-	st, err := os.Stat(mp3)
+//
+// 本地引擎**不切**：25MB 是云端网关的上传上限，本机没有这个约束，
+// 而切片在本地是纯损失 —— 每片都要重新加载一次模型、边界处还会丢字。
+func (h *SubtitleHandler) splitIfNeeded(audio, dir, base string) ([]string, []float64, error) {
+	if h.asr != nil && h.asr.LocalEnabled() {
+		return []string{audio}, []float64{0}, nil
+	}
+	st, err := os.Stat(audio)
 	if err != nil {
 		return nil, nil, err
 	}
 	if st.Size() <= asrMaxBytes {
-		return []string{mp3}, []float64{0}, nil
+		return []string{audio}, []float64{0}, nil
 	}
 
 	pattern := filepath.Join(dir, base+"-%03d.mp3")
 	cmd := exec.Command(h.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-		"-i", mp3,
+		"-i", audio,
 		"-f", "segment", "-segment_time", fmt.Sprintf("%d", asrChunkSec),
 		"-c", "copy", pattern)
 	if out, err := cmd.CombinedOutput(); err != nil {

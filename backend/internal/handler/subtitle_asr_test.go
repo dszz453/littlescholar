@@ -3,6 +3,7 @@ package handler
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -168,3 +169,80 @@ func TestSplitIfNeededSmallFile(t *testing.T) {
 }
 
 var _ = sync.Mutex{}
+
+// 抽音轨的编码参数必须跟目标文件后缀一致。
+//
+// 这是本地 whisper 那条路上最容易错、又最难看出的一处：
+// 参数说 mp3 而文件名叫 .wav（或反过来），ffmpeg 照着参数写、
+// whisper 照着后缀判容器，最后报 "failed to read audio file" ——
+// 看起来像源文件坏了，实际是这里配错。
+func TestAudioEncodeArgsFollowsExtension(t *testing.T) {
+	wav := strings.Join(audioEncodeArgs("/tmp/a.wav"), " ")
+	for _, want := range []string{"pcm_s16le", "-ar 16000", "-ac 1", "-f wav"} {
+		if !strings.Contains(wav, want) {
+			t.Fatalf("wav 参数里缺 %q：%s", want, wav)
+		}
+	}
+	if strings.Contains(wav, "mp3") {
+		t.Fatalf("wav 参数里出现了 mp3：%s", wav)
+	}
+
+	mp3 := strings.Join(audioEncodeArgs("/tmp/a.mp3"), " ")
+	for _, want := range []string{"32k", "-ar 16000", "-f mp3"} {
+		if !strings.Contains(mp3, want) {
+			t.Fatalf("mp3 参数里缺 %q：%s", want, mp3)
+		}
+	}
+	if strings.Contains(mp3, "pcm_s16le") {
+		t.Fatalf("mp3 参数里出现了 pcm：%s", mp3)
+	}
+}
+
+// newLocalASRHandler 造一个"本地 whisper 可用"的 handler（假 bin / 假模型，
+// 只满足 Enabled 的存在性检查；不会真的执行转写）。
+func newLocalASRHandler(t *testing.T) *SubtitleHandler {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "whisper-cli")
+	model := filepath.Join(dir, "model.bin")
+	for _, p := range []string{bin, model} {
+		if err := os.WriteFile(p, []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &SubtitleHandler{outDir: dir}
+	h.WithASR(&subtitle.Transcriber{
+		Local: subtitle.NewLocalWhisper(bin, model, "en", 3),
+	})
+	return h
+}
+
+// 本地引擎不切片：25MB 是云端网关的上传上限，本机没有这个约束，
+// 而切片在本地是纯损失（每片重开一次模型 + 边界丢字）。
+// 这条用 30MB 文件钉住 —— 去掉短路就会去跑 ffmpeg（这里 ffmpeg 路径是空的，必然报错）。
+func TestSplitSkippedForLocalEngine(t *testing.T) {
+	h := newLocalASRHandler(t)
+	p := filepath.Join(h.outDir, "big.wav")
+	if err := os.WriteFile(p, make([]byte, 30<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parts, offsets, err := h.splitIfNeeded(p, h.outDir, "big")
+	if err != nil {
+		t.Fatalf("本地引擎不该切片（不该跑 ffmpeg）：%v", err)
+	}
+	if len(parts) != 1 || parts[0] != p || offsets[0] != 0 {
+		t.Fatalf("本地引擎被切了：%#v %v", parts, offsets)
+	}
+}
+
+// 超时跟着引擎走：本地 CPU 推理是一小时音频跑十几分钟，30 分钟兜不住。
+func TestASRTimeoutFollowsEngine(t *testing.T) {
+	local := newLocalASRHandler(t)
+	if got := local.asrTimeout(); got != asrTimeoutLocal {
+		t.Fatalf("本地引擎超时 = %v，想要 %v", got, asrTimeoutLocal)
+	}
+	cloud := newASRHandler(t)
+	if got := cloud.asrTimeout(); got != asrTimeout {
+		t.Fatalf("云端引擎超时 = %v，想要 %v", got, asrTimeout)
+	}
+}

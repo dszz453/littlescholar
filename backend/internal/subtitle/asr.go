@@ -35,6 +35,14 @@ type Transcriber struct {
 	Language string
 	Client   *http.Client
 
+	// Local 非空且可用时**优先走本机 whisper.cpp**，不联网、不耗额度。
+	//
+	// 为什么要留两条引擎而不是二选一：中转网关里未必有转写模型
+	// （本项目的真实情况就是四个 whisper 模型名全灭），
+	// 而本地 whisper 要吃 CPU。两条都留着，谁可用走谁，
+	// 而且本地挂了还能退回云端 —— 反过来不行。
+	Local *LocalWhisper
+
 	// mu 保护的只有"当前确认可用的模型名"。
 	mu        sync.Mutex
 	knownGood string
@@ -53,7 +61,37 @@ var asrModelCandidates = []string{"whisper-1", "gpt-4o-transcribe", "whisper-lar
 
 // Enabled 是否可用。
 func (t *Transcriber) Enabled() bool {
-	return t != nil && strings.TrimSpace(t.Base) != "" && strings.TrimSpace(t.Key) != ""
+	if t == nil {
+		return false
+	}
+	if t.LocalEnabled() {
+		return true
+	}
+	return strings.TrimSpace(t.Base) != "" && strings.TrimSpace(t.Key) != ""
+}
+
+// LocalEnabled 是否走本机 whisper.cpp。
+//
+// 判定要连带看文件在不在（LocalWhisper.Enabled 会 stat），
+// 不能只看配置填了没有 —— 模型没挂上时若判"可用"，
+// 每次播放都会起一个注定失败的转写并写 24 小时冷却标记。
+func (t *Transcriber) LocalEnabled() bool {
+	return t != nil && t.Local != nil && t.Local.Enabled()
+}
+
+// Engine 当前会用的引擎：local / http / off。
+//
+// 这个值要能一眼回答"线上到底在用什么听写"：
+// 只配了网关时是 http，模型挂上后自动变 local，
+// 而"以为切到本地了、其实还在打网关"这类误判排查起来极费时间。
+func (t *Transcriber) Engine() string {
+	switch {
+	case t.LocalEnabled():
+		return "local"
+	case t != nil && strings.TrimSpace(t.Base) != "" && strings.TrimSpace(t.Key) != "":
+		return "http"
+	}
+	return "off"
 }
 
 func (t *Transcriber) base() string {
@@ -81,6 +119,9 @@ func (t *Transcriber) client() *http.Client {
 // filename 只用于 multipart 里的文件名（网关按扩展名判断容器格式，
 // 传错会让它报"不支持的格式"），必须带真实扩展名。
 func (t *Transcriber) TranscribeFile(ctx context.Context, path string) (string, error) {
+	if t.LocalEnabled() {
+		return t.Local.TranscribeFile(ctx, path)
+	}
 	if !t.Enabled() {
 		return "", fmt.Errorf("语音转写未启用")
 	}

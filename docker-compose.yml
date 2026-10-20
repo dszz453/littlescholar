@@ -49,6 +49,14 @@ services:
       ALIVE_DEAD_THRESHOLD: ${ALIVE_DEAD_THRESHOLD:-2}
       ALIVE_STALE_HOURS: ${ALIVE_STALE_HOURS:-72}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # 字幕听写引擎：auto（默认，优先本机 whisper）/ local / http / off。
+      # 镜像里自带 whisper-cli 与 ggml 模型（见 backend/Dockerfile），
+      # 所以默认就是本机转写 —— 不联网、不耗额度。
+      SUBTITLE_ASR_ENGINE: ${SUBTITLE_ASR_ENGINE:-auto}
+      SUBTITLE_WHISPER_BIN: /usr/local/bin/whisper-cli
+      SUBTITLE_WHISPER_MODEL: /app/models/model.bin
+      # 4 核 NAS 留一个核给正在播放的视频，否则孩子那边会卡
+      SUBTITLE_WHISPER_THREADS: ${SUBTITLE_WHISPER_THREADS:-3}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
     volumes:

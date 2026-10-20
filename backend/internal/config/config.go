@@ -9,17 +9,17 @@ import (
 
 // Config 全局配置
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	Database DatabaseConfig `mapstructure:"database"`
-	Redis    RedisConfig    `mapstructure:"redis"`
-	JWT      JWTConfig      `mapstructure:"jwt"`
-	Security SecurityConfig `mapstructure:"security"`
-	External ExternalConfig `mapstructure:"external"`
-	Storage  StorageConfig  `mapstructure:"storage"`
+	Server    ServerConfig    `mapstructure:"server"`
+	Database  DatabaseConfig  `mapstructure:"database"`
+	Redis     RedisConfig     `mapstructure:"redis"`
+	JWT       JWTConfig       `mapstructure:"jwt"`
+	Security  SecurityConfig  `mapstructure:"security"`
+	External  ExternalConfig  `mapstructure:"external"`
+	Storage   StorageConfig   `mapstructure:"storage"`
 	Transcode TranscodeConfig `mapstructure:"transcode"`
 	Subtitle  SubtitleConfig  `mapstructure:"subtitle"`
-	Alive    AliveConfig    `mapstructure:"alive"`
-	Log      LogConfig      `mapstructure:"log"`
+	Alive     AliveConfig     `mapstructure:"alive"`
+	Log       LogConfig       `mapstructure:"log"`
 }
 
 // SubtitleConfig 字幕相关。
@@ -38,6 +38,22 @@ type SubtitleConfig struct {
 	// ASRLanguage 听写语言。这套库是英语学习资料，传 en 比让模型自己猜稳。
 	// 留空则自动判断（中文资料也能用）。
 	ASRLanguage string `mapstructure:"asr_language"`
+
+	// ASREngine 用哪个引擎听写：auto / local / http / off。
+	//
+	//	auto  （默认）本地 whisper 可用就本地，否则退回网关；
+	//	local 只用本机 whisper.cpp（网关里没有转写模型时用这个）；
+	//	http  只用 OpenAI 兼容的 /audio/transcriptions；
+	//	off   关掉听写（前三道来源照常工作）。
+	ASREngine string `mapstructure:"asr_engine"`
+	// WhisperBin whisper-cli 可执行文件路径（镜像里自带）。
+	WhisperBin string `mapstructure:"whisper_bin"`
+	// WhisperModel ggml 模型路径。也可以填一个目录，自动挑里面最合适的
+	// ggml-*.bin —— 换模型时不用改配置。
+	WhisperModel string `mapstructure:"whisper_model"`
+	// WhisperThreads 推理线程数。默认 3：这台 NAS 只有 4 核，
+	// 听写跑起来时孩子多半正在看视频，吃满核会表现为"播放卡顿"。
+	WhisperThreads int `mapstructure:"whisper_threads"`
 }
 
 type ServerConfig struct {
@@ -77,10 +93,10 @@ func (r RedisConfig) Addr() string {
 }
 
 type JWTConfig struct {
-	Secret          string `mapstructure:"secret"`
-	AccessExpireHrs int    `mapstructure:"access_expire_hours"`
-	RefreshExpireHrs int   `mapstructure:"refresh_expire_hours"`
-	Issuer          string `mapstructure:"issuer"`
+	Secret           string `mapstructure:"secret"`
+	AccessExpireHrs  int    `mapstructure:"access_expire_hours"`
+	RefreshExpireHrs int    `mapstructure:"refresh_expire_hours"`
+	Issuer           string `mapstructure:"issuer"`
 }
 
 type SecurityConfig struct {
@@ -142,6 +158,12 @@ func Load(path string) (*Config, error) {
 	// 学习资料网上没有现成字幕，只能自己听写：默认 whisper-1 + 英文。
 	v.SetDefault("subtitle.asr_model", "whisper-1")
 	v.SetDefault("subtitle.asr_language", "en")
+	// 听写引擎：默认 auto —— 镜像里带了 whisper-cli 和模型就用本地，
+	// 没带（或模型没挂上）就退回网关，不需要人工干预。
+	v.SetDefault("subtitle.asr_engine", "auto")
+	v.SetDefault("subtitle.whisper_bin", "/usr/local/bin/whisper-cli")
+	v.SetDefault("subtitle.whisper_model", "/app/models/model.bin")
+	v.SetDefault("subtitle.whisper_threads", 3)
 
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.mode", "release")
