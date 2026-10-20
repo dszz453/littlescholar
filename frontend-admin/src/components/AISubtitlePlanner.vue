@@ -8,6 +8,10 @@
           <div class="text-secondary small">
             {{ statText }}
           </div>
+          <div class="text-secondary small">
+            产物同时写进数据库（播放直接命中）和文件夹 <code>data/subtitle/ai/&lt;资源ID&gt;.vtt</code> +
+            <code>.txt</code>（逐行中英对照，可直接打印）。
+          </div>
         </div>
         <div class="actions">
           <el-button :icon="Refresh" :loading="loading" @click="refreshAll">刷新</el-button>
