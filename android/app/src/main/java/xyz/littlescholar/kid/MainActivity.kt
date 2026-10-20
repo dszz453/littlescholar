@@ -89,21 +89,110 @@ class MainActivity : AppCompatActivity() {
          * （孩子端两种都用：音频走 `<audio>`、视频走 `<video>`）。
          * `__lsPlayWatch` 保证只装一次（SPA 路由切换不会重装）。
          */
-        const val KEEPALIVE_JS = """
+        const val INJECT_JS = """
 (function () {
   if (window.__lsPlayWatch) { return; }
   window.__lsPlayWatch = 1;
+
   var send = function (on) {
     try { window.KidNative.setPlaying(!!on); } catch (e) { /* 纯浏览器里没有这个桥 */ }
   };
-  var on  = ['play', 'playing'];
-  var off = ['pause', 'ended', 'emptied', 'error'];
-  on.concat(off).forEach(function (name) {
+
+  // ---- 当前在播的那个元素 ----
+  // 媒体事件不冒泡，但走捕获阶段，在 document 上挂着就能覆盖页面里所有
+  // <video>/<audio>，不需要知道播放页把它们放在哪一层。
+  var media = null;
+  var lastPush = 0;
+
+  var isMedia = function (t) {
+    return !!t && (t.tagName === 'VIDEO' || t.tagName === 'AUDIO');
+  };
+
+  // 后端给的是 /api/stream/123?t=… 这种相对地址。浏览器按当前页面补全，
+  // 而原生的 MediaPlayer 收到相对路径会当成本地文件名 —— 不报错但没声音。
+  var absolute = function (u) {
+    if (!u) { return ''; }
+    if (/^(https?|blob|data|file):/i.test(u)) { return u; }
+    try { return new URL(u, location.href).href; } catch (e) { return u; }
+  };
+
+  var payload = function (el, playing) {
+    return JSON.stringify({
+      active: true,
+      playing: !!playing,
+      title: (document.title || '').slice(0, 120),
+      duration: Math.round((el && el.duration) || 0),
+      position: Math.round((el && el.currentTime) || 0),
+      url: absolute(el && (el.currentSrc || el.src)),
+      video: !!el && el.tagName === 'VIDEO',
+      paused: !playing
+    });
+  };
+
+  // 主动把状态推给壳：壳里那条"onStop 兜底接管"靠的就是这份快照。
+  // timeupdate 一秒来好几次，节流到 2 秒 —— 只为了离开那一刻的位置别太旧。
+  var push = function (el, playing) {
+    try { window.KidNative.mediaState(payload(el, playing)); } catch (e) { /* noop */ }
+  };
+
+  ['play', 'playing', 'pause', 'ended', 'emptied', 'error'].forEach(function (name) {
     document.addEventListener(name, function (e) {
-      var t = e.target;
-      if (!t || (t.tagName !== 'VIDEO' && t.tagName !== 'AUDIO')) { return; }
-      send(on.indexOf(name) >= 0);
+      if (!isMedia(e.target)) { return; }
+      var playing = (name === 'play' || name === 'playing') && !e.target.paused;
+      send(playing);
+      if (playing) { media = e.target; }
+      push(e.target, playing);
     }, true);
+  });
+
+  // 播放中定期刷新快照（timeupdate 一秒来好几次，这里节流到 2 秒 ——
+  // 只为了"离开那一刻"的位置别太旧，onStop 兜底接管要靠它）。
+  document.addEventListener('timeupdate', function (e) {
+    if (!isMedia(e.target) || e.target.paused) { return; }
+    media = e.target;
+    if (Date.now() - lastPush > 2000) {
+      lastPush = Date.now();
+      push(media, true);
+    }
+  }, true);
+
+  // ---- 全局接管钩子 ----
+  // 原生接管后要让页面**闭嘴**（否则两边一起出声），交还时再恢复。
+  // 孩子端新版自己有一套 window.__kidMedia.xxx；这里的钩子是给
+  // **旧版页面 / 任何不认识这套约定的页面**兜底的，两条都跑不冲突：
+  // 页面自己处理过的，这里再 mute/pause 一次是幂等的。
+  window.__lsHandoff = {
+    ack: function () {
+      var el = media;
+      if (!el) { return; }
+      try { el.muted = true; el.pause(); } catch (e) { /* noop */ }
+    },
+    giveBack: function (sec) {
+      var el = media;
+      if (!el) { return; }
+      try {
+        if (sec > 0 && Math.abs(sec - (el.currentTime || 0)) > 1.5) {
+          el.currentTime = sec;
+        }
+        el.muted = false;
+      } catch (e) { /* noop */ }
+      try { el.play(); } catch (e) { /* 没有用户手势时可能被拒，下一次点击会恢复 */ }
+    }
+  };
+
+  // ---- 切后台 / 回前台 ----
+  // 这是**壳自己的**交接：不依赖页面里有没有那段 JS。
+  // 线上实测过：孩子端某次部署是旧构建（页面上压根没有 takeOver 这段），
+  // 于是"标准版不能后台播放、PRO 却能" —— 因为 PRO 把前端产物嵌进了 APK。
+  // 接线放在壳里，页面新旧都能用。
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') {
+      var el = media;
+      if (!el || el.paused) { return; }
+      try { window.KidNative.takeOver(payload(el, true)); } catch (e) { /* noop */ }
+    } else {
+      try { window.KidNative.giveBack(); } catch (e) { /* noop */ }
+    }
   });
 })();
 """
@@ -454,7 +543,7 @@ class MainActivity : AppCompatActivity() {
                 swipe.isRefreshing = false
                 Diagnostics.add("页面", "加载完成 $url")
 
-                // 注入"播放保活"监听（细节见 KEEPALIVE_JS）。
+                // 注入"播放保活 + 后台交接"监听（细节见 INJECT_JS）。
                 // ⚠️ 必须**每次**加载完都注入：脚本自己不重复装（靠 __lsPlayWatch），
                 //    但页面重载后 window 是全新的，不注入就退回"没有保活"。
                 injectPlaybackWatch(view)
@@ -763,7 +852,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 把 [KEEPALIVE_JS] 塞进当前页面。
+     * 把 [INJECT_JS] 塞进当前页面。
      *
      * ⚠️ 用 `evaluateJavascript` 而不是 `loadUrl("javascript:…")`：前者不刷新页面、
      * 也不受 URL 长度与转义影响。它**不等待 Promise** —— 但这段脚本是同步的。
@@ -771,8 +860,8 @@ class MainActivity : AppCompatActivity() {
      */
     private fun injectPlaybackWatch(view: WebView) {
         try {
-            view.evaluateJavascript(KEEPALIVE_JS, null)
-            Diagnostics.add("保活", "已注入播放监听")
+            view.evaluateJavascript(INJECT_JS, null)
+            Diagnostics.add("保活", "已注入播放监听（含后台交接）")
         } catch (e: Exception) {
             Diagnostics.add("保活", "注入失败：${e.message}")
         }

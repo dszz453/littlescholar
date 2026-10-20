@@ -58,8 +58,22 @@ func NewAudioFormatHandler(db *gorm.DB, enc *util.Encryptor, acc *task.Accelerat
 }
 
 // NeedsConvert 这条音频资源是不是"浏览器放不出来、必须转"。
+//
+// 判据只看**扩展名**，不看 media_type：
+//
+//   - media_type 是后补列，存量行可能还是导入时统一写死的 "video"，
+//     而早年这条 `res.MediaType != audio` 的判断会让它们**永远**走不到转码，
+//     直接拿直链塞进 <video> —— 浏览器解不了 wma，孩子看到的就是
+//     "这个音频放不了"（2026-10-20 线上「大猫」目录下的 wma 就是这个形状）；
+//   - 扩展名才是文件格式的权威来源，且 AudioNeedsTranscodeExt 里全是
+//     音频专用格式，不存在"把视频误判成音频"的风险。
 func (h *AudioFormatHandler) NeedsConvert(res *model.Resource) bool {
-	if h == nil || res == nil || res.MediaType != model.MediaTypeAudio {
+	if h == nil || res == nil {
+		return false
+	}
+	switch res.MediaType {
+	case model.MediaTypeEbook, model.MediaTypeImage, model.MediaTypePDF:
+		// 电子书/图片有各自的转换链，别抢
 		return false
 	}
 	return service.AudioNeedsTranscodeExt(service.ResourceExt(res))
@@ -87,7 +101,9 @@ func (h *AudioFormatHandler) Serve(c *gin.Context) {
 		util.NotFound(c, "资源不存在")
 		return
 	}
-	if !h.NeedsConvert(&res) {
+	// 明确请求转换的，只要不是"确定不需要转"就放行：
+	// 扩展名未知的资源只能靠转换兜底，硬拒等于让它彻底播不了。
+	if !h.NeedsConvert(&res) && service.ResourceExt(&res) != "" {
 		util.BadRequest(c, "这个音频不需要转换")
 		return
 	}

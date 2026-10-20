@@ -69,7 +69,12 @@ object MediaBridge {
     fun toggle() = callMedia("toggle && window.__kidMedia.toggle()")
 
     /** 原生已接管：网页把自己静音并暂停，别两边一起出声。 */
-    fun takeOverAck() = callMedia("takeOverAck && window.__kidMedia.takeOverAck()")
+    fun takeOverAck() {
+        callMedia("takeOverAck && window.__kidMedia.takeOverAck()")
+        // 壳自己注入的那份交接（见 MainActivity.INJECT_JS）：页面是旧构建、
+        // 压根没有 __kidMedia 时靠它把网页静音 —— 否则原生一开播就是双声道。
+        call("window.__lsHandoff && window.__lsHandoff.ack && window.__lsHandoff.ack()")
+    }
 
     /**
      * 交还播放：把位置还给网页。
@@ -77,8 +82,11 @@ object MediaBridge {
      * `ended=true` 表示这一集播完了（原生播放器跑到结尾），
      * 网页据此走"自动下一集"；否则只是回来的普通续播。
      */
-    fun giveBack(sec: Long, ended: Boolean) =
-        callMedia("giveBack && window.__kidMedia.giveBack(${if (sec < 0) 0 else sec}, ${if (ended) "true" else "false"})")
+    fun giveBack(sec: Long, ended: Boolean) {
+        val s = if (sec < 0) 0 else sec
+        callMedia("giveBack && window.__kidMedia.giveBack($s, ${if (ended) "true" else "false"})")
+        call("window.__lsHandoff && window.__lsHandoff.giveBack && window.__lsHandoff.giveBack($s)")
+    }
 
     /**
      * 系统媒体面板拖动进度条。

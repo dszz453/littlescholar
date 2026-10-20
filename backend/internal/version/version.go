@@ -34,6 +34,9 @@ import "fmt"
 //
 // 版本历史（倒序，最近的在上）：
 //
+//	1.12.0 wma/ape 这类音频"点开放不出来"：音频转码的判据改看扩展名，
+//	       不再要求 media_type==audio（存量行还写着 video），
+//	       且 ext 为空时先 ffprobe 探一次再判类型
 //	1.11.0 听写镜像去掉 AVX 指令集：线上 NAS 是 Celeron J1900（无 AVX），
 //	       1.10.0 的 whisper-cli 一 init 就 Illegal instruction；模型改 base.en
 //	1.10.0 字幕听写改用本机 whisper.cpp（镜像内置 whisper-cli + ggml 模型）：
@@ -41,7 +44,7 @@ import "fmt"
 //	1.8.0  版本号终于变成真值：后台「系统状态」不再硬编码 1.0.0，
 //	       /api/health 也回带版本与构建信息
 //	1.0.0  项目初始版本（此前的 1.0.0 是硬编码，不代表任何一次改动）
-var Version = "1.11.0"
+var Version = "1.12.0"
 
 // Commit 构建时的 git 提交全哈希。可空 —— 本地 `go run` 就没有。
 var Commit = ""

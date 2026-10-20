@@ -190,6 +190,17 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	}
 
 	mediaType := res.MediaType
+	// 格式未知就先探一次（ffprobe 打直链），结果会写回 Ext。
+	//
+	// 为什么要在**判类型之前**探：存量网盘资源有两处信息缺失 ——
+	// Title 入库时被剥掉后缀、Ext 是后补列可能为空。这时按标题猜只能得到
+	// 空 ext，落进"猜不出按视频"的默认分支 —— 而 wma/ape 这类音频一旦被
+	// 当成视频，就不会走音频转码，直接拿直链塞进 <video>，浏览器解不了，
+	// 孩子看到的就是"这个音频放不了"。先探一次只要几百毫秒，且只付一次
+	// （探到的 ext 会持久化，之后每次点开都命中）。
+	if service.ResourceExt(&res) == "" && canProxy(&res) {
+		h.probeContainer(c.Request.Context(), &res)
+	}
 	// media_type 是后来补的列（见 MEMORY「AutoMigrate 补列不回填默认值」），
 	// 存量行可能是空；而这些资源的 Title 在入库时就被剥掉了扩展名，
 	// 按标题猜只会得到空 ext → 默认 video。真实格式还留在 Ext / FileID 里，
@@ -226,14 +237,6 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	// 被配置关掉），已按原画降级。如实告诉前端，否则用户只会看到
 	// 画质按钮点了没反应，以为是坏的。
 	var smoothUnavailable bool
-
-	// 先补容器格式，再决定播放方式。
-	//
-	// 顺序很重要：NeedsTranscode 依赖 ResourceExt，而存量网盘资源这一项是空的。
-	// 不先探一次，rmvb/mkv 会被当成"浏览器能播"直接代理出去，第一次必然失败。
-	if mediaType == model.MediaTypeVideo && service.ResourceExt(&res) == "" {
-		h.probeContainer(c.Request.Context(), &res)
-	}
 
 	// 画质选择：由孩子在播放页决定走不走转码。
 	//
