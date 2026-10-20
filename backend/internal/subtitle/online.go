@@ -27,6 +27,17 @@ const osBase = "https://api.opensubtitles.com/api/v1"
 type Online struct {
 	APIKey string
 	Client *http.Client
+	// Base 覆盖字幕站地址，只给单测用（默认 osBase）。
+	// 没有它就只能对着真实站点测，等于不测。
+	Base string
+}
+
+// base 实际请求的基址。
+func (o *Online) base() string {
+	if o != nil && o.Base != "" {
+		return strings.TrimRight(o.Base, "/")
+	}
+	return osBase
 }
 
 func NewOnline(key string) *Online {
@@ -86,7 +97,7 @@ func (o *Online) Search(ctx context.Context, title string, season, episode int) 
 }
 
 func (o *Online) search(ctx context.Context, q string, season, episode int) ([]osSubtitle, error) {
-	u, _ := url.Parse(osBase + "/subtitles")
+	u, _ := url.Parse(o.base() + "/subtitles")
 	params := u.Query()
 	params.Set("query", q)
 	params.Set("languages", "zh-cn,zh,tw,en")
@@ -162,7 +173,7 @@ func (o *Online) search(ctx context.Context, q string, season, episode int) ([]o
 
 func (o *Online) download(ctx context.Context, fileID int64) ([]byte, error) {
 	body, _ := json.Marshal(map[string]any{"file_id": fileID})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, osBase+"/download", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.base()+"/download", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}

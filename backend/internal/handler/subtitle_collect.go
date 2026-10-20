@@ -45,10 +45,17 @@ type SubtitleCollector struct {
 	// chat 惰性获取：没配 AI 时返回 nil，采集照样能跑（只用本地匹配）
 	chat func() subtitle.ChatFunc
 
+	// online 字幕站搜索。没配 key 时为关闭状态，见 collectOnline。
+	online *subtitle.Online
+
 	maxPerRound int
 	client      *http.Client
 
+	// mu 只管"同一时刻只有一轮"这件事。**不能**拿它去护 lastStat ——
+	// 一轮要跑几分钟（每条列目录 + 喘 1.2 秒），期间 LastStat 会一直阻塞，
+	// 管理页查进度就是干转圈直到超时。2026-10-20 踩过。
 	mu       sync.Mutex
+	statMu   sync.RWMutex
 	lastRun  time.Time
 	lastStat CollectStat
 }
@@ -84,11 +91,28 @@ func (c *SubtitleCollector) SetMaxPerRound(n int) {
 	}
 }
 
-// LastStat 上一轮的结果。
+// SetOnline 挂上字幕站搜索（同目录找不到时的兜底）。
+//
+// 单独一个 setter 而不是塞进构造参数：既有调用点（含一堆单测）都是
+// 四个参数，为了一个可选能力改签名会把它们全拖下水。
+func (c *SubtitleCollector) SetOnline(o *subtitle.Online) {
+	if c != nil {
+		c.online = o
+	}
+}
+
+// LastStat 上一轮的结果。**不阻塞**：轮次跑着的时候返回的是中间进度。
 func (c *SubtitleCollector) LastStat() CollectStat {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.statMu.RLock()
+	defer c.statMu.RUnlock()
 	return c.lastStat
+}
+
+// setStat 更新对外的进度快照。
+func (c *SubtitleCollector) setStat(st CollectStat) {
+	c.statMu.Lock()
+	c.lastStat = st
+	c.statMu.Unlock()
 }
 
 // Start 起后台循环。
@@ -118,31 +142,39 @@ func (c *SubtitleCollector) RunOnce(ctx context.Context) CollectStat {
 	}
 	// 同一时刻只允许一轮：手动触发和定时任务撞上会重复打网盘 API
 	if !c.mu.TryLock() {
-		return c.lastStat
+		return c.LastStat()
 	}
 	defer c.mu.Unlock()
 
 	stat := CollectStat{At: time.Now()}
+	c.setStat(stat)
+
 	rows, err := c.store.Missing(c.maxPerRound)
 	if err != nil {
 		stat.LastNote = "查待配资源失败：" + err.Error()
-		c.lastStat = stat
+		c.setStat(stat)
 		return stat
 	}
 	if len(rows) == 0 {
 		stat.LastNote = "没有待配字幕的资源"
-		c.lastStat = stat
+		c.setStat(stat)
 		return stat
 	}
+
+	total := len(rows)
+	// 先把"一共要扫几条"写出去。一轮可能跑好几分钟，只在末尾写一次的话，
+	// 期间管理页看到的永远是上一轮的旧数据 —— 分不清"在跑"和"卡死了"。
+	stat.LastNote = fmt.Sprintf("开始扫描 %d 条待配资源", total)
+	c.setStat(stat)
 
 	chat := subtitle.ChatFunc(nil)
 	if c.chat != nil {
 		chat = c.chat()
 	}
 
+	lastErr := ""
 	for i := range rows {
 		if ctx.Err() != nil {
-			stat.LastNote = "已取消"
 			break
 		}
 		res := &rows[i]
@@ -151,12 +183,22 @@ func (c *SubtitleCollector) RunOnce(ctx context.Context) CollectStat {
 		switch {
 		case err != nil:
 			stat.Failed++
-			stat.LastNote = fmt.Sprintf("资源 %d：%v", res.ID, err)
+			lastErr = fmt.Sprintf("资源 %d：%v", res.ID, err)
 		case got:
 			stat.Stored++
 		default:
 			stat.Skipped++
 		}
+		// 每条之后刷一次进度：这就是"留痕"。这个项目踩过太多次
+		// "兜底成功、坏了几天没人发现"，靠的就是这一行。
+		note := fmt.Sprintf("扫描中 %d/%d（入库 %d，跳过 %d，失败 %d）",
+			stat.Scanned, total, stat.Stored, stat.Skipped, stat.Failed)
+		if lastErr != "" {
+			note += "；最新错误 " + lastErr
+		}
+		stat.LastNote = note
+		c.setStat(stat)
+
 		// 每条之间喘一口：网盘 API 对"连续快速列举"很敏感，
 		// 而且这一刻可能正有人在看视频，别把带宽和配额抢光。
 		select {
@@ -164,17 +206,46 @@ func (c *SubtitleCollector) RunOnce(ctx context.Context) CollectStat {
 		case <-time.After(1200 * time.Millisecond):
 		}
 	}
-	if stat.LastNote == "" {
-		stat.LastNote = fmt.Sprintf("扫描 %d，入库 %d，跳过 %d", stat.Scanned, stat.Stored, stat.Skipped)
+	final := fmt.Sprintf("扫完 %d/%d 条（入库 %d，跳过 %d，失败 %d）",
+		stat.Scanned, total, stat.Stored, stat.Skipped, stat.Failed)
+	if lastErr != "" {
+		final += "；最新错误 " + lastErr
 	}
+	if ctx.Err() != nil {
+		final = "已取消，" + final
+	}
+	stat.LastNote = final
+	c.statMu.Lock()
 	c.lastRun = time.Now()
 	c.lastStat = stat
+	c.statMu.Unlock()
 	log.Printf("[subtitle] 采集一轮：%s", stat.LastNote)
 	return stat
 }
 
 // collectOne 处理一条资源。返回 (是否入库, 错误)。
+//
+// 两条路，顺序不能反：
+//  1. 同目录候选 —— 不花钱、最准，优先；
+//  2. 联网搜 —— 目录里压根没有字幕文件时的唯一出路。
+//
+// ⚠️ 别把 ② 当成补丁。2026-10-20 上线后发现线上库 1308 条资源里
+// **一个字幕文件都没有**，只做 ① 等于每条都空转，功能看起来"做了但没用"。
 func (c *SubtitleCollector) collectOne(ctx context.Context, res *model.Resource,
+	chat subtitle.ChatFunc) (bool, error) {
+
+	got, err := c.collectSibling(ctx, res, chat)
+	if err != nil {
+		return false, err
+	}
+	if got {
+		return true, nil
+	}
+	return c.collectOnline(ctx, res)
+}
+
+// collectSibling 在同目录里找同名/同集的字幕。
+func (c *SubtitleCollector) collectSibling(ctx context.Context, res *model.Resource,
 	chat subtitle.ChatFunc) (bool, error) {
 
 	a, cred, err := adapterFor(c.db, c.enc, res)
@@ -246,6 +317,61 @@ func (c *SubtitleCollector) collectOne(ctx context.Context, res *model.Resource,
 		return false, err
 	}
 	log.Printf("[subtitle] 资源 %d 已配字幕：%s（置信度 %d）", res.ID, picked.Name, conf)
+	return true, nil
+}
+
+// onlineConfidence 联网搜到的字幕给的置信度。
+//
+// 为什么是 70：Search 内部已按"标题词重合度"硬筛过一遍，命中就意味着
+// 片名对得上；但它没法判断"第几集"对不对（同一部动画的不同集字幕在
+// 字幕站上常常混在一起）。给到 70 让它能过 MinConfidence(60) 这道门，
+// 又不冒充"同目录同名"那种几乎不会错的 90+。
+const onlineConfidence = 70
+
+// collectOnline 目录里没有字幕时，去字幕站搜一份。
+//
+// 没配 key（SUBTITLE_OPENSUBTITLES_KEY）就是关闭状态，安静跳过 ——
+// 不报错、不刷日志：这是"没开这个功能"，不是"出了问题"。
+func (c *SubtitleCollector) collectOnline(ctx context.Context, res *model.Resource) (bool, error) {
+	if c.online == nil || !c.online.Enabled() {
+		return false, nil
+	}
+	// 用本地解析就够：采集是离线批处理，一批几十条，
+	// 为了片名逐条调 AI 既慢又费额度。解析不出来才是不该硬搜。
+	p := subtitle.ParseTitleLocal(res.Title)
+	if p.Name == "" {
+		return false, nil
+	}
+
+	sCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
+	defer cancel()
+	vtt, src, err := c.online.Search(sCtx, p.Name, p.Season, p.Episode)
+	if err != nil {
+		// "网上没匹配到"是绝大多数资源的正常结局，不该记成失败
+		msg := err.Error()
+		if strings.Contains(msg, "没有匹配到") || strings.Contains(msg, "关键词") {
+			return false, nil
+		}
+		return false, fmt.Errorf("联网搜字幕失败：%w", err)
+	}
+	if strings.TrimSpace(vtt) == "" {
+		return false, nil
+	}
+
+	row := &model.ResourceSubtitle{
+		ResourceID: res.ID,
+		Lang:       guessLang(src),
+		Source:     src,
+		Origin:     "online",
+		Confidence: onlineConfidence,
+		Cues:       subtitle.CountCues(vtt),
+		Size:       len(vtt),
+		VTT:        vtt,
+	}
+	if err := c.store.Save(row); err != nil {
+		return false, err
+	}
+	log.Printf("[subtitle] 资源 %d 联网配上字幕：%s（%s）", res.ID, src, res.Title)
 	return true, nil
 }
 

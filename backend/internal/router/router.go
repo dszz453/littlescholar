@@ -42,14 +42,14 @@ type Deps struct {
 	// 为什么不在这里 new：周奖状的定时生成是在 main 里挂到优雅退出链上的
 	// （`defer stopAward()`），main 必须拿得到同一个 PlanHandler 实例。
 	// 留空时下面会兜底自建，保证单独调用 Setup 的场景（测试）仍可用。
-	AI   *handler.AIHandler
+	AI *handler.AIHandler
 	// SubtitleCollector 由 Setup 内部构造后写回，供 main 决定何时启动。
 	//
 	// 为什么不直接在 Setup 里 `go Start(...)`：Setup 也会被测试调用，
 	// 一进去就起一个"每 6 小时列一遍网盘目录"的 goroutine，
 	// 单测会莫名其妙地变慢、还会打真实接口。
 	SubtitleCollector *handler.SubtitleCollector
-	Plan *handler.PlanHandler
+	Plan              *handler.PlanHandler
 	// Digest 同上：每日知识沉淀的定时任务也挂在 main 的优雅退出链上。
 	Digest *handler.DigestHandler
 	// Organize AI 整理助手（纯请求-响应，没有后台任务，由 router 自行构造即可）
@@ -130,6 +130,9 @@ func Setup(deps *Deps) *gin.Engine {
 				})
 			}
 		})
+	// 同目录找不到字幕时去字幕站搜一份（需要 SUBTITLE_OPENSUBTITLES_KEY，
+	// 没配就是关闭状态）。复用 handler 那套 key，别读两遍配置。
+	subtitleCollector.SetOnline(subtitle.NewOnline(deps.Cfg.Subtitle.OpenSubtitlesKey))
 	deps.SubtitleCollector = subtitleCollector
 	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret).
 		WithEbook(ebookH).

@@ -2,10 +2,14 @@ package handler
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/littlescholar/core/internal/adapter"
@@ -99,9 +103,9 @@ const srtBody = "1\n00:00:01,000 --> 00:00:03,000\n小猪佩奇你好\n\n2\n00:0
 // 主链路：同目录有同名字幕 → 转成 VTT → 写进永久存储。
 func TestCollectorStoresSiblingSubtitle(t *testing.T) {
 	f := newCollectFixture(t, map[string]string{
-		"第01集.mp4":  "not-a-real-video",
-		"第01集.srt":  srtBody,
-		"第02集.srt":  srtBody, // 别的集，不该被认领
+		"第01集.mp4": "not-a-real-video",
+		"第01集.srt": srtBody,
+		"第02集.srt": srtBody, // 别的集，不该被认领
 	})
 	r := f.addResource(t, "第01集", "mp4", "/第01集.mp4", "/")
 
@@ -185,7 +189,7 @@ func TestCollectorStoresHighConfidenceFromAI(t *testing.T) {
 func TestCollectorSkipsWhenNoSubtitle(t *testing.T) {
 	f := newCollectFixture(t, map[string]string{
 		"第01集.mp4": "not-a-real-video",
-		"说明.txt":    "hello",
+		"说明.txt":   "hello",
 	})
 	r := f.addResource(t, "第01集", "mp4", "/第01集.mp4", "/")
 
@@ -197,4 +201,120 @@ func TestCollectorSkipsWhenNoSubtitle(t *testing.T) {
 	if row, _ := f.store.Get(r.ID); row != nil {
 		t.Fatal("没有字幕却写了一条记录")
 	}
+}
+
+// 目录里没有字幕文件 → 去字幕站搜一份并入库。
+//
+// 这是线上最普遍的处境：1308 条待配资源里**一个 .srt 都没有**。
+// 没有这条兜底，"后台自动配字幕"就是一个永远入库 0 条的摆设。
+func TestCollectorFallsBackToOnline(t *testing.T) {
+	f := newCollectFixture(t, map[string]string{
+		"第01集.mp4": "not-a-real-video",
+	})
+	r := f.addResource(t, "小猪佩奇 第01集", "mp4", "/第01集.mp4", "/")
+
+	srv := newFakeSubServer(t, "1\n00:00:01,000 --> 00:00:03,000\n小猪佩奇你好\n")
+
+	c := NewSubtitleCollector(f.db, f.enc, f.store, nil)
+	online := subtitle.NewOnline("fake-key")
+	online.Base = srv
+	c.SetOnline(online)
+
+	stat := c.RunOnce(context.Background())
+	if stat.Stored != 1 {
+		t.Fatalf("应当从网上配到一条，实际 %+v", stat)
+	}
+	row, err := f.store.Get(r.ID)
+	if err != nil || row == nil {
+		t.Fatalf("没有入库：%v", err)
+	}
+	if row.Origin != "online" {
+		t.Fatalf("来源标错了：%q", row.Origin)
+	}
+	if !strings.Contains(row.VTT, "小猪佩奇你好") {
+		t.Fatalf("字幕正文不对：%q", row.VTT)
+	}
+}
+
+// 没配 key 时必须安静跳过：这是"没开这个功能"，不是"出错"。
+func TestCollectorOnlineSilentWithoutKey(t *testing.T) {
+	f := newCollectFixture(t, map[string]string{
+		"第01集.mp4": "not-a-real-video",
+	})
+	f.addResource(t, "小猪佩奇 第01集", "mp4", "/第01集.mp4", "/")
+
+	c := NewSubtitleCollector(f.db, f.enc, f.store, nil)
+	c.SetOnline(subtitle.NewOnline(""))
+
+	stat := c.RunOnce(context.Background())
+	if stat.Failed != 0 || stat.Stored != 0 {
+		t.Fatalf("没配 key 却报错/入库了：%+v", stat)
+	}
+}
+
+// 一轮跑着的时候，查进度必须**立刻**返回。
+//
+// 2026-10-20 的原始实现把 lastStat 也放在 mu 下面：一轮要跑几分钟
+// （每条列一遍网盘目录 + 喘 1.2 秒），期间 GET /api/admin/subtitle/stats
+// 一直阻塞，管理页看到的是干转圈直到超时 —— 而人只会解读为"采集器挂了"。
+// 这里直接占住"轮次锁"来复现那个场景。
+func TestLastStatDoesNotBlockWhileRoundRunning(t *testing.T) {
+	c := NewSubtitleCollector(nil, nil, nil, nil)
+
+	c.mu.Lock() // 模拟一轮正在跑
+	defer c.mu.Unlock()
+
+	done := make(chan CollectStat, 1)
+	go func() { done <- c.LastStat() }()
+
+	select {
+	case st := <-done:
+		_ = st
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("一轮在跑的时候 LastStat 阻塞了 —— 管理页查进度会一直转到超时")
+	}
+}
+
+// 进度要在轮次**结束前**就能看到，不能只在末尾写一次。
+func TestCollectorExposesProgressDuringRound(t *testing.T) {
+	f := newCollectFixture(t, map[string]string{
+		"第01集.mp4": "not-a-real-video",
+	})
+	f.addResource(t, "第01集", "mp4", "/第01集.mp4", "/")
+
+	c := NewSubtitleCollector(f.db, f.enc, f.store, nil)
+	stat := c.RunOnce(context.Background())
+
+	// 扫完的提示要带"分母"，否则看不出这一轮到底走完没有
+	if !strings.Contains(stat.LastNote, "1/") {
+		t.Fatalf("结论文案里没有进度分母：%q", stat.LastNote)
+	}
+	if got := c.LastStat(); got.LastNote != stat.LastNote {
+		t.Fatalf("LastStat 与返回值不一致：%q vs %q", got.LastNote, stat.LastNote)
+	}
+}
+
+// newFakeSubServer 一个最小的字幕站：搜得到一条、下载得到 srt 正文。
+//
+// 直接返回基址，配合 subtitle.Online.Base 用。真站点要 key 要配额，
+// 不搭假的，这条兜底路径就只能靠上线手点 —— 而它恰好是线上唯一的出路。
+func newFakeSubServer(t *testing.T, srt string) string {
+	t.Helper()
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/subtitles", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":[{"attributes":{"language":"zh-cn",`+
+			`"download_count":1234,"files":[{"file_id":"1","file_name":"a.srt"}]}}]}`)
+	})
+	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"link":"`+srv.URL+`/f"}`)
+	})
+	mux.HandleFunc("/f", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, srt)
+	})
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
 }
