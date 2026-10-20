@@ -530,6 +530,9 @@ func (s *AISubtitleService) generate(ctx context.Context, res *model.Resource,
 	if err != nil {
 		return nil, err
 	}
+	// 一本绘本的原文 JSON 可能上千字，慢模型 60 秒（配置默认）经常不够。
+	// 线上就撞过 deadline exceeded —— 单条失败，重试又要再烧一次额度。
+	cli = cli.WithTimeout(180 * time.Second)
 
 	duration := float64(res.Duration)
 	// 音频地址：本地硬盘给 file://，网盘给带 headers 的直链。
