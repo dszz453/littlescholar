@@ -594,6 +594,14 @@ func (s *AISubtitleService) generate(ctx context.Context, res *model.Resource,
 		return nil, skipError{reason: "模型没有给内容：" + reason}
 	}
 
+	// 句子数量级明显不对（4 分钟的绘本只回 1~2 句）时，宁可跳过：
+	// 那种字幕只在开头闪一下，家长会以为"字幕功能坏了"，还会写进库里。
+	if subtitle.ScriptLooksIncomplete(lines, duration) {
+		return nil, skipError{reason: fmt.Sprintf(
+			"模型只给出 %d 句，与 %.0f 秒的时长明显不成比例（可能只记得开头），已跳过",
+			len(lines), duration)}
+	}
+
 	// 有音频就读一遍停顿位置；读不到就退回按字数均分（AlignCues 内部处理）。
 	var spans []subtitle.Span
 	if speechInput != "" {

@@ -414,3 +414,28 @@ func TestAlignCuesCapsLongCue(t *testing.T) {
 		t.Fatalf("单条持续 %.1f 秒，超过上限 %.0f", d, aiMaxCueSeconds)
 	}
 }
+
+// 模型只给 1~2 句时不能当"成功"：4 分钟的绘本只会开头显示 30 秒，
+// 用户看到的是"字幕功能坏了"。数量级明显不够就该跳过（跳过会写明原因）。
+func TestScriptLooksIncomplete(t *testing.T) {
+	one := []AILine{{Text: "Fly Guy is here."}}
+	if !ScriptLooksIncomplete(one, 263) {
+		t.Fatal("4 分钟只给 1 句，应判为不完整")
+	}
+	many := make([]AILine, 24)
+	for i := range many {
+		many[i] = AILine{Text: "I go buzz."}
+	}
+	if ScriptLooksIncomplete(many, 263) {
+		t.Fatal("24 句不该被误杀")
+	}
+	// 短视频不判：30 秒的儿歌给 2 句是正常的
+	if ScriptLooksIncomplete([]AILine{{Text: "a"}, {Text: "b"}}, 30) {
+		t.Fatal("短视频不该用这条门槛")
+	}
+	// 重复度高的启蒙读物：60 秒 4 句 → 每 10 秒 0.67 句 > 0.25，放过
+	four := []AILine{{Text: "a"}, {Text: "b"}, {Text: "c"}, {Text: "d"}}
+	if ScriptLooksIncomplete(four, 60) {
+		t.Fatal("60 秒 4 句是正常密度，不该跳过")
+	}
+}

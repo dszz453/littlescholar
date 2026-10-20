@@ -391,6 +391,22 @@ func softenCut(runes []rune, from, to int) int {
 	return 0
 }
 
+// ScriptLooksIncomplete 判断模型给的句子是否**明显不够**。
+//
+// 线上见过：一本 4 分钟的绘本，模型只回 1 句（"Fly Guy is here."）——
+// 它其实不记得原文，只是勉强凑了一句。这种结果比"跳过"更糟：
+// 字幕只在开头出现 30 秒，家长会以为"字幕功能坏了"。
+//
+// 判据刻意宽松（每 10 秒音频至少 1/4 句），只拦"数量级不对"的情况：
+// 重复度高的启蒙读物（一页一句反复）不会被误杀。
+func ScriptLooksIncomplete(lines []AILine, duration float64) bool {
+	if duration < 60 {
+		return false
+	}
+	expected := duration / 10
+	return float64(len(lines)) < expected*0.25
+}
+
 // AlignCues 把句子贴到时间轴上。
 //
 // speech 是 ffmpeg 探出来的「有声区间」。有就用它（跳过静音，句子落在
