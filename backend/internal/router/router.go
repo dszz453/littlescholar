@@ -1,17 +1,20 @@
 package router
 
 import (
+	"context"
 	"net/http"
 	"path/filepath"
 	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/littlescholar/core/internal/ai"
 	"github.com/littlescholar/core/internal/config"
 	"github.com/littlescholar/core/internal/handler"
 	"github.com/littlescholar/core/internal/middleware"
 	"github.com/littlescholar/core/internal/model"
 	"github.com/littlescholar/core/internal/service"
+	"github.com/littlescholar/core/internal/subtitle"
 	"github.com/littlescholar/core/internal/task"
 	"github.com/littlescholar/core/internal/util"
 	"github.com/littlescholar/core/internal/version"
@@ -40,6 +43,12 @@ type Deps struct {
 	// （`defer stopAward()`），main 必须拿得到同一个 PlanHandler 实例。
 	// 留空时下面会兜底自建，保证单独调用 Setup 的场景（测试）仍可用。
 	AI   *handler.AIHandler
+	// SubtitleCollector 由 Setup 内部构造后写回，供 main 决定何时启动。
+	//
+	// 为什么不直接在 Setup 里 `go Start(...)`：Setup 也会被测试调用，
+	// 一进去就起一个"每 6 小时列一遍网盘目录"的 goroutine，
+	// 单测会莫名其妙地变慢、还会打真实接口。
+	SubtitleCollector *handler.SubtitleCollector
 	Plan *handler.PlanHandler
 	// Digest 同上：每日知识沉淀的定时任务也挂在 main 的优雅退出链上。
 	Digest *handler.DigestHandler
@@ -99,9 +108,29 @@ func Setup(deps *Deps) *gin.Engine {
 		deps.Cfg.Transcode.FFmpegPath, imageFmtDir, deps.Cfg.JWT.Secret)
 	// 字幕产物同样放在 data 下未被 r.Static 暴露的目录
 	subtitleDir := filepath.Join(filepath.Dir(deps.Cfg.Storage.TranscodeDir), "subtitle")
+	// 字幕的**永久**存储（后台采集器写、播放时读）。
+	subtitleStore := subtitle.NewStore(deps.DB)
 	subtitleH := handler.NewSubtitleHandler(deps.DB, deps.Perm, deps.Encryptor, nil,
 		deps.Cfg.Transcode.FFmpegPath, subtitleDir, deps.Cfg.JWT.Secret,
-		deps.Cfg.Subtitle.OpenSubtitlesKey)
+		deps.Cfg.Subtitle.OpenSubtitlesKey, subtitleStore)
+	// 后台采集：AI 参与"标题解析"和"候选打分"，命中后存进上面那个 store。
+	//
+	// chat 用惰性函数传入：AI 配置存在数据库里、可能被管理员随时改，
+	// 构造时读一次会把改动锁死在启动那一刻。
+	subtitleCollector := handler.NewSubtitleCollector(deps.DB, deps.Encryptor, subtitleStore,
+		func() subtitle.ChatFunc {
+			cli, _, err := aiH.DefaultClient()
+			if err != nil || cli == nil {
+				return nil
+			}
+			return func(ctx context.Context, system, user string) (string, error) {
+				return cli.Chat(ctx, []ai.Message{
+					{Role: "system", Content: system},
+					{Role: "user", Content: user},
+				})
+			}
+		})
+	deps.SubtitleCollector = subtitleCollector
 	playH := handler.NewPlayHandler(deps.DB, deps.Perm, deps.Encryptor, deps.Transcode, deps.Cfg.JWT.Secret).
 		WithEbook(ebookH).
 		WithAudioFormat(audioFmtH).
@@ -198,6 +227,12 @@ func Setup(deps *Deps) *gin.Engine {
 
 		// 资源接入（网盘 / WebDAV / 本地硬盘统一入口）
 		admin.GET("/disk/types", diskH.Types)
+		// 字幕采集：看进度 + 手动跑一轮。
+		//
+		// 只有这两个接口，没有"列表/编辑"——字幕是按资源自动配的，
+		// 人工干预的入口在播放页的「没有字幕？」上（暂未开放）。
+		admin.GET("/subtitle/stats", subtitleCollector.AdminStats)
+		admin.POST("/subtitle/collect", subtitleCollector.AdminCollect)
 		admin.GET("/disk/accounts", diskH.List)
 		admin.POST("/disk/accounts/qr", diskH.GetQRCode)
 		admin.GET("/disk/accounts/qr/:sessionId", diskH.PollQRCode)

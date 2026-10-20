@@ -42,6 +42,8 @@ type SubtitleHandler struct {
 	outDir string
 	secret string
 	online *subtitle.Online
+	// store 永久存储（后台采集器写、播放时读）。可为 nil（测试/未接库）。
+	store *subtitle.Store
 
 	locks sync.Map // uint64 → *sync.Mutex
 	sem   chan struct{}
@@ -49,7 +51,8 @@ type SubtitleHandler struct {
 
 // NewSubtitleHandler 构造。
 func NewSubtitleHandler(db *gorm.DB, perm *service.PermissionService, enc *util.Encryptor,
-	acc *task.Accelerator, ffmpegPath, outDir, jwtSecret, osKey string) *SubtitleHandler {
+	acc *task.Accelerator, ffmpegPath, outDir, jwtSecret, osKey string,
+	store *subtitle.Store) *SubtitleHandler {
 
 	if strings.TrimSpace(outDir) == "" {
 		outDir = filepath.Join(os.TempDir(), "ls-subtitle")
@@ -68,6 +71,7 @@ func NewSubtitleHandler(db *gorm.DB, perm *service.PermissionService, enc *util.
 		outDir: outDir,
 		secret: jwtSecret,
 		online: subtitle.NewOnline(osKey),
+		store:  store,
 		sem:    make(chan struct{}, 2),
 	}
 }
@@ -109,6 +113,17 @@ func (h *SubtitleHandler) Serve(c *gin.Context) {
 		h.serveFile(c, cached, readSource(h.outDir, id))
 		return
 	}
+	// ② 永久存储（后台采集器存下的）。
+	//
+	// 顺序放在"没有字幕"的负缓存**之前**：负缓存是"上次没找到"，
+	// 而采集器可能在那之后才配上 —— 先看负缓存会让新配好的字幕最长 24 小时不生效。
+	if !refresh && h.store != nil {
+		if row, err := h.store.Get(id); err == nil && row != nil {
+			h.writeCache(cached, id, row.VTT, row.Source)
+			h.serveFile(c, cached, row.Source)
+			return
+		}
+	}
 	// 负缓存：确认没有字幕，24 小时内不再探一遍（探测要打网盘 API）。
 	if !refresh {
 		noneFile := filepath.Join(h.outDir, fmt.Sprintf("%d.none", id))
@@ -144,20 +159,62 @@ func (h *SubtitleHandler) Serve(c *gin.Context) {
 		return
 	}
 
+	h.writeCache(cached, id, vtt, source)
+
+	// ③ 顺手存进永久存储。
+	//
+	// 实时解析出来的这条也是"匹配过一次"的结果 —— 不存的话，
+	// 缓存被清掉（换容器、清目录）就得重新跑一遍网盘 + ffprobe + 联网，
+	// 下次播放又慢十几秒。存下来之后 /api/subtitle 一次主键查询就够。
+	//
+	// 置信度按来源给：同目录/内嵌是高可信，联网匹配低一些（可能配错片子）。
+	if h.store != nil {
+		conf := 80
+		if strings.HasPrefix(source, "联网") || source == "" {
+			conf = subtitle.MinConfidence
+		}
+		_ = h.store.Save(&model.ResourceSubtitle{
+			ResourceID: id,
+			Source:     source,
+			Origin:     originOf(source),
+			Confidence: conf,
+			Cues:       subtitle.CountCues(vtt),
+			Size:       len(vtt),
+			VTT:        vtt,
+		})
+	}
+
+	h.serveFile(c, cached, source)
+}
+
+// originOf 把人类可读的来源翻成机器可读的（统计/排查用）。
+func originOf(source string) string {
+	switch {
+	case strings.HasPrefix(source, "同目录"):
+		return "sibling"
+	case strings.HasPrefix(source, "内嵌"):
+		return "embedded"
+	case strings.HasPrefix(source, "联网"):
+		return "online"
+	}
+	return "auto"
+}
+
+// writeCache 把字幕落到缓存文件（顺手维护 .source / 清掉 .none）。
+//
+// 写缓存失败不该影响这次播放：字幕正文已经在内存里了，直接发出去就行，
+// 所以失败只清理临时文件、不返回错误。
+func (h *SubtitleHandler) writeCache(cached string, id uint64, vtt, source string) {
 	tmp := cached + ".part"
 	if err := os.WriteFile(tmp, []byte(vtt), 0o644); err != nil {
-		c.Status(http.StatusNoContent)
 		return
 	}
 	if err := os.Rename(tmp, cached); err != nil {
 		_ = os.Remove(tmp)
-		c.Status(http.StatusNoContent)
 		return
 	}
 	_ = os.WriteFile(filepath.Join(h.outDir, fmt.Sprintf("%d.source", id)), []byte(source), 0o644)
 	_ = os.Remove(filepath.Join(h.outDir, fmt.Sprintf("%d.none", id)))
-
-	h.serveFile(c, cached, source)
 }
 
 // build 按"本地 → 内嵌 → 联网"的顺序找字幕。

@@ -17,6 +17,15 @@ import android.webkit.WebView
  * ⚠️ 换集逻辑只有一份：桥最终调到播放页里那几个函数（`Play.vue` 的
  * `window.__kidMedia`），与页面按钮、系统媒体面板共用同一套 prevTrackId /
  * nextTrackId。别在原生侧再实现一遍"下一集是谁"。
+ *
+ * ============ 后台播放的两个新回调 ============
+ *
+ * `takeOverAck` / `giveBack` 是"把播放所有权在原生与网页之间交接"用的：
+ *   · App 切后台 → 服务用原生 MediaPlayer 接着播 → 调 [takeOverAck]，
+ *     网页收到后**把自己暂停并静音**（否则两边同时出声）；
+ *   · 回到前台 → 服务调 [giveBack]，把播放位置还回去，
+ *     网页 seek 到那个位置继续播。
+ * 见 MediaPlaybackService 顶部那段"为什么上一版后台不播"。
  */
 object MediaBridge {
 
@@ -39,11 +48,37 @@ object MediaBridge {
         }
     }
 
-    fun prev() = call("window.__kidMedia && window.__kidMedia.prev && window.__kidMedia.prev()")
+    /** 统一的入口片段：网页没注册桥就整段短路，不报错。 */
+    private fun callMedia(fn: String) = call("window.__kidMedia && window.__kidMedia.$fn")
 
-    fun next() = call("window.__kidMedia && window.__kidMedia.next && window.__kidMedia.next()")
+    fun prev() = callMedia("prev && window.__kidMedia.prev()")
 
-    fun toggle() = call("window.__kidMedia && window.__kidMedia.toggle && window.__kidMedia.toggle()")
+    fun next() = callMedia("next && window.__kidMedia.next()")
+
+    /**
+     * 播放 / 暂停分开，**不要用 toggle**。
+     *
+     * 系统发 `onPlay` 时页面可能已经在播（耳机重连、蓝牙切车机都会重复发），
+     * 用 toggle 会把正在播的暂停掉 —— 用户看到的就是"点播放反而停了"。
+     */
+    fun play() = callMedia("play && window.__kidMedia.play()")
+
+    fun pause() = callMedia("pause && window.__kidMedia.pause()")
+
+    /** 兼容旧调用点（页面里按钮仍是 toggle 语义）。 */
+    fun toggle() = callMedia("toggle && window.__kidMedia.toggle()")
+
+    /** 原生已接管：网页把自己静音并暂停，别两边一起出声。 */
+    fun takeOverAck() = callMedia("takeOverAck && window.__kidMedia.takeOverAck()")
+
+    /**
+     * 交还播放：把位置还给网页。
+     *
+     * `ended=true` 表示这一集播完了（原生播放器跑到结尾），
+     * 网页据此走"自动下一集"；否则只是回来的普通续播。
+     */
+    fun giveBack(sec: Long, ended: Boolean) =
+        callMedia("giveBack && window.__kidMedia.giveBack(${if (sec < 0) 0 else sec}, ${if (ended) "true" else "false"})")
 
     /**
      * 系统媒体面板拖动进度条。
@@ -53,6 +88,6 @@ object MediaBridge {
      */
     fun seekTo(sec: Long) {
         if (sec < 0) return
-        call("window.__kidMedia && window.__kidMedia.seekTo && window.__kidMedia.seekTo(${sec})")
+        callMedia("seekTo && window.__kidMedia.seekTo($sec)")
     }
 }

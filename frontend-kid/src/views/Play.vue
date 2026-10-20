@@ -1953,28 +1953,75 @@ function setupMediaSession() {
 let lastNativePush = 0
 
 function pushNativeMedia() {
-  // 标准版的桥叫 KidNative，PRO 的叫 EdgeNative —— 两个壳各自独立，
-  // 这里都认（纯浏览器里两个都没有，静默跳过）。
-  const bridge = window.KidNative || window.EdgeNative
-  if (!bridge || typeof bridge.mediaState !== 'function') return
+  const bridge = nativeBridge()
+  if (!bridge) return
   if (!isVideo.value && !isAudio.value) return
   try {
-    bridge.mediaState(
-      JSON.stringify({
-        active: true,
-        playing: !!isPlaying.value,
-        title: info.value.title || '',
-        subtitle: info.value.categoryName || '',
-        poster: info.value.poster || '',
-        duration: Math.round(Number(duration.value) || 0),
-        position: Math.round(Number(current.value) || 0),
-        hasPrev: !!prevTrackId(),
-        hasNext: !!nextTrackId(),
-      })
-    )
+    bridge.mediaState(JSON.stringify(nativePayload()))
   } catch {
     /* 桥挂了不能影响播放 */
   }
+}
+
+/* ---------- 原生接管（后台播放） ----------
+ *
+ * 问题：App 切到后台后，Chromium 会把 WebView 的 JS 执行挂起。
+ * 上一版把"播放"完全留在网页里，通知栏/媒体面板的每个按钮都要
+ * `evaluateJavascript` 打回网页执行 —— 网页一挂起，按钮就点不动，
+ * 正在播的东西也会停。孩子看到的就是"有图标、点不动、切后台就断"。
+ *
+ * 现在改成**所有权交接**：
+ *   切后台 → 把 url + 位置交给原生（takeOver），原生用 MediaPlayer 接着播，
+ *            然后 ack 回来让我们把自己静音并暂停（避免两边出声）；
+ *   回前台 → 原生停下，把位置还回来（giveBack），我们 seek 过去继续播。
+ *
+ * ⚠️ 交接期间 `isPlaying` 会被置成 false —— 这是**故意的**：网页确实没在播了。
+ * 壳里判断"要不要停前台服务"的逻辑要认得这个状态（见 maybeStopPlayback），
+ * 否则宽限期一到就把服务收了，后台播放跟着断。
+ */
+let handoffActive = false
+
+function nativeBridge() {
+  // 标准版的桥叫 KidNative，PRO 的叫 EdgeNative —— 两个壳各自独立，
+  // 这里都认（纯浏览器里两个都没有，静默跳过）。
+  const b = window.KidNative || window.EdgeNative
+  if (!b || typeof b.mediaState !== 'function') return null
+  return b
+}
+
+/** 推给原生/系统面板的那一份状态。 */
+function nativePayload() {
+  return {
+    active: true,
+    playing: !!isPlaying.value,
+    title: info.value.title || '',
+    subtitle: info.value.categoryName || '',
+    poster: info.value.poster || '',
+    duration: Math.round(Number(duration.value) || 0),
+    position: Math.round(Number(current.value) || 0),
+    hasPrev: !!prevTrackId(),
+    hasNext: !!nextTrackId(),
+    // 后台接管要用（原生读不到 WebView 里的状态）
+    url: info.value.url || '',
+    video: !!isVideo.value,
+  }
+}
+
+/**
+ * 能不能交给原生。
+ *
+ * `blob:` 坚决不行 —— 它只存在于 WebView 进程内，原生播放器读不到，
+ * 接管"成功"了却一点声音都没有，比不接管更糟。离线缓存播放走的就是 blob。
+ */
+function canHandoff() {
+  const bridge = nativeBridge()
+  if (!bridge || typeof bridge.takeOver !== 'function') return false
+  if (!isVideo.value && !isAudio.value) return false
+  if (offlinePlay.value) return false
+  if (!isPlaying.value) return false
+  const u = info.value.url || ''
+  if (!u) return false
+  return !/^(blob|data):/i.test(u)
 }
 
 // 播放/暂停要立刻反映到系统面板（不能等下一个 5 秒节拍）
@@ -1986,8 +2033,8 @@ watch(isPlaying, () => {
 // 离开播放页：让系统面板收起。壳里会等 20 秒宽限再停服务 ——
 // 切集时"清理→重新加载"必然会走一次 inactive，不能立刻停。
 function pushNativeInactive() {
-  const bridge = window.KidNative || window.EdgeNative
-  if (!bridge || typeof bridge.mediaState !== 'function') return
+  const bridge = nativeBridge()
+  if (!bridge) return
   try {
     bridge.mediaState(JSON.stringify({ active: false }))
   } catch {
@@ -2312,8 +2359,26 @@ function cleanupMedia() {
 function onVisibilityChange() {
   if (document.visibilityState === 'hidden') {
     flushProgress(false)
+    // 切后台：把播放交给原生接着播。
+    //
+    // ⚠️ 必须在 visibilitychange 里做，不能等原生的 onStop —— 那时 WebView
+    // 可能已经被挂起，页面没机会把地址和位置送出去。
+    if (canHandoff()) {
+      try {
+        nativeBridge().takeOver(JSON.stringify(nativePayload()))
+      } catch {
+        /* 交不出去就让网页自己撑着，不至于更糟 */
+      }
+    }
   } else {
-    // 回到前台，同步一次真实状态
+    // 回前台：先要回播放位置，再同步真实状态
+    if (handoffActive) {
+      try {
+        nativeBridge()?.giveBack?.()
+      } catch {
+        /* 同上 */
+      }
+    }
     const el = mediaEl()
     if (el) isPlaying.value = !el.paused
   }
@@ -2332,7 +2397,23 @@ onMounted(() => {
     prev: goPrevTrack,
     next: goNextTrack,
     toggle: () => togglePlay(),
+
+    // ⚠️ play / pause 必须分开且**幂等**。
+    // 系统会重复发 onPlay（耳机重连、蓝牙切车机、媒体面板回连都会），
+    // 用 toggle 顶着会把正在播的暂停掉 —— 表现就是"点播放反而停了"。
+    play: () => {
+      const el = mediaEl()
+      if (!el || !el.paused) return
+      el.play().catch(() => {})
+    },
+    pause: () => {
+      const el = mediaEl()
+      if (!el || el.paused) return
+      el.pause()
+    },
+
     isPlaying: () => isPlaying.value,
+
     // 系统媒体面板拖动进度条 → 原生 → 这里
     seekTo: (sec) => {
       const el = mediaEl()
@@ -2345,6 +2426,47 @@ onMounted(() => {
       } catch {
         /* 元数据还没加载时设 currentTime 会抛，忽略即可 */
       }
+    },
+
+    /* ---------- 后台接管的两个回调（见 canHandoff 上方那段说明） ---------- */
+
+    /** 原生已经接手在播了：把我们自己静音并暂停，否则两边一起出声。 */
+    takeOverAck: () => {
+      handoffActive = true
+      const el = mediaEl()
+      if (!el) return
+      try {
+        el.muted = true
+        el.pause()
+      } catch {
+        /* noop */
+      }
+      isPlaying.value = false
+      lastNativePush = Date.now()
+    },
+
+    /** 原生交还播放：seek 回去继续播。`ended` = 后台已经把这一集播完了。 */
+    giveBack: (sec, ended) => {
+      handoffActive = false
+      if (ended) {
+        // 后台播完由原生报回来，走同一套"自动下一集"
+        onEnded()
+        return
+      }
+      const el = mediaEl()
+      if (!el) return
+      const t = Number(sec)
+      try {
+        if (Number.isFinite(t) && t > 0 && Math.abs(t - (el.currentTime || 0)) > 1.5) {
+          el.currentTime = t
+          current.value = t
+        }
+        el.muted = false
+      } catch {
+        /* noop */
+      }
+      el.play().catch(() => {})
+      isPlaying.value = !el.paused
     },
   }
   load()

@@ -274,7 +274,7 @@ func main() {
 		digestHandler.DailyLimit = n
 	}
 
-	engine := router.Setup(&router.Deps{
+	rdeps := &router.Deps{
 		DB:        db,
 		Cfg:       cfg,
 		Logger:    logger,
@@ -291,7 +291,15 @@ func main() {
 		Plan:      planHandler,
 		Digest:    digestHandler,
 		Organize:  organizeHandler,
-	})
+	}
+	tengine := router.Setup(rdeps)
+	engine := tengine
+	// 字幕后台采集：从"资源所在目录"里找同名字幕，分不开时让 AI 选，
+	// 命中就存进 resource_subtitles（永久）。启动后延迟 3 分钟先跑第一轮，
+	// 之后每 6 小时一轮（见 SubtitleCollector.Start）。
+	if rdeps.SubtitleCollector != nil {
+		rdeps.SubtitleCollector.Start(6 * time.Hour)
+	}
 
 	// 8.1 每周 AI 奖状
 	//

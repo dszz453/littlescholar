@@ -719,6 +719,34 @@ class MainActivity : AppCompatActivity() {
                 Diagnostics.add("媒体", "状态推送失败：${e.message}")
             }
         }
+
+        /**
+         * 网页切到后台，把播放交给原生接着播。
+         *
+         * 为什么不让原生自己判断：`onStop` 比页面的 `visibilitychange` 晚，
+         * 而这段时间里 WebView 可能已经被挂起，页面就没机会把 url 送出来了。
+         * 由页面主动交，拿到的位置也最准。
+         *
+         * 服务没起来时先存着，`onCreate` 后补 —— 见 `MediaPlaybackService.consumePending`。
+         */
+        @JavascriptInterface
+        fun takeOver(json: String?) {
+            try {
+                MediaPlaybackService.takeOver(json ?: "")
+            } catch (e: Exception) {
+                Diagnostics.add("接管", "接管请求失败：${e.message}")
+            }
+        }
+
+        /** 回到前台，把播放还回网页。 */
+        @JavascriptInterface
+        fun giveBack() {
+            try {
+                MediaPlaybackService.giveBack()
+            } catch (e: Exception) {
+                Diagnostics.add("接管", "交还失败：${e.message}")
+            }
+        }
     }
 
     /**
@@ -779,6 +807,12 @@ class MainActivity : AppCompatActivity() {
         if (!playbackWanted) return
         if (!screenInteractive()) {
             // 屏幕还黑着：再续一轮，不释放任何东西
+            playbackHandler.postDelayed(stopPlayback, KEEPALIVE_GRACE_MS)
+            return
+        }
+        // 后台接管中：网页是**故意暂停**的（声音交给原生播放器了），
+        // 这时候收服务等于把正在播的东西关掉。再续一轮，等真正结束。
+        if (MediaPlaybackService.isHandingOff()) {
             playbackHandler.postDelayed(stopPlayback, KEEPALIVE_GRACE_MS)
             return
         }

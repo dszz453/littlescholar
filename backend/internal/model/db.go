@@ -110,6 +110,7 @@ func AllModels() []interface{} {
 		&StudyCheckIn{},
 		&StudyAward{},
 		&KnowledgeDigest{},
+		&ResourceSubtitle{},
 		&AIConfig{},
 		&AIReport{},
 		&AIChatSession{},

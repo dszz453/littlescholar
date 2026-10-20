@@ -7,5 +7,7 @@
     <string name="noti_text">锁屏也可以继续听</string>
     <string name="noti_prev">上一首</string>
     <string name="noti_toggle">播放/暂停</string>
+    <string name="noti_play">播放</string>
+    <string name="noti_pause">暂停</string>
     <string name="noti_next">下一首</string>
 </resources>
