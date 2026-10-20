@@ -278,3 +278,40 @@ func TestRunTaskSkipsWhenBetterSubtitleExists(t *testing.T) {
 		t.Fatalf("开了覆盖还停在 %q，说明跳过逻辑把原因搞混了", status)
 	}
 }
+
+// 人工指定的字幕任何情况下都不许被覆盖（Store.Save 的规矩）。
+//
+// 关键不在于"跳过"，而在于**必须在这条链路上跳过**：如果放它继续走，
+// 会生成、写文件、标记 done，但库里纹丝不动 —— 页面说"已完成"，
+// 播出来还是旧字幕，这是最难查的一类不一致。
+func TestRunTaskNeverOverwritesManual(t *testing.T) {
+	db, svc := newAISubFixture(t)
+	cat := makeCategory(t, db)
+	r := &model.Resource{CategoryID: cat.ID, Title: "Book", MediaType: model.MediaTypeAudio, Ext: "mp3"}
+	db.Create(r)
+	if err := svc.store.Save(&model.ResourceSubtitle{
+		ResourceID: r.ID,
+		Source:     "人工校对 · 家长上传",
+		Origin:     "manual",
+		Manual:     true,
+		VTT:        "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n",
+	}); err != nil {
+		t.Fatalf("准备字幕失败：%v", err)
+	}
+	task := &model.AISubtitleTask{ResourceID: r.ID, Title: r.Title, Status: model.AISubtitleStatusPending}
+	db.Create(task)
+
+	plan, err := svc.LoadPlan()
+	if err != nil {
+		t.Fatalf("读计划失败：%v", err)
+	}
+	// 即使打开了覆盖，人工那条也不能动
+	plan.Overwrite = true
+	note, status := svc.runTask(context.Background(), task, plan)
+	if status != model.AISubtitleStatusSkipped {
+		t.Fatalf("状态 = %q（%s），想要 skipped", status, note)
+	}
+	if !strings.Contains(note, "人工") {
+		t.Fatalf("说明里应指出是人工字幕：%q", note)
+	}
+}

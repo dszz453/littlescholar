@@ -454,10 +454,19 @@ func (s *AISubtitleService) runTask(ctx context.Context, task *model.AISubtitleT
 	}
 
 	// 已有字幕就别动：默认策略下"sibling/embedded/online"都比模型复原的可信。
-	if !plan.Overwrite && s.store != nil {
-		if old, err := s.store.Get(res.ID); err == nil && old != nil && old.Origin != "ai" {
-			return finish(model.AISubtitleStatusSkipped,
-				"已有字幕（"+orDefaultStr(old.Source, old.Origin)+"），未开启覆盖", 0, "", "")
+	//
+	// ⚠️ 人工指定的那条**任何情况下都不覆盖**（Store.Save 也是这么定的），
+	// 所以这里必须先判 Manual：不判的话会生成、写文件、标记 done，
+	// 但库里纹丝不动 —— 页面说"已完成"，播出来还是旧字幕，最难查的一类不一致。
+	if s.store != nil {
+		if old, err := s.store.Get(res.ID); err == nil && old != nil {
+			if old.Manual {
+				return finish(model.AISubtitleStatusSkipped, "人工指定的字幕，不覆盖", 0, "", "")
+			}
+			if !plan.Overwrite && old.Origin != "ai" {
+				return finish(model.AISubtitleStatusSkipped,
+					"已有字幕（"+orDefaultStr(old.Source, old.Origin)+"），未开启覆盖", 0, "", "")
+			}
 		}
 	}
 
