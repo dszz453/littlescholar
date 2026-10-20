@@ -91,18 +91,27 @@ RUN cmake .. \
 
 # 模型：默认 base.en（148MB）。
 #
-# 为什么不是更大的 small：线上这台 NAS 是 Celeron J1900（4 核 1.99GHz，
-# 无 AVX），whisper.cpp 在它上面只能跑 SSE2 路径，small 大约只有
-# 0.1~0.2 倍实时 —— 一本 3 分钟的绘本音频要等 20 分钟，跟"点开就有字幕"
-# 的预期差太远。base 快 3 倍左右，而这套库是清晰朗读的儿童读物，
-# base 的识别质量够用。
+# ⚠️ 模型必须是**量化版（-q5_1）**，这一条不是口味问题：
+# GGML_F16C 关掉以后，F16 权重每一层都要先软件转成 F32 才能参与计算，
+# 等于凭空多一倍内存搬运量。2026-10-20 线上实测同一段 3 秒音频：
+#   ggml-tiny.en.bin（F16, 74MB）      100s
+#   ggml-tiny.en-q5_1.bin（Q5_1, 30MB） 62s
+#   ggml-base.en.bin（F16, 141MB）      >100s（跑不完）
+# 量化版走整数点积（SSE 路径），比换更小的模型有效得多。
+#
+# 为什么最终落在 tiny 而不是 base/small：这台 NAS 是 Celeron J1900
+# （4 核 1.99GHz，无 AVX），一个 30 秒窗口就要 50~60 秒，约 0.5 倍实时。
+# 一本 3 分钟的绘本 = 5~7 分钟，这已经是"能接受"的边界；
+# 换 base/small 会直接掉到十几分钟以上，等于不可用。
+# 这套库是清晰朗读的儿童读物，tiny.en 的识别质量够用。
+# 以后换到强机器：把这里和 whisper_local.go 的 resolveModel 优先级一起改。
 #
 # **统一改名成 model.bin**：配置里只认这一个路径，换模型不用改 compose。
-# 下载失败就按 small 降级，三个都拿不到则让构建失败 ——
+# 下载失败就按更差的候选降级，全部拿不到则让构建失败 ——
 # 静默产出"有 cli 没模型"的镜像是最坏结果：构建日志一片绿，功能永远不可用。
 RUN set -eux; \
     mkdir -p /models; ok=0; \
-    for m in base.en small.en-q5_1 small.en; do \
+    for m in tiny.en-q5_1 tiny.en base.en-q5_1 base.en; do \
       for host in hf-mirror.com huggingface.co; do \
         if curl -fsSL --retry 2 --retry-delay 2 --max-time 1200 \
              -o /models/model.bin \
@@ -111,7 +120,7 @@ RUN set -eux; \
         fi; \
       done; \
     done; \
-    [ "$ok" = "1" ] || { echo "模型下载失败：三个候选全不可用"; exit 1; }; \
+    [ "$ok" = "1" ] || { echo "模型下载失败：四个候选全不可用"; exit 1; }; \
     ls -lh /models/model.bin
 
 # ============ 运行阶段 ============

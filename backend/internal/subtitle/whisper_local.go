@@ -27,7 +27,17 @@ import (
 //
 // 它是**单文件静态二进制**：不用 pip、不用 CUDA、不用 Python 运行时，
 // 塞进现有 alpine 镜像就能跑，跟 Go 服务端一样"拷进去就能用"。
-// 量化过的 small.en 只有一百多 MB，4 核 NAS 上跑 10 分钟音频大约 1~2 分钟。
+//
+// # 速度的真实数字（别按"应该很快"去设计）
+//
+// 2026-10-20 在目标 NAS（Intel Celeron J1900，4 核，无 AVX / 无 F16C）实测：
+// tiny.en-q5_1 处理一个 30 秒窗口约 50~60 秒，即 **0.5x 实时**；
+// 而 whisper 会把不足 30 秒的音频补齐到 30 秒算，所以"一条 3 秒的提示音"
+// 和"30 秒的句子"成本一样。换成 3 分钟的绘本音频就是 5~7 分钟。
+//
+// 这个量级决定了产品形态：**字幕只能是"提前生成、下次就有"**，
+// 不能指望孩子点开就等。所以 collector 的批跑、以及"字幕生成中"的
+// 前端提示都不是可选项 —— 它们是这套东西能不能用的前提。
 type LocalWhisper struct {
 	// Bin whisper-cli 可执行文件路径。
 	Bin string
@@ -101,21 +111,35 @@ func (w *LocalWhisper) resolveModel() (string, error) {
 	if len(matches) == 0 {
 		return "", fmt.Errorf("目录里没有 ggml-*.bin：%s", p)
 	}
+	// 顺序按"这台机器能不能在合理时间内跑完"排，不是按识别质量排。
+	//
+	// ⚠️ 2026-10-20 线上实测（Celeron J1900 / 无 AVX / 4 核）：
+	//   base.en（F16, 141MB）跑 3 秒音频 > 100s 还没结束；
+	//   tiny.en（F16, 74MB）100s；tiny.en-q5_1（30MB）62s。
+	// 差距主要来自**权重量化**：这台 CPU 没有 F16C（为兼容 AVX 一并关掉了），
+	// F16 权重每层都要先软件转成 F32 才能算，等于凭空多一倍内存搬运。
+	// 换成 q5_1（走整数点积）立刻快一倍，这比换小模型有效得多。
 	rank := func(name string) int {
 		n := strings.ToLower(filepath.Base(name))
 		switch {
-		case strings.Contains(n, "small.en-q"):
+		case strings.Contains(n, "tiny.en-q"):
 			return 0
-		case strings.Contains(n, "small.en"):
+		case strings.Contains(n, "tiny.en"):
 			return 1
 		case strings.Contains(n, "base.en-q"):
 			return 2
 		case strings.Contains(n, "base.en"):
 			return 3
-		case strings.Contains(n, "small"):
+		case strings.Contains(n, "small.en-q"):
 			return 4
-		case strings.Contains(n, "base"):
+		case strings.Contains(n, "small.en"):
 			return 5
+		case strings.Contains(n, "tiny-q"), strings.Contains(n, "tiny"):
+			return 6
+		case strings.Contains(n, "base"):
+			return 7
+		case strings.Contains(n, "small"):
+			return 8
 		}
 		return 9
 	}
@@ -170,14 +194,26 @@ func (w *LocalWhisper) TranscribeFile(ctx context.Context, path string) (string,
 
 	// 参数只用 whisper-cli 里存在了很多年的几个：
 	//   -m 模型 / -f 输入 / -l 语言 / -t 线程 / -osrt 输出 SRT / -of 输出前缀
-	// 刻意不写温度、不关打印：这两类的短参数名在各版本间改过名
-	// （-tp、-np 都属"新加的"），拼错一个就是整条链路 100% 失败，
-	// 而报错只是用法提示 —— 从日志里完全看不出是参数写错了。
-	// 温度默认就是 0（贪心解码），不写也是要的行为。
+	//
+	// 解码策略三个参数是**后加的**（Dockerfile 把 whisper.cpp 钉在 v1.7.4，
+	// 这三个在那一版的 --help 里确认过），加它们是因为线上实测差距明显：
+	//
+	//   -bs 1 -bo 1  默认是 `5 beams + best of 5` —— 每一步都要维护 5 条候选，
+	//                对清晰朗读的课文没有收益，在这台 4 核弱 CPU 上纯烧时间。
+	//                代价是遇到口音重/背景嘈杂时略差，可接受。
+	//   -nf          关掉温度回退。开头是音乐、或者整段没人声时，
+	//                默认会因为置信度低而把温度 0→0.2→…→1.0 逐个重试，
+	//                等于同一段音频解码五六遍；表现是"这段音频特别慢"。
+	//                关掉后这类音频只是识别结果差，不会卡住整条队列。
+	//
+	// 不写 -tp（温度）：默认就是 0，贪心。
 	args := []string{
 		"-m", model,
 		"-f", path,
 		"-t", strconv.Itoa(w.threads()),
+		"-bs", "1",
+		"-bo", "1",
+		"-nf",
 		"-osrt",
 		"-of", prefix,
 	}

@@ -63,11 +63,21 @@ func TestLocalWhisperEnabledNeedsRealFiles(t *testing.T) {
 	}
 }
 
-// 模型目录里同时有好几个时，必须挑英文 small 量化版。
-// 挑错的后果不是报错，而是"字幕质量莫名其妙变差"或"一集要转半小时"。
-func TestLocalWhisperResolveModelPrefersSmallEnglish(t *testing.T) {
+// 模型目录里同时有好几个时，必须挑**量化过的英文 tiny**。
+//
+// 这条优先级是照着线上实测定的，不是照着"质量越高越好"定的：
+// 目标机是 Celeron J1900（无 AVX / 无 F16C），F16 权重每层都要软件转 F32，
+// 同一段 3 秒音频 base.en(F16) >100s、tiny.en(F16) 100s、tiny.en-q5_1 62s。
+// 挑错的后果不是报错，而是"一集要转半小时" —— 没人会去查，只会觉得这功能坏了。
+func TestLocalWhisperResolveModelPrefersQuantizedTiny(t *testing.T) {
 	dir := t.TempDir()
-	for _, n := range []string{"ggml-tiny.bin", "ggml-base.en.bin", "ggml-small.bin", "ggml-small.en-q5_1.bin"} {
+	for _, n := range []string{
+		"ggml-small.en-q5_1.bin",
+		"ggml-base.en.bin",
+		"ggml-base.en-q5_1.bin",
+		"ggml-tiny.en.bin",       // F16，同尺寸但慢一倍
+		"ggml-tiny.en-q5_1.bin",  // 要的是它
+	} {
 		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -77,8 +87,8 @@ func TestLocalWhisperResolveModelPrefersSmallEnglish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(got) != "ggml-small.en-q5_1.bin" {
-		t.Fatalf("挑中 %s，想要 ggml-small.en-q5_1.bin", filepath.Base(got))
+	if filepath.Base(got) != "ggml-tiny.en-q5_1.bin" {
+		t.Fatalf("挑中 %s，想要 ggml-tiny.en-q5_1.bin", filepath.Base(got))
 	}
 	// 目录形态也要能通过 Enabled（bin 得是真的存在）
 	bin := filepath.Join(dir, "whisper-cli")
@@ -88,6 +98,23 @@ func TestLocalWhisperResolveModelPrefersSmallEnglish(t *testing.T) {
 	w.Bin = bin
 	if !w.Enabled() {
 		t.Fatal("目录里有模型却判不可用")
+	}
+}
+
+// 只有非量化版时也得能用 —— 宁可慢，不能"整个不可用"。
+func TestLocalWhisperResolveModelFallsBackToNonQuantized(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"ggml-base.en.bin", "ggml-tiny.en.bin"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := (&LocalWhisper{Model: dir}).resolveModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(got) != "ggml-tiny.en.bin" {
+		t.Fatalf("挑中 %s，想要 ggml-tiny.en.bin", filepath.Base(got))
 	}
 }
 
@@ -134,7 +161,12 @@ func TestLocalWhisperArgsAndSrtOutput(t *testing.T) {
 	}
 
 	joined := strings.Join(gotArgs, " ")
-	for _, want := range []string{"-m " + model, "-f " + audio, "-osrt", "-of ", "-t 3", "-l en"} {
+	for _, want := range []string{
+		"-m " + model, "-f " + audio, "-osrt", "-of ", "-t 3", "-l en",
+		// 解码策略：默认 5 beams 在这台弱 CPU 上纯烧时间；
+		// -nf 关掉温度回退，否则音乐/静音段会被解码五六遍。
+		"-bs 1", "-bo 1", "-nf",
+	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("参数里缺 %q：%s", want, joined)
 		}
