@@ -21,6 +21,9 @@
       >
         CC
       </button>
+      <!-- 学习资料的字幕是 AI 现听写的，第一次播放要等几十秒。
+           不提示的话，家长只会看到"点了一遍没字幕"就再也不点了。 -->
+      <span v-else-if="subtitleState === 'pending'" class="sub-pending">字幕生成中…</span>
     </header>
 
     <!-- ===== 加载 / 错误 ===== -->
@@ -70,7 +73,7 @@
           playsinline
           @timeupdate="onTimeUpdate"
           @loadedmetadata="onLoadedMetadata"
-          @play="isPlaying = true"
+          @play="onMediaPlay"
           @pause="isPlaying = false"
           @ended="onEnded"
           @error="onMediaError"
@@ -100,7 +103,7 @@
           x5-video-player-type="h5-page"
           @timeupdate="onTimeUpdate"
           @loadedmetadata="onLoadedMetadata"
-          @play="isPlaying = true"
+          @play="onMediaPlay"
           @pause="isPlaying = false"
           @ended="onEnded"
           @error="onMediaError"
@@ -508,6 +511,10 @@ const audioEl = ref(null)
 const videoEl = ref(null)
 
 const isPlaying = ref(false)
+// 用户自己按的暂停。切后台时原生要判断"该不该接着播" ——
+// 分不清"用户暂停"和"系统把网页压下去导致的暂停"，就会出现
+// "明明我按了暂停，切后台它自己又响起来"。
+const userPaused = ref(false)
 const current = ref(0)
 const duration = ref(0)
 const rate = ref(1)
@@ -1815,12 +1822,21 @@ async function reloadInfo() {
 }
 
 /* ---------- 播放控制 ---------- */
+// 真正开始播放时清掉"用户按过暂停"的标记：
+// 自动播放、切下一集、原生交还，都不该被上一次的暂停意图挡住。
+function onMediaPlay() {
+  isPlaying.value = true
+  userPaused.value = false
+}
+
 function togglePlay() {
   const el = mediaEl()
   if (!el) return
   if (el.paused) {
+    userPaused.value = false
     el.play().catch(() => {})
   } else {
+    userPaused.value = true
     el.pause()
   }
 }
@@ -2002,8 +2018,25 @@ function nativePayload() {
     hasPrev: !!prevTrackId(),
     hasNext: !!nextTrackId(),
     // 后台接管要用（原生读不到 WebView 里的状态）
-    url: info.value.url || '',
+    //
+    // ⚠️ 必须是**绝对地址**：后端给的是 `/api/stream/123?t=...` 这种相对路径，
+    // 浏览器会按当前页面补全，而原生的 MediaPlayer 收到相对路径会把它
+    // 当成一个本地文件名 —— 接管"成功"，但一点声音都没有。
+    // 现象就是"控制中心在、点播放没反应、后台也没声"。
+    url: absoluteURL(info.value.url || ''),
     video: !!isVideo.value,
+    paused: !!userPaused.value,
+  }
+}
+
+/** 相对地址补成绝对地址；blob:/data: 原样返回（它们本来就不能交给原生）。 */
+function absoluteURL(u) {
+  if (!u) return ''
+  if (/^(https?|blob|data|file):/i.test(u)) return u
+  try {
+    return new URL(u, location.href).href
+  } catch {
+    return u
   }
 }
 
@@ -2051,7 +2084,7 @@ function pushNativeInactive() {
 const SUB_KEY = 'kid_subtitle_on'
 
 const subtitleCues = ref([])
-const subtitleState = ref('idle') // idle | loading | ok | none
+const subtitleState = ref('idle') // idle | loading | ok | none | pending
 const subtitleSource = ref('')
 const subtitleOn = ref(readSubtitlePref())
 
@@ -2187,8 +2220,21 @@ function decodeSubtitleSource(v) {
   }
 }
 
+// 转写进行中时服务端会回 204 + 这个头。它和"真的没有字幕"是两回事：
+// 后者是终局，前者值得再等一会儿 —— 学习资料的字幕是 AI 现听写的。
+const SUB_POLL_DELAYS = [10000, 20000, 30000, 60000, 90000, 120000]
+
+// 每轮请求的代号。切集/重播会让旧的那一轮作废，
+// 否则上一集的轮询会在新一集上把字幕刷成旧的。
+let subGen = 0
+
 async function loadSubtitle() {
+  const gen = ++subGen
   resetSubtitle()
+  await fetchSubtitle(gen, 0)
+}
+
+async function fetchSubtitle(gen, attempt) {
   if (!isVideo.value && !isAudio.value) return
   // 离线缓存播放：没有网络也没有票据，直接跳过
   if (offlinePlay.value) return
@@ -2204,10 +2250,20 @@ async function loadSubtitle() {
     target = `/api/subtitle/${resourceId.value}?t=${encodeURIComponent(t)}`
   }
 
-  subtitleState.value = 'loading'
+  if (attempt === 0) subtitleState.value = 'loading'
   try {
     const res = await fetch(target, { cache: 'no-store' })
     if (res.status === 204 || !res.ok) {
+      // 204 = 服务端明确说"没有字幕"。
+      // 但带 X-Subtitle-Pending 的 204 是"正在听写，等会儿再来"。
+      if (res.headers.get('X-Subtitle-Pending') === '1' && attempt < SUB_POLL_DELAYS.length) {
+        if (gen !== subGen) return
+        subtitleState.value = 'pending'
+        setTimeout(() => {
+          if (gen === subGen) fetchSubtitle(gen, attempt + 1)
+        }, SUB_POLL_DELAYS[attempt])
+        return
+      }
       // 204 = 服务端明确说"没有字幕"。这是常态，不提示。
       subtitleState.value = 'none'
       return
@@ -2223,6 +2279,7 @@ async function loadSubtitle() {
       subtitleState.value = 'none'
       return
     }
+    if (gen !== subGen) return // 请求期间已经换集了
     subtitleCues.value = cues
     subtitleSource.value = decodeSubtitleSource(res.headers.get('X-Subtitle-Source'))
     subtitleState.value = 'ok'
@@ -2579,6 +2636,24 @@ watch(isPlaying, (v) => {
 }
 .more {
   font-size: 15px;
+}
+/* 字幕生成中的提示：不弹窗、不遮画面，只是让人知道"在做了" */
+.sub-pending {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--c-text-sub);
+  padding: 0 6px;
+  white-space: nowrap;
+  animation: sub-blink 1.6s ease-in-out infinite;
+}
+@keyframes sub-blink {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 .head-info {
   flex: 1;

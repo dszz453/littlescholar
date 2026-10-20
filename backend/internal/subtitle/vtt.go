@@ -324,3 +324,59 @@ func assCueTime(s string) (string, bool) {
 	return fmt.Sprintf("%02d:%02d:%02d.%s",
 		atoi(m[1]), atoi(m[2]), atoi(m[3]), ms), true
 }
+
+// vttTime 匹配 VTT 的一个时间点 `HH:MM:SS.mmm`（小时可能只有一位）。
+var vttTime = regexp.MustCompile(`(\d{1,2}):(\d{2}):(\d{2})\.(\d{3})`)
+
+// Shift 把整份 VTT 的时间轴整体后移 offsetSec 秒。
+//
+// 用途只有一个：长音频要切片送转写（网关对单文件有体积上限），
+// 每片都是"从 0 开始"的时间轴，拼起来必须把第 N 片整体推后 N×片长。
+// 不推的话，第二条字幕会从 00:00:00 重来一遍 —— 播放时表现为
+// "字幕一直在开头那几句上打转"。
+func Shift(vtt string, offsetSec float64) string {
+	if offsetSec <= 0 {
+		return vtt
+	}
+	off := int(offsetSec * 1000)
+	lines := strings.Split(vtt, "\n")
+	for i, ln := range lines {
+		if !strings.Contains(ln, "-->") {
+			continue
+		}
+		lines[i] = vttTime.ReplaceAllStringFunc(ln, func(m string) string {
+			p := vttTime.FindStringSubmatch(m)
+			if len(p) != 5 {
+				return m
+			}
+			ms := atoi(p[1])*3600000 + atoi(p[2])*60000 + atoi(p[3])*1000 + atoi(p[4]) + off
+			if ms < 0 {
+				ms = 0
+			}
+			return fmt.Sprintf("%02d:%02d:%02d.%03d",
+				ms/3600000, ms/60000%60, ms/1000%60, ms%1000)
+		})
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Merge 把多段 VTT 合成一份（丢掉第二段起的 WEBVTT 头与空行）。
+func Merge(parts []string) string {
+	var b strings.Builder
+	b.WriteString("WEBVTT\n")
+	for _, p := range parts {
+		for _, ln := range strings.Split(p, "\n") {
+			t := strings.TrimSpace(ln)
+			if t == "" || t == "WEBVTT" || strings.HasPrefix(t, "NOTE") {
+				continue
+			}
+			if isAllDigits(t) {
+				continue // 残留的序号行
+			}
+			b.WriteString(ln)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}

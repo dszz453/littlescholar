@@ -30,6 +30,14 @@ type SubtitleConfig struct {
 	// OpenSubtitlesKey 填了才启用"网上自动匹配"。
 	// 免费申请：https://www.opensubtitles.com → API consumers
 	OpenSubtitlesKey string `mapstructure:"opensubtitles_key"`
+
+	// ASRModel 语音听写模型名。走的是 OpenAI 兼容的 /audio/transcriptions，
+	// 与后台「AI 配置」共用 base_url + key，但**模型要单独指定** ——
+	// AI 配置里存的是对话模型（agnes-3.0-flash），拿去转写必然报错。
+	ASRModel string `mapstructure:"asr_model"`
+	// ASRLanguage 听写语言。这套库是英语学习资料，传 en 比让模型自己猜稳。
+	// 留空则自动判断（中文资料也能用）。
+	ASRLanguage string `mapstructure:"asr_language"`
 }
 
 type ServerConfig struct {
@@ -131,6 +139,10 @@ func Load(path string) (*Config, error) {
 	v := viper.New()
 
 	// 默认值
+	// 学习资料网上没有现成字幕，只能自己听写：默认 whisper-1 + 英文。
+	v.SetDefault("subtitle.asr_model", "whisper-1")
+	v.SetDefault("subtitle.asr_language", "en")
+
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.mode", "release")
 

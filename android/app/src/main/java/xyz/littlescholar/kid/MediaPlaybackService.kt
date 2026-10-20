@@ -157,7 +157,37 @@ class MediaPlaybackService : Service() {
          * 宽限期一到就把服务停掉，后台播放跟着断。见 MainActivity.maybeStopPlayback。
          */
         fun isHandingOff(): Boolean = instance?.handingOffNow == true
+
+        /**
+         * 壳里主动接管：不依赖网页的 `visibilitychange`。
+         *
+         * 为什么还需要这条：网页那一声 `takeOver` 是异步过桥的，
+         * 而 `visibilitychange` 在 WebView 里报不报、什么时候报，
+         * 各家 ROM/内核都不一样。一旦没报，JS 很快被冻结，
+         * 就再也没有机会调第二次了 —— 表现就是"切后台就断"。
+         *
+         * 这里用**最近一次真的在播**的快照（含绝对地址与位置）兜底，
+         * 60 秒内有效；用户自己按过暂停的不接（否则"我暂停了它自己又响"）。
+         */
+        fun takeOverFromState(): Boolean {
+            val s = instance ?: return false
+            if (s.handingOffNow) return true
+            val st = s.lastPlaying ?: return false
+            if (System.currentTimeMillis() - s.lastPlayingAt > 60_000L) return false
+            if (st.paused) return false
+            Diagnostics.add("接管", "壳里主动接管（网页没交接）：@${st.position}s")
+            s.takeOver(st)
+            return true
+        }
     }
+
+    /** 最近一次"在播"的快照，见 applyState 的注释。 */
+    @Volatile
+    private var lastPlaying: MediaState? = null
+
+    /** 上面那份快照的时间，太老就不拿来接管了。 */
+    @Volatile
+    private var lastPlayingAt: Long = 0L
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -292,6 +322,13 @@ class MediaPlaybackService : Service() {
             Diagnostics.add("接管", "blob/data 地址无法交给原生，保持网页播放")
             return
         }
+        // ⚠️ 相对路径（`/api/stream/123?t=...`）会让 MediaPlayer 当成本地文件名：
+        // setDataSource 不报错、prepare 也"成功"，但一点声音都没有。
+        // 网页侧已经补成绝对地址，这里再拦一道，并把原因写进诊断。
+        if (!st.url.startsWith("http://", true) && !st.url.startsWith("https://", true)) {
+            Diagnostics.add("接管", "地址不是绝对 URL，无法交给原生：${st.url.take(60)}")
+            return
+        }
         state = st
         handoffPreparing = true
         Diagnostics.add("接管", "后台接管播放：${st.url.take(80)} @ ${st.position}s")
@@ -396,6 +433,13 @@ class MediaPlaybackService : Service() {
 
     /** 把最新状态灌进 session（元数据 + 播放状态 + 通知）。 */
     fun applyState(st: MediaState) {
+        // 记下"最近一次真的在播"的样子：切后台时如果网页没来得及交接
+        // （visibilitychange 没触发、或 JS 已经被冻结），壳里靠它主动接管。
+        // 只记在播且地址可用的，避免被"暂停/空地址"的心跳覆盖掉。
+        if (st.playing && st.url.startsWith("http", true)) {
+            lastPlaying = st.copy(active = true, playing = true)
+            lastPlayingAt = System.currentTimeMillis()
+        }
         // ⚠️ 后台接管期间，网页是"暂停并静音"的，它推来的 playing/position
         // 会把面板刷成"已暂停"。这段时间以原生播放器为准，忽略这两项。
         state = if (handoffMode) {
@@ -652,6 +696,13 @@ data class MediaState(
     val url: String = "",
     /** 是不是视频（决定 AudioAttributes 的 content type）。 */
     val video: Boolean = false,
+    /**
+     * 是不是**用户自己按的暂停**。
+     *
+     * 切后台时系统也会让网页的 `<video>` 触发 pause，跟用户按暂停长得一模一样；
+     * 不区分的话，壳里"按最近状态主动接管"会把用户刚暂停的内容又播起来。
+     */
+    val paused: Boolean = false,
 ) {
     companion object {
         fun parse(json: String?): MediaState? {
@@ -671,6 +722,7 @@ data class MediaState(
                     // 地址长度给足：PRO 的本地加速流会带一长串票据参数
                     url = o.optString("url", "").take(4096),
                     video = o.optBoolean("video", false),
+                    paused = o.optBoolean("paused", false),
                 )
             } catch (e: Exception) {
                 null

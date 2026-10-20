@@ -669,6 +669,19 @@ class MainActivity : AppCompatActivity() {
         // 刻意留空：见上方说明，不暂停 WebView 以维持媒体播放
     }
 
+    override fun onStop() {
+        super.onStop()
+        // 切后台：这里**主动**把播放交给原生，不等网页那一回调。
+        //
+        // 网页的 `visibilitychange → takeOver` 仍是主路径（位置更准），
+        // 但它在 WebView 里报不报、什么时候报都不确定；一旦没报，
+        // JS 很快被冻结，就再也没有第二次机会 —— 表现就是"切后台就断"。
+        // 这里用最近一次在播的状态兜底，两条路只要成一条，声音就不会断。
+        if (MediaPlaybackService.takeOverFromState()) {
+            Diagnostics.add("后台", "已切到原生播放（壳里主动接管）")
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         webView.onResume()

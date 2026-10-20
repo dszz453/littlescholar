@@ -509,24 +509,34 @@ func maxInt64(a, b int64) int64 {
 	return b
 }
 
-// readLocalFile 读 `file://` 地址。
+// fileURLToPath 把 `file://` 地址换成可用的本地路径。
 //
 // 跨平台这里有两个坑，都必须处理：
 //   - **路径**：Linux 是 `file:///a/b`（去掉前缀正好是 `/a/b`），
 //     而 Windows 适配器给的是 `file://C/Users/...`（少了冒号）；
 //   - **编码**：中文文件名是百分号编码的（`%E7%AC%AC01%E9%9B%86.srt`），
 //     不 unescape 就会拿一个带 `%` 的路径去 open，必然 No such file。
-func readLocalFile(rawURL string) ([]byte, error) {
+//
+// 抽成函数是因为现在有两个调用方（读字幕文件、ffmpeg 抽音轨），
+// 各写一份必然会在某个平台上演化出不一致的行为。
+func fileURLToPath(rawURL string) string {
 	p := strings.TrimPrefix(rawURL, "file://")
 	if unescaped, err := url.PathUnescape(p); err == nil {
 		p = unescaped
 	}
 	// Windows 盘符：`C/Users/...` → `C:/Users/...`；`/C:/Users/...` → `C:/Users/...`
-	if len(p) >= 2 && p[0] == '/' && p[1] != '/' && len(p) > 2 && p[2] == ':' {
+	if len(p) > 2 && p[0] == '/' && p[1] != '/' && p[2] == ':' {
 		p = p[1:]
-	} else if len(p) >= 2 && p[1] == '/' && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) {
+	} else if len(p) >= 2 && p[1] == '/' &&
+		((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) {
 		p = string(p[0]) + ":" + p[1:]
 	}
+	return p
+}
+
+// readLocalFile 读 `file://` 地址。
+func readLocalFile(rawURL string) ([]byte, error) {
+	p := fileURLToPath(rawURL)
 
 	const maxSize = 4 << 20
 	f, err := os.Open(filepath.FromSlash(p))

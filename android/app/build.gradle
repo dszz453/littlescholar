@@ -17,8 +17,8 @@ def siteUrl = project.hasProperty('siteUrl') ? project.siteUrl : 'https://study.
 // 抽成变量是为了让产物名与包里的 versionName **只有一个来源** ——
 // 两处各写一遍，迟早在某次升版本时漏改一处，于是分发给家长的那个包
 // 名字写着 1.2.0、装上去是 1.3.0，排查问题时全乱。
-def appVersionName = '1.5.0'
-def appVersionCode = 10500 // = 10000×1 + 100×5 + 0
+def appVersionName = '1.5.1'
+def appVersionCode = 10501 // = 10000×1 + 100×5 + 1
 // 产物的显示名（不含 .apk）。标配客户端就叫「小书童」，不带后缀。
 def appArtifactBase = '小书童'
 
@@ -47,6 +47,11 @@ android {
         // ⚠️ versionCode 不递增时覆盖安装会直接失败，系统只回一句"应用未安装"。
         versionCode appVersionCode
         // 版本历史（倒序）：
+        //   1.5.1  修 1.5.0 的后台播放仍然不响：交接给原生的地址是相对路径
+        //         （/api/stream/123?t=…），MediaPlayer 当成文件名 → 接管"成功"但没声。
+        //         现在补成绝对地址；另外切后台不再只靠网页 visibilitychange，
+        //         壳里 onStop 会按"最近一次在播"的状态主动接管（60s 内有效，
+        //         用户自己按过暂停的不接）。
         //   1.5.0  后台播放真的成立：网页进后台前把 url + 位置交给原生，
         //         服务用 MediaPlayer 接着播；回前台交还并 seek 回去。
         //         通知按钮按真实状态给「播放」/「暂停」，不再一律 toggle。

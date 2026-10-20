@@ -113,6 +113,13 @@ func Setup(deps *Deps) *gin.Engine {
 	subtitleH := handler.NewSubtitleHandler(deps.DB, deps.Perm, deps.Encryptor, nil,
 		deps.Cfg.Transcode.FFmpegPath, subtitleDir, deps.Cfg.JWT.Secret,
 		deps.Cfg.Subtitle.OpenSubtitlesKey, subtitleStore)
+	// 语音听写（按需）：学习资料网上没有现成字幕，只能把音轨转成字幕。
+	// 复用后台「AI 配置」的 base_url + key，模型单独取（whisper-1 之类）。
+	// 取不到就静默跳过 —— 没配 AI 时字幕只是"少一种来源"，不该让服务起不来。
+	if base, key, _, err := aiH.DefaultEndpoint(); err == nil && base != "" && key != "" {
+		subtitleH.WithASR(subtitle.NewTranscriber(base, key,
+			deps.Cfg.Subtitle.ASRModel, deps.Cfg.Subtitle.ASRLanguage))
+	}
 	// 后台采集：AI 参与"标题解析"和"候选打分"，命中后存进上面那个 store。
 	//
 	// chat 用惰性函数传入：AI 配置存在数据库里、可能被管理员随时改，

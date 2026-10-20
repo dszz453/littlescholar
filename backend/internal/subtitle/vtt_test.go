@@ -210,3 +210,44 @@ func TestIsSubtitle(t *testing.T) {
 		}
 	}
 }
+
+// 切片拼接：第 N 片的时间轴必须整体推后 N×片长。
+//
+// 不推的话第二片会从 00:00:00 重来一遍，播放时表现为"字幕一直在开头几句上打转"。
+func TestShiftMovesTimeline(t *testing.T) {
+	src := "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\n第一句\n"
+	got := Shift(src, 600)
+	if !strings.Contains(got, "00:10:01.000 --> 00:10:03.000") {
+		t.Fatalf("时间轴没后移：%q", got)
+	}
+	if !strings.Contains(got, "第一句") {
+		t.Fatalf("正文被改坏了：%q", got)
+	}
+	// 位移 0 必须原样返回（短音频走的就是这条路）
+	if Shift(src, 0) != src {
+		t.Fatal("offset=0 却改动了内容")
+	}
+}
+
+func TestShiftHandlesHours(t *testing.T) {
+	src := "WEBVTT\n\n00:59:58.000 --> 01:00:00.000\n跨小时\n"
+	got := Shift(src, 5)
+	if !strings.Contains(got, "01:00:03.000 --> 01:00:05.000") {
+		t.Fatalf("跨小时进位算错了：%q", got)
+	}
+}
+
+func TestMergeDropsRepeatedHeader(t *testing.T) {
+	a := "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nA\n"
+	b := "WEBVTT\n\n00:10:01.000 --> 00:10:02.000\nB\n"
+	got := Merge([]string{a, b})
+	if strings.Count(got, "WEBVTT") != 1 {
+		t.Fatalf("合起来应当只有一个 WEBVTT 头：%q", got)
+	}
+	if !strings.Contains(got, "A") || !strings.Contains(got, "B") {
+		t.Fatalf("合并后丢了内容：%q", got)
+	}
+	if CountCues(got) != 2 {
+		t.Fatalf("合并后条数不对：%d", CountCues(got))
+	}
+}
