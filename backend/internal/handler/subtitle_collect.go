@@ -48,10 +48,6 @@ type SubtitleCollector struct {
 	// online 字幕站搜索。没配 key 时为关闭状态，见 collectOnline。
 	online *subtitle.Online
 
-	// asr 只用来**读**当前引擎（local/http/off），给管理页做诊断。
-	// 真正跑听写的是 SubtitleHandler，这边不碰它的锁与并发。
-	asr *subtitle.Transcriber
-
 	maxPerRound int
 	client      *http.Client
 
@@ -102,13 +98,6 @@ func (c *SubtitleCollector) SetMaxPerRound(n int) {
 func (c *SubtitleCollector) SetOnline(o *subtitle.Online) {
 	if c != nil {
 		c.online = o
-	}
-}
-
-// SetASR 记下听写引擎，供管理页展示。可为 nil（不允许听写）。
-func (c *SubtitleCollector) SetASR(t *subtitle.Transcriber) {
-	if c != nil {
-		c.asr = t
 	}
 }
 
@@ -492,10 +481,6 @@ func guessLang(name string) string {
 func (c *SubtitleCollector) AdminStats(ctx *gin.Context) {
 	st := c.store.Stats()
 	last := c.LastStat()
-	engine := "off"
-	if c.asr != nil {
-		engine = c.asr.Engine()
-	}
 	ctx.JSON(http.StatusOK, gin.H{
 		"code":    0,
 		"message": "success",
@@ -504,9 +489,6 @@ func (c *SubtitleCollector) AdminStats(ctx *gin.Context) {
 			"total":   st.Video,
 			"pending": maxInt64(st.Video-st.Stored, 0),
 			"last":    last,
-			// asr 当前听写引擎。local = 本机 whisper.cpp，
-			// http = 云端网关，off = 不可用（新资源不会有字幕）。
-			"asr": engine,
 		},
 	})
 }

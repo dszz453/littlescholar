@@ -44,13 +44,6 @@ type SubtitleHandler struct {
 	online *subtitle.Online
 	// store 永久存储（后台采集器写、播放时读）。可为 nil（测试/未接库）。
 	store *subtitle.Store
-	// asr 语音听写（按需）。没配 AI 时为 nil，见 subtitle_asr.go。
-	asr      *subtitle.Transcriber
-	asrSem   chan struct{}
-	asrLocks sync.Map // uint64 → struct{}（转写单飞）
-	// asrRunner 真正干活的实现，默认 runASR。抽出来是为了让
-	// "单飞/冷却/媒体类型"这些判断能在不装 ffmpeg 的环境里被测到。
-	asrRunner func(model.Resource)
 
 	locks sync.Map // uint64 → *sync.Mutex
 	sem   chan struct{}
@@ -161,20 +154,12 @@ func (h *SubtitleHandler) Serve(c *gin.Context) {
 		if err != nil {
 			log.Printf("字幕：资源 %d 没配上（%v）", id, err)
 		}
-		// ④ 最后一道：AI 听写。
+		// 三道来源（同目录 / 内嵌 / 联网）全空就是"没有字幕"。
 		//
-		// 学习资料（新概念课文、英文绘本、儿歌）网上没有现成字幕，
-		// 前三条路必然全空 —— 不在这里补一刀，"自动配字幕"对这类库等于没做。
-		// 转写是异步的，这一轮仍然是 204，但要告诉前端"在生成了，等会儿再来"
-		// （头 `X-Subtitle-Pending: 1`），否则家长只看到"没字幕"。
-		//
-		// ⚠️ 负缓存 `.none` 不能在这里写：它会让之后 24 小时的请求直接
-		// 走"没有字幕"的短路，把刚生成好的字幕挡在门外。
-		if h.StartASR(&res) {
-			c.Header(subtitlePendingHeader, "1")
-			c.Status(http.StatusNoContent)
-			return
-		}
+		// 2026-10-20 撤掉了"AI 听写"这一道：本机 whisper 在这台 NAS
+		// （Celeron J1900）上只有 0.5 倍实时，一本 3 分钟绘本要转 6~7 分钟，
+		// 结论是"不值得为它常驻一个吃满 CPU 的转写引擎"。
+		// 负缓存照旧写：确认没有就 24 小时内不再探一遍（探测要打网盘 API）。
 		_ = os.WriteFile(filepath.Join(h.outDir, fmt.Sprintf("%d.none", id)), []byte(""), 0o644)
 		c.Status(http.StatusNoContent)
 		return
@@ -217,8 +202,6 @@ func originOf(source string) string {
 		return "embedded"
 	case strings.HasPrefix(source, "联网"):
 		return "online"
-	case strings.HasPrefix(source, "AI 听写"):
-		return "asr"
 	}
 	return "auto"
 }

@@ -30,30 +30,6 @@ type SubtitleConfig struct {
 	// OpenSubtitlesKey 填了才启用"网上自动匹配"。
 	// 免费申请：https://www.opensubtitles.com → API consumers
 	OpenSubtitlesKey string `mapstructure:"opensubtitles_key"`
-
-	// ASRModel 语音听写模型名。走的是 OpenAI 兼容的 /audio/transcriptions，
-	// 与后台「AI 配置」共用 base_url + key，但**模型要单独指定** ——
-	// AI 配置里存的是对话模型（agnes-3.0-flash），拿去转写必然报错。
-	ASRModel string `mapstructure:"asr_model"`
-	// ASRLanguage 听写语言。这套库是英语学习资料，传 en 比让模型自己猜稳。
-	// 留空则自动判断（中文资料也能用）。
-	ASRLanguage string `mapstructure:"asr_language"`
-
-	// ASREngine 用哪个引擎听写：auto / local / http / off。
-	//
-	//	auto  （默认）本地 whisper 可用就本地，否则退回网关；
-	//	local 只用本机 whisper.cpp（网关里没有转写模型时用这个）；
-	//	http  只用 OpenAI 兼容的 /audio/transcriptions；
-	//	off   关掉听写（前三道来源照常工作）。
-	ASREngine string `mapstructure:"asr_engine"`
-	// WhisperBin whisper-cli 可执行文件路径（镜像里自带）。
-	WhisperBin string `mapstructure:"whisper_bin"`
-	// WhisperModel ggml 模型路径。也可以填一个目录，自动挑里面最合适的
-	// ggml-*.bin —— 换模型时不用改配置。
-	WhisperModel string `mapstructure:"whisper_model"`
-	// WhisperThreads 推理线程数。默认 3：这台 NAS 只有 4 核，
-	// 听写跑起来时孩子多半正在看视频，吃满核会表现为"播放卡顿"。
-	WhisperThreads int `mapstructure:"whisper_threads"`
 }
 
 type ServerConfig struct {
@@ -155,15 +131,7 @@ func Load(path string) (*Config, error) {
 	v := viper.New()
 
 	// 默认值
-	// 学习资料网上没有现成字幕，只能自己听写：默认 whisper-1 + 英文。
-	v.SetDefault("subtitle.asr_model", "whisper-1")
-	v.SetDefault("subtitle.asr_language", "en")
-	// 听写引擎：默认 auto —— 镜像里带了 whisper-cli 和模型就用本地，
-	// 没带（或模型没挂上）就退回网关，不需要人工干预。
-	v.SetDefault("subtitle.asr_engine", "auto")
-	v.SetDefault("subtitle.whisper_bin", "/usr/local/bin/whisper-cli")
-	v.SetDefault("subtitle.whisper_model", "/app/models/model.bin")
-	v.SetDefault("subtitle.whisper_threads", 3)
+	// 字幕：只用"同目录 / 内嵌轨 / 联网"三道来源（听写已于 2026-10-20 撤除）。
 
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.mode", "release")

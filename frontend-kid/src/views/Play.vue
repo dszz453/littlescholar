@@ -21,9 +21,6 @@
       >
         CC
       </button>
-      <!-- 学习资料的字幕是 AI 现听写的，第一次播放要等几十秒。
-           不提示的话，家长只会看到"点了一遍没字幕"就再也不点了。 -->
-      <span v-else-if="subtitleState === 'pending'" class="sub-pending">字幕生成中…</span>
     </header>
 
     <!-- ===== 加载 / 错误 ===== -->
@@ -2084,7 +2081,7 @@ function pushNativeInactive() {
 const SUB_KEY = 'kid_subtitle_on'
 
 const subtitleCues = ref([])
-const subtitleState = ref('idle') // idle | loading | ok | none | pending
+const subtitleState = ref('idle') // idle | loading | ok | none
 const subtitleSource = ref('')
 const subtitleOn = ref(readSubtitlePref())
 
@@ -2220,10 +2217,6 @@ function decodeSubtitleSource(v) {
   }
 }
 
-// 转写进行中时服务端会回 204 + 这个头。它和"真的没有字幕"是两回事：
-// 后者是终局，前者值得再等一会儿 —— 学习资料的字幕是 AI 现听写的。
-const SUB_POLL_DELAYS = [10000, 20000, 30000, 60000, 90000, 120000]
-
 // 每轮请求的代号。切集/重播会让旧的那一轮作废，
 // 否则上一集的轮询会在新一集上把字幕刷成旧的。
 let subGen = 0
@@ -2231,10 +2224,10 @@ let subGen = 0
 async function loadSubtitle() {
   const gen = ++subGen
   resetSubtitle()
-  await fetchSubtitle(gen, 0)
+  await fetchSubtitle(gen)
 }
 
-async function fetchSubtitle(gen, attempt) {
+async function fetchSubtitle(gen) {
   if (!isVideo.value && !isAudio.value) return
   // 离线缓存播放：没有网络也没有票据，直接跳过
   if (offlinePlay.value) return
@@ -2250,21 +2243,12 @@ async function fetchSubtitle(gen, attempt) {
     target = `/api/subtitle/${resourceId.value}?t=${encodeURIComponent(t)}`
   }
 
-  if (attempt === 0) subtitleState.value = 'loading'
+  subtitleState.value = 'loading'
   try {
     const res = await fetch(target, { cache: 'no-store' })
     if (res.status === 204 || !res.ok) {
-      // 204 = 服务端明确说"没有字幕"。
-      // 但带 X-Subtitle-Pending 的 204 是"正在听写，等会儿再来"。
-      if (res.headers.get('X-Subtitle-Pending') === '1' && attempt < SUB_POLL_DELAYS.length) {
-        if (gen !== subGen) return
-        subtitleState.value = 'pending'
-        setTimeout(() => {
-          if (gen === subGen) fetchSubtitle(gen, attempt + 1)
-        }, SUB_POLL_DELAYS[attempt])
-        return
-      }
-      // 204 = 服务端明确说"没有字幕"。这是常态，不提示。
+      // 204 = 服务端明确说"没有字幕"（同目录/内嵌/联网三道都没配上）。
+      // 这是常态，不提示、不重试 —— 重试多少次结果都一样。
       subtitleState.value = 'none'
       return
     }
@@ -2636,24 +2620,6 @@ watch(isPlaying, (v) => {
 }
 .more {
   font-size: 15px;
-}
-/* 字幕生成中的提示：不弹窗、不遮画面，只是让人知道"在做了" */
-.sub-pending {
-  flex: 0 0 auto;
-  font-size: 11px;
-  color: var(--c-text-sub);
-  padding: 0 6px;
-  white-space: nowrap;
-  animation: sub-blink 1.6s ease-in-out infinite;
-}
-@keyframes sub-blink {
-  0%,
-  100% {
-    opacity: 0.45;
-  }
-  50% {
-    opacity: 1;
-  }
 }
 .head-info {
   flex: 1;

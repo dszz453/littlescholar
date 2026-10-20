@@ -453,25 +453,3 @@ func truncate(s string, n int) string {
 	}
 	return string(runes[:n]) + "..."
 }
-
-// DefaultEndpoint 取默认 AI 配置的连接信息（key 已解密）。
-//
-// 与 DefaultClient 分开是因为语音听写要的不是 chat client：
-// 它需要原始 base_url + key + 一个**转写模型名**（whisper-1 之类），
-// 而 AIConfig.Model 存的是对话模型（agnes-3.0-flash），拿去做转写必然失败。
-func (h *AIHandler) DefaultEndpoint() (baseURL, apiKey, modelName string, err error) {
-	if h == nil || h.db == nil {
-		return "", "", "", errNotFound
-	}
-	var cfg model.AIConfig
-	if err := h.db.Where("is_default = ?", true).First(&cfg).Error; err != nil {
-		if err := h.db.Order("id asc").First(&cfg).Error; err != nil {
-			return "", "", "", err
-		}
-	}
-	key, err := h.encryptor.Decrypt(cfg.APIKeyEncrypted)
-	if err != nil {
-		return "", "", "", errDecrypt
-	}
-	return cfg.BaseURL, key, cfg.Model, nil
-}

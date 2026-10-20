@@ -39,129 +39,20 @@ RUN set -e; \
     go mod tidy && \
     go build -ldflags="$LDF" -o /build/core-server ./cmd/server
 
-# ============ whisper.cpp（本机语音听写）============
-#
-# 为什么要自己做一份：这套库是**英语学习资料**，网上没有现成字幕可搜；
-# 而云端网关（OpenAI 兼容的 /audio/transcriptions）里根本没有转写模型
-# （whisper-1 / gpt-4o-transcribe / whisper-large-v3 / whisper 四个名字
-# 全回 `No available channel for model`）。唯一稳的路是把模型放进容器。
-#
-# 为什么在镜像里编译而不是下预编译包：仓库只发 macOS/Windows 的 release，
-# Linux 二进制要自己编；这一步在 CI 上做（runner 有网、有 CPU），
-# 服务器只 pull，跟其它镜像的构建方式保持一致。
-FROM alpine:3.19 AS whisper
-
-RUN apk add --no-cache build-base cmake curl
-
-# 版本钉死：whisper-cli 的参数名在版本间改过（-np / -tp 都是后加的），
-# 跟着 master 走会出现"今天能转、明天报用法错误"。
-ARG WHISPER_REF=v1.7.4
-
-RUN set -eux; \
-    curl -fsSL --retry 3 -o /tmp/w.tar.gz \
-      "https://codeload.github.com/ggerganov/whisper.cpp/tar.gz/refs/tags/${WHISPER_REF}"; \
-    mkdir -p /src && tar -xzf /tmp/w.tar.gz -C /src --strip-components=1
-
-WORKDIR /src/build
-# 静态链 whisper/ggml（BUILD_SHARED_LIBS=OFF），运行镜像里就不必带一堆 .so；
-# GGML_NATIVE=OFF 是为了"编译机 CPU 新、跑在 NAS 上"不会因指令集不兼容而崩；
-# GGML_OPENMP=OFF 少一个 libgomp 运行时依赖。
-#
-# ⚠️ AVX 系列必须**全部显式关掉**，光有 GGML_NATIVE=OFF 不够。
-# 线上这台 NAS 是 Intel Celeron J1900（Silvermont 架构，2013 年），
-# flags 里只有 sse4_2 —— 连 AVX 都没有。ggml 的 GGML_AVX/AVX2/FMA/F16C
-# 默认全是 ON，编出来的二进制在它上面一 init 就 `Illegal instruction (core dumped)`，
-# 而报错发生在加载模型时，看着像"模型文件坏了"。
-# 保留 SSSE3/SSE4.2（J1900 有），量化点积仍走 SSE 路径，速度不至于惨不忍睹。
-RUN cmake .. \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DBUILD_SHARED_LIBS=OFF \
-      -DWHISPER_BUILD_TESTS=OFF \
-      -DWHISPER_BUILD_EXAMPLES=ON \
-      -DWHISPER_BUILD_SERVER=OFF \
-      -DGGML_NATIVE=OFF \
-      -DGGML_AVX=OFF \
-      -DGGML_AVX2=OFF \
-      -DGGML_AVX512=OFF \
-      -DGGML_FMA=OFF \
-      -DGGML_F16C=OFF \
-      -DGGML_OPENMP=OFF \
-      -DGGML_BLAS=OFF \
- && cmake --build . --config Release -j"$(nproc)"
-
-# 模型：默认 base.en（148MB）。
-#
-# ⚠️ 模型必须是**量化版（-q5_1）**，这一条不是口味问题：
-# GGML_F16C 关掉以后，F16 权重每一层都要先软件转成 F32 才能参与计算，
-# 等于凭空多一倍内存搬运量。2026-10-20 线上实测同一段 3 秒音频：
-#   ggml-tiny.en.bin（F16, 74MB）      100s
-#   ggml-tiny.en-q5_1.bin（Q5_1, 30MB） 62s
-#   ggml-base.en.bin（F16, 141MB）      >100s（跑不完）
-# 量化版走整数点积（SSE 路径），比换更小的模型有效得多。
-#
-# 为什么最终落在 tiny 而不是 base/small：这台 NAS 是 Celeron J1900
-# （4 核 1.99GHz，无 AVX），一个 30 秒窗口就要 50~60 秒，约 0.5 倍实时。
-# 一本 3 分钟的绘本 = 5~7 分钟，这已经是"能接受"的边界；
-# 换 base/small 会直接掉到十几分钟以上，等于不可用。
-# 这套库是清晰朗读的儿童读物，tiny.en 的识别质量够用。
-# 以后换到强机器：把这里和 whisper_local.go 的 resolveModel 优先级一起改。
-#
-# **统一改名成 model.bin**：配置里只认这一个路径，换模型不用改 compose。
-# 下载失败就按更差的候选降级，全部拿不到则让构建失败 ——
-# 静默产出"有 cli 没模型"的镜像是最坏结果：构建日志一片绿，功能永远不可用。
-RUN set -eux; \
-    mkdir -p /models; ok=0; \
-    for m in tiny.en-q5_1 tiny.en base.en-q5_1 base.en; do \
-      for host in hf-mirror.com huggingface.co; do \
-        if curl -fsSL --retry 2 --retry-delay 2 --max-time 1200 \
-             -o /models/model.bin \
-             "https://${host}/ggerganov/whisper.cpp/resolve/main/ggml-${m}.bin"; then \
-          echo "whisper 模型 = ${m} (${host})"; ok=1; break 2; \
-        fi; \
-      done; \
-    done; \
-    [ "$ok" = "1" ] || { echo "模型下载失败：四个候选全不可用"; exit 1; }; \
-    ls -lh /models/model.bin
-
 # ============ 运行阶段 ============
 FROM alpine:3.19
 
-# 安装运行时依赖：时区、ca 证书、ffmpeg（转码 + 抽音轨）、
-# libstdc++（whisper-cli 是 C++ 编译的，musl 基础镜像里没有）
+# 安装运行时依赖：时区、ca 证书、ffmpeg（转码 + 抽音轨）
 RUN apk add --no-cache \
     ca-certificates \
     tzdata \
     ffmpeg \
-    libstdc++ \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
 
 WORKDIR /app
 
 COPY --from=builder /build/core-server /app/core-server
-
-# 本机语音听写：whisper-cli + 模型（见上面的 whisper 阶段）
-COPY --from=whisper /src/build/bin/whisper-cli /usr/local/bin/whisper-cli
-COPY --from=whisper /models/model.bin /app/models/model.bin
-
-# 构建期自检：缺 so 的二进制在这里就暴露，而不是等线上第一次听写才失败。
-# 判据用 --help 输出里的 "usage" —— 缺共享库时输出的是
-# "Error loading shared library ..."，一定不匹配。
-#
-# 再用一段静音 wav 真跑一次模型加载：模型那三条降级下载里任何一条
-# 下到"HTML 错误页"（镜像站偶尔这么干）都会在这里当场红，
-# 而不是等到线上第一次听写才报 "failed to load model"。
-RUN set -eux; \
-    out="$(whisper-cli --help 2>&1 || true)"; \
-    echo "$out" | head -5; \
-    echo "$out" | grep -qi "usage" || { echo "whisper-cli 跑不起来（多半缺共享库）"; exit 1; }; \
-    test -s /app/models/model.bin; \
-    ffmpeg -hide_banner -loglevel error -y -f lavfi -i anullsrc=r=16000:cl=mono \
-           -t 1 -c:a pcm_s16le /tmp/sil.wav; \
-    if ! whisper-cli -m /app/models/model.bin -f /tmp/sil.wav -l en -t 2 >/tmp/w.log 2>&1; then \
-        tail -5 /tmp/w.log; echo "模型加载失败（多半下到了错误页面）"; exit 1; \
-    fi; \
-    rm -f /tmp/sil.wav /tmp/w.log
 
 # 数据目录
 RUN mkdir -p /app/data/media /app/data/transcode
