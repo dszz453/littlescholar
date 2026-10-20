@@ -40,7 +40,7 @@ func newAISubFixture(t *testing.T) (*gorm.DB, *AISubtitleService) {
 		t.Fatalf("加密器初始化失败：%v", err)
 	}
 	aiH := NewAIHandler(db, enc)
-	svc := NewAISubtitleService(db, subtitle.NewStore(db), aiH, "", t.TempDir(), t.TempDir())
+	svc := NewAISubtitleHandler(db, subtitle.NewStore(db), aiH, "", t.TempDir(), t.TempDir())
 	return db, svc
 }
 

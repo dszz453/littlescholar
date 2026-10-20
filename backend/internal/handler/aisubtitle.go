@@ -71,11 +71,15 @@ type AISubtitleStat struct {
 	LastRunAt *time.Time `json:"lastRunAt"`
 }
 
-// NewAISubtitleService 构造。
+// NewAISubtitleHandler 构造。
+//
+// 类型叫 Service（它还跑后台计划，不只是 HTTP handler），但构造器沿用
+// NewXxxHandler 的命名：scripts/lint_offline.py 的「路由 handler 方法存在性」
+// 是拿 `xxxH := handler.NewXxxHandler` 配对的，换个名字这些路由就没人校验了。
 //
 // store 为空时所有写库动作都会失败（ErrNoStore），所以这里允许为空，
 // 但路由装配时一定传真的 —— 单测里可以只测计划/窗口这些纯逻辑。
-func NewAISubtitleService(db *gorm.DB, store *subtitle.Store, aiH *AIHandler,
+func NewAISubtitleHandler(db *gorm.DB, store *subtitle.Store, aiH *AIHandler,
 	ffmpegPath, dir, cacheDir string) *AISubtitleService {
 
 	if strings.TrimSpace(dir) == "" {

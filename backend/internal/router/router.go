@@ -141,7 +141,7 @@ func Setup(deps *Deps) *gin.Engine {
 	// AI 批量写字幕：模型只给文本，时间轴由音频的停顿位置算（见 aiwrite.go）。
 	// 产物落 data/subtitle/ai（与播放缓存同目录但不在同一层），
 	// 同时写 resource_subtitles（origin='ai'）——播放链路只认后者。
-	aiSubtitleH := handler.NewAISubtitleService(deps.DB, subtitleStore, aiH,
+	aiSubtitleH := handler.NewAISubtitleHandler(deps.DB, subtitleStore, aiH,
 		deps.Cfg.Transcode.FFmpegPath,
 		filepath.Join(subtitleDir, "ai"), subtitleDir)
 	deps.AISubtitle = aiSubtitleH
