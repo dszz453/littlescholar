@@ -66,6 +66,13 @@ WORKDIR /src/build
 # 静态链 whisper/ggml（BUILD_SHARED_LIBS=OFF），运行镜像里就不必带一堆 .so；
 # GGML_NATIVE=OFF 是为了"编译机 CPU 新、跑在 NAS 上"不会因指令集不兼容而崩；
 # GGML_OPENMP=OFF 少一个 libgomp 运行时依赖。
+#
+# ⚠️ AVX 系列必须**全部显式关掉**，光有 GGML_NATIVE=OFF 不够。
+# 线上这台 NAS 是 Intel Celeron J1900（Silvermont 架构，2013 年），
+# flags 里只有 sse4_2 —— 连 AVX 都没有。ggml 的 GGML_AVX/AVX2/FMA/F16C
+# 默认全是 ON，编出来的二进制在它上面一 init 就 `Illegal instruction (core dumped)`，
+# 而报错发生在加载模型时，看着像"模型文件坏了"。
+# 保留 SSSE3/SSE4.2（J1900 有），量化点积仍走 SSE 路径，速度不至于惨不忍睹。
 RUN cmake .. \
       -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_SHARED_LIBS=OFF \
@@ -73,20 +80,29 @@ RUN cmake .. \
       -DWHISPER_BUILD_EXAMPLES=ON \
       -DWHISPER_BUILD_SERVER=OFF \
       -DGGML_NATIVE=OFF \
+      -DGGML_AVX=OFF \
+      -DGGML_AVX2=OFF \
+      -DGGML_AVX512=OFF \
+      -DGGML_FMA=OFF \
+      -DGGML_F16C=OFF \
       -DGGML_OPENMP=OFF \
       -DGGML_BLAS=OFF \
  && cmake --build . --config Release -j"$(nproc)"
 
-# 模型：优先英文 small 量化版（181MB，识别质量明显好过 base，4 核跑得动），
-# 拿不到就降级 base。**统一改名成 model.bin** —— 配置里只认这一个路径，
-# 换模型不用改 compose、也不用重新对路径。
+# 模型：默认 base.en（148MB）。
 #
-# 先试 hf-mirror（国内可达），再试 huggingface，最后才报错退出：
-# 静默失败会产出一个"带 whisper-cli 但没有模型"的镜像，
-# 表现是听写永远不可用，而构建日志一片绿。
+# 为什么不是更大的 small：线上这台 NAS 是 Celeron J1900（4 核 1.99GHz，
+# 无 AVX），whisper.cpp 在它上面只能跑 SSE2 路径，small 大约只有
+# 0.1~0.2 倍实时 —— 一本 3 分钟的绘本音频要等 20 分钟，跟"点开就有字幕"
+# 的预期差太远。base 快 3 倍左右，而这套库是清晰朗读的儿童读物，
+# base 的识别质量够用。
+#
+# **统一改名成 model.bin**：配置里只认这一个路径，换模型不用改 compose。
+# 下载失败就按 small 降级，三个都拿不到则让构建失败 ——
+# 静默产出"有 cli 没模型"的镜像是最坏结果：构建日志一片绿，功能永远不可用。
 RUN set -eux; \
     mkdir -p /models; ok=0; \
-    for m in small.en-q5_1 small.en base.en; do \
+    for m in base.en small.en-q5_1 small.en; do \
       for host in hf-mirror.com huggingface.co; do \
         if curl -fsSL --retry 2 --retry-delay 2 --max-time 1200 \
              -o /models/model.bin \
@@ -122,11 +138,21 @@ COPY --from=whisper /models/model.bin /app/models/model.bin
 # 构建期自检：缺 so 的二进制在这里就暴露，而不是等线上第一次听写才失败。
 # 判据用 --help 输出里的 "usage" —— 缺共享库时输出的是
 # "Error loading shared library ..."，一定不匹配。
+#
+# 再用一段静音 wav 真跑一次模型加载：模型那三条降级下载里任何一条
+# 下到"HTML 错误页"（镜像站偶尔这么干）都会在这里当场红，
+# 而不是等到线上第一次听写才报 "failed to load model"。
 RUN set -eux; \
     out="$(whisper-cli --help 2>&1 || true)"; \
     echo "$out" | head -5; \
     echo "$out" | grep -qi "usage" || { echo "whisper-cli 跑不起来（多半缺共享库）"; exit 1; }; \
-    test -s /app/models/model.bin
+    test -s /app/models/model.bin; \
+    ffmpeg -hide_banner -loglevel error -y -f lavfi -i anullsrc=r=16000:cl=mono \
+           -t 1 -c:a pcm_s16le /tmp/sil.wav; \
+    if ! whisper-cli -m /app/models/model.bin -f /tmp/sil.wav -l en -t 2 >/tmp/w.log 2>&1; then \
+        tail -5 /tmp/w.log; echo "模型加载失败（多半下到了错误页面）"; exit 1; \
+    fi; \
+    rm -f /tmp/sil.wav /tmp/w.log
 
 # 数据目录
 RUN mkdir -p /app/data/media /app/data/transcode
