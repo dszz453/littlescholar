@@ -67,6 +67,10 @@ class MediaPlaybackService : Service() {
         const val ACTION_PAUSE = "xyz.littlescholar.kid.PAUSE"
         const val ACTION_NEXT = "xyz.littlescholar.kid.NEXT"
 
+        /** 页面点名要用原生引擎播一条音频（wma/ape 这类 WebView 解不了的）。 */
+        const val ACTION_NATIVE = "xyz.littlescholar.kid.NATIVE_AUDIO"
+        const val EXTRA_JSON = "json"
+
         /**
          * 服务是不是真的在跑。
          *
@@ -136,6 +140,32 @@ class MediaPlaybackService : Service() {
             instance?.giveBack()
         }
 
+        /**
+         * 页面要求用**原生引擎**播一条音频。
+         *
+         * 与 [takeOver] 的区别：接管是"网页已经在播、切后台时交给原生接着放"；
+         * 这条是"网页根本播不了（wma），从头就由原生播"。两者互斥，
+         * 且原生模式不需要交还 —— 切前后台用的都是同一个 VLC 播放器。
+         *
+         * 走 Intent 而不是 instance 直调：服务没起来时也要能一条命令把它拉起来，
+         * 否则第一次点开 wma 就是"没声"。
+         */
+        fun nativeAudio(ctx: Context, json: String) {
+            val i = Intent(ctx, MediaPlaybackService::class.java).apply {
+                action = ACTION_NATIVE
+                putExtra(EXTRA_JSON, json)
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    ctx.startForegroundService(i)
+                } else {
+                    ctx.startService(i)
+                }
+            } catch (e: Exception) {
+                Diagnostics.add("原生播放", "启动失败：${e.message}")
+            }
+        }
+
         /** 服务没起来时先把状态存着，`onCreate` 之后补接管。 */
         @Volatile
         private var pending: MediaState? = null
@@ -157,6 +187,14 @@ class MediaPlaybackService : Service() {
          * 宽限期一到就把服务停掉，后台播放跟着断。见 MainActivity.maybeStopPlayback。
          */
         fun isHandingOff(): Boolean = instance?.handingOffNow == true
+
+        /**
+         * 原生引擎是不是正在播（wma 这类）。
+         *
+         * 与 [isHandingOff] 一样，是给 MainActivity 的"该不该收服务"判断用的：
+         * 原生模式下页面里没有 `<audio>`，它永远报"没在播"。
+         */
+        fun isNativePlaying(): Boolean = instance?.nativeMode == true
 
         /**
          * 壳里主动接管：不依赖网页的 `visibilitychange`。
@@ -209,6 +247,16 @@ class MediaPlaybackService : Service() {
     private var handoffMode = false
     private var handoffPreparing = false
 
+    /**
+     * 原生解码引擎（libVLC）。**只有 nativeMode 为 true 时它才是"当前真正在播的那个"**。
+     *
+     * 与 [player]（MediaPlayer，用于后台接管 mp4/mp3）是两条互斥的路：
+     * 网页**能**解的格式走 WebView（音画同步、字幕、倍速都在页面里）；
+     * 网页**解不了**的（wma/ape/amr…）才由它播，页面退化成遥控器 + 字幕层。
+     */
+    private var vlc: VlcAudioEngine? = null
+    private var nativeMode = false
+
     /** 给 `isHandingOff()` 用（准备中也算，避免准备期被误停服务）。 */
     internal val handingOffNow: Boolean get() = handoffMode || handoffPreparing
 
@@ -237,6 +285,16 @@ class MediaPlaybackService : Service() {
             }
             ACTION_NEXT -> {
                 MediaBridge.next()
+                return START_STICKY
+            }
+            ACTION_NATIVE -> {
+                // startForegroundService 要求 5 秒内 startForeground，
+                // 所以先把面板立起来，再让 VLC 去加载（加载可能要一两秒）。
+                running = true
+                session?.isActive = true
+                acquireLocks()
+                startForeground(NOTI_ID, buildNotification())
+                handleNative(intent.getStringExtra(EXTRA_JSON).orEmpty())
                 return START_STICKY
             }
             ACTION_PLAY -> {
@@ -278,12 +336,22 @@ class MediaPlaybackService : Service() {
             markPlaying(true)
             return
         }
+        if (nativeMode) {
+            vlc?.resume()
+            markPlaying(true)
+            return
+        }
         MediaBridge.play()
     }
 
     private fun doPause() {
         if (handoffMode) {
             runCatching { player?.pause() }
+            markPlaying(false)
+            return
+        }
+        if (nativeMode) {
+            vlc?.pause()
             markPlaying(false)
             return
         }
@@ -300,12 +368,135 @@ class MediaPlaybackService : Service() {
     }
 
     private fun nativePositionSec(): Long {
+        if (nativeMode) return (vlc?.positionMs ?: 0L) / 1000L
         val p = player ?: return state.position
         return try {
             (p.currentPosition / 1000L).coerceAtLeast(0)
         } catch (e: Exception) {
             state.position
         }
+    }
+
+    // ============================================================
+    //  原生引擎（wma / ape / amr …）
+    // ============================================================
+
+    /**
+     * 页面点名的原生播放。协议是单条 JSON：
+     *
+     * ```json
+     * {"cmd":"play","url":"https://…wma?t=…","position":12,"title":"…",
+     *  "subtitle":"…","poster":"…","duration":217}
+     * {"cmd":"pause"} / {"cmd":"resume"} / {"cmd":"seek","position":30} / {"cmd":"stop"}
+     * ```
+     *
+     * 为什么让页面来点名、而不是壳自己按扩展名判断：
+     * 页面上那个地址可能是 `/api/stream`（直链）、PRO 的 `/edge/stream`
+     * （本地反代），也可能是一集视频。壳里猜错一次就是"没声"，而页面
+     * 手里有服务端给的类型（`nativeAudio`），这个判断只该有一处。
+     */
+    private fun handleNative(json: String) {
+        if (json.isBlank()) return
+        val o = runCatching { JSONObject(json) }.getOrNull() ?: return
+        val cmd = o.optString("cmd", "play")
+        if (cmd != "stop" && cmd != "play" && !nativeMode) {
+            // 还没进入原生模式就收到 pause/seek：多半是页面重进后补发的
+            // 状态心跳，直接忽略，别把别的资源打断。
+            return
+        }
+        when (cmd) {
+            "play" -> {
+                val url = o.optString("url", "")
+                if (url.isBlank()) {
+                    Diagnostics.add("原生播放", "地址为空，忽略")
+                    return
+                }
+                state = state.copy(
+                    active = true,
+                    playing = true,
+                    title = o.optString("title", state.title).take(120),
+                    subtitle = o.optString("subtitle", state.subtitle).take(120),
+                    poster = o.optString("poster", state.poster),
+                    duration = o.optLong("duration", state.duration),
+                    position = o.optDouble("position", 0.0).toLong().coerceAtLeast(0),
+                    url = url,
+                    video = false,
+                )
+                nativeMode = true
+                // 原生模式不存在"接管"这回事：播放器本来就在服务里。
+                handoffMode = false
+                handoffPreparing = false
+                Diagnostics.add("原生播放", "VLC 加载：${url.take(80)}")
+                engine().play(url, state.position * 1000L)
+            }
+            "pause" -> {
+                engine().pause()
+                markPlaying(false)
+            }
+            "resume" -> {
+                engine().resume()
+                markPlaying(true)
+            }
+            "seek" -> {
+                val sec = o.optDouble("position", 0.0).toLong().coerceAtLeast(0)
+                engine().seekTo(sec * 1000L)
+                state = state.copy(position = sec)
+                updateSession()
+            }
+            "stop" -> stopNative()
+            else -> Diagnostics.add("原生播放", "未知指令：$cmd")
+        }
+    }
+
+    private fun engine(): VlcAudioEngine =
+        vlc ?: VlcAudioEngine(applicationContext) { st -> onNativeState(st) }.also { vlc = it }
+
+    /**
+     * VLC 的状态回调（已切到主线程）。
+     *
+     * 三件事：刷新面板、把位置推给页面（进度条与字幕都靠它）、
+     * 播完通知页面去切下一集。
+     */
+    private fun onNativeState(st: VlcAudioEngine.State) {
+        if (st.error.isNotEmpty()) {
+            Diagnostics.add("原生播放", "失败：${st.error}")
+            // 失败也要告诉页面：它会退到"这一段放不了"的提示，
+            // 而不是永远转圈等一个不会来的声音。
+            MediaBridge.nativeState(false, 0.0, 0.0, false, st.error)
+            return
+        }
+        if (!nativeMode) return
+        state = state.copy(
+            playing = st.playing,
+            position = st.positionMs / 1000L,
+            duration = if (st.durationMs > 0) st.durationMs / 1000L else state.duration,
+        )
+        updateSession()
+        if (running) {
+            getSystemService(NotificationManager::class.java)?.notify(NOTI_ID, buildNotification())
+        }
+        MediaBridge.nativeState(
+            st.playing,
+            st.positionMs / 1000.0,
+            st.durationMs / 1000.0,
+            st.ended,
+            "",
+        )
+    }
+
+    private fun stopNative() {
+        if (!nativeMode && vlc == null) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+        nativeMode = false
+        runCatching { vlc?.stop() }
+        MediaBridge.nativeState(false, 0.0, 0.0, false, "")
+        releaseLocks()
+        session?.isActive = false
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     /**
@@ -415,6 +606,12 @@ class MediaPlaybackService : Service() {
             override fun onSkipToNext() = MediaBridge.next()
             override fun onSkipToPrevious() = MediaBridge.prev()
             override fun onSeekTo(pos: Long) {
+                if (nativeMode) {
+                    vlc?.seekTo(pos)
+                    state = state.copy(position = pos / 1000L)
+                    updateSession()
+                    return
+                }
                 if (handoffMode) {
                     runCatching { player?.seekTo(pos.toInt()) }
                     state = state.copy(position = pos / 1000L)
@@ -442,10 +639,16 @@ class MediaPlaybackService : Service() {
         }
         // ⚠️ 后台接管期间，网页是"暂停并静音"的，它推来的 playing/position
         // 会把面板刷成"已暂停"。这段时间以原生播放器为准，忽略这两项。
-        state = if (handoffMode) {
-            st.copy(playing = state.playing, position = nativePositionSec())
-        } else {
-            st
+        state = when {
+            handoffMode -> st.copy(playing = state.playing, position = nativePositionSec())
+            // 原生模式下网页是"暂停"的（它连 <audio> 都没有），
+            // 让它推来的 playing/position 覆盖面板会让通知栏一直显示"已暂停"。
+            nativeMode -> st.copy(
+                playing = state.playing,
+                position = nativePositionSec(),
+                url = state.url,
+            )
+            else -> st
         }
         if (st.poster.isNotEmpty() && st.poster != lastPosterUrl) {
             lastPosterUrl = st.poster
@@ -668,6 +871,8 @@ class MediaPlaybackService : Service() {
         running = false
         instance = null
         releasePlayer()
+        runCatching { vlc?.release() }
+        vlc = null
         releaseLocks()
         session?.release()
         session = null

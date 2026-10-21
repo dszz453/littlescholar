@@ -255,14 +255,30 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	// 前端该用哪个渲染器、文件从哪拿。所以单开一个分支，
 	// 不参与下面的画质选择。
 	ebookFormat := ""
+	// 原生解码（见上面 audioformat 分支）
+	nativeAudio := false
+	nativeURL := ""
 	switch {
 	case mediaType == model.MediaTypeEbook:
 		ebookFormat = h.setupEbook(&res, &playMode, &playURL)
 	case mediaType == model.MediaTypeAudio && h.audioFmt != nil && h.audioFmt.NeedsConvert(&res):
-		// wma / ape / amr / ac3 …：WebView 的 <audio> 直接放不出来。
-		// 这里给一个"服务端已经转成 AAC"的地址，前端不用做任何判断。
+		// wma / ape / amr / ac3 …：Chromium 根本解不了（canPlayType 返回空、
+		// 加载报 DEMUXER_ERROR），所以两条路都得给：
+		//
+		//   · nativeUrl —— **原文件直链**，交给客户端内置的 libVLC 播。
+		//     1.6.0 起的 APK 走这条：点开就出声，服务端不转码、不占盘。
+		//   · url       —— 服务端转好的 m4a，给老版本 APK 和纯浏览器用
+		//     （网页里没有原生引擎，只能用这个）。
+		//
+		// 为什么不在服务端按版本判断：页面既可能来自新壳、也可能是手机
+		// 浏览器打开的同一份页面。让**页面**按"有没有 KidNative.nativeAudio"
+		// 自己选，只有一处判断，也不会因为版本号漏升级而退回干等一分钟。
 		playMode = "audioformat"
 		playURL = h.audioFmt.URLFor(res.ID)
+		if link := h.streamURL(res.ID); link != "" {
+			nativeAudio = true
+			nativeURL = link
+		}
 	case mediaType == model.MediaTypeImage && h.imageFmt != nil && h.imageFmt.NeedsConvert(&res):
 		// HEIC / TIFF：<img> 在 WebView 里就是一块空白，转成 JPEG 再给
 		playMode = "imageformat"
@@ -340,6 +356,12 @@ func (h *PlayHandler) Info(c *gin.Context) {
 		"ext":               service.ResourceExt(&res),
 		"playMode":          playMode,
 		"url":               playURL,
+		// 客户端能不能**原生**播这条音频（wma 这类）。
+		//
+		// nativeAudio=true 时前端应该把 nativeUrl 交给壳的 libVLC，
+		// url 只在没有原生引擎时用（浏览器/老 APK，走服务端转码）。
+		"nativeAudio": nativeAudio,
+		"nativeUrl":   nativeURL,
 		"poster":            res.Cover,
 		"duration":          res.Duration,
 		"lastPosition":      lastPosition,

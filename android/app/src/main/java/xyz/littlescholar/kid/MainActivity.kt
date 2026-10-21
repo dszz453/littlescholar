@@ -94,6 +94,11 @@ class MainActivity : AppCompatActivity() {
   if (window.__lsPlayWatch) { return; }
   window.__lsPlayWatch = 1;
 
+  // 原生音频引擎（wma 这类 WebView 解不了的格式）的状态回调。
+  // 页面是新构建时自己会定义 __lsNative；旧构建上这里兜个空实现，
+  // 免得原生一推状态就报 undefined 把后面的脚本带断。
+  if (!window.__lsNative) { window.__lsNative = { onState: function () {} }; }
+
   var send = function (on) {
     try { window.KidNative.setPlaying(!!on); } catch (e) { /* 纯浏览器里没有这个桥 */ }
   };
@@ -840,6 +845,21 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /**
+         * 页面点名用**原生引擎**播一条音频（wma/ape 这类 WebView 解不了的）。
+         *
+         * 只做转发：真正的播放器在 [MediaPlaybackService] 里，切后台/锁屏
+         * 用的还是它，因此不需要 takeOver/giveBack 那一套交接。
+         */
+        @JavascriptInterface
+        fun nativeAudio(json: String?) {
+            try {
+                MediaPlaybackService.nativeAudio(this@MainActivity, json ?: "")
+            } catch (e: Exception) {
+                Diagnostics.add("原生播放", "指令失败：${e.message}")
+            }
+        }
+
         /** 回到前台，把播放还回网页。 */
         @JavascriptInterface
         fun giveBack() {
@@ -915,6 +935,12 @@ class MainActivity : AppCompatActivity() {
         // 后台接管中：网页是**故意暂停**的（声音交给原生播放器了），
         // 这时候收服务等于把正在播的东西关掉。再续一轮，等真正结束。
         if (MediaPlaybackService.isHandingOff()) {
+            playbackHandler.postDelayed(stopPlayback, KEEPALIVE_GRACE_MS)
+            return
+        }
+        // 原生引擎（VLC）正在播：页面此时**没有** <audio>，它报的"不播了"
+        // 只代表"网页里没有元素在播"，收服务等于把 wma 直接掐断。
+        if (MediaPlaybackService.isNativePlaying()) {
             playbackHandler.postDelayed(stopPlayback, KEEPALIVE_GRACE_MS)
             return
         }

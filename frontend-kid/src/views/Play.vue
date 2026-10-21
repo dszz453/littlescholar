@@ -62,8 +62,11 @@
         <!-- 音频也有字幕：很多"听故事"其实是英语启蒙，字幕是刚需 -->
         <p v-if="subtitleOn && subtitleHTML" class="sub-audio-line" v-html="subtitleHTML"></p>
 
+        <!-- 原生模式（wma 这类）不挂 <audio>：Chromium 解不了这个格式，
+             挂上去也只会报 DEMUXER_ERROR。声音由壳的 libVLC 播，
+             这里只留页面 UI（封面/进度/字幕），时间轴走 __lsNative。 -->
         <audio
-          v-if="info.url"
+          v-if="info.url && !nativeAudioMode"
           ref="audioEl"
           :src="info.url"
           preload="metadata"
@@ -75,7 +78,7 @@
           @ended="onEnded"
           @error="onMediaError"
         />
-        <div v-else class="video-wait">
+        <div v-else-if="!nativeAudioMode" class="video-wait">
           <div class="spinner big"></div>
           <p class="prep-title">正在把这段音频转成能播的版本…</p>
         </div>
@@ -687,6 +690,95 @@ function mediaEl() {
   return isVideo.value ? videoEl.value : audioEl.value
 }
 
+/* ---------- 原生音频（wma / ape …）：交给壳的 libVLC ----------
+ *
+ * 为什么需要：Chromium 解不了 wma —— `canPlayType('audio/x-ms-wma')` 返回空串，
+ * 加载直接报 DEMUXER_ERROR_COULD_NOT_OPEN（2026-10-21 实测）。
+ * 以前只能让服务器转成 m4a 再塞给 <audio>，而 NAS（J1900）转一本 3 分钟的
+ * 绘本要 21.6 秒，长一点的书就是"点开等一分钟"。
+ *
+ * 1.6.0 起的 APK 内置 libVLC：服务端在 playInfo 里额外给
+ * `nativeAudio: true` + `nativeUrl`（原文件直链），页面把它交给原生，
+ * 声音立刻出来，服务端不转码、不占盘。
+ *
+ * ⚠️ 代价是页面里**没有 <audio> 元素**了：`mediaEl()` 返回 null，
+ * 时间轴改由壳每 ~250ms 推一次（`window.__lsNative.onState`）。
+ * 所以下面每个播放控制函数都有"原生分支"，别只改一处。
+ */
+function nativeAudioBridge() {
+  const b = window.KidNative || window.EdgeNative
+  return b && typeof b.nativeAudio === 'function' ? b : null
+}
+
+const nativeAudioMode = computed(
+  () =>
+    isAudio.value &&
+    !!info.value.nativeAudio &&
+    !!info.value.nativeUrl &&
+    !!nativeAudioBridge(),
+)
+
+function nativeCmd(obj) {
+  const b = nativeAudioBridge()
+  if (!b) return false
+  try {
+    b.nativeAudio(JSON.stringify(obj))
+    return true
+  } catch {
+    // 桥挂了不能把播放页搞崩：让用户看到"放不了"，而不是白屏
+    return false
+  }
+}
+
+function startNativeAudio(at) {
+  if (!nativeAudioMode.value) return
+  const pos = Number(at)
+  nativeCmd({
+    cmd: 'play',
+    url: absoluteURL(info.value.nativeUrl),
+    position: Number.isFinite(pos) && pos > 0 ? pos : 0,
+    title: info.value.title || '',
+    subtitle: info.value.categoryName || '',
+    poster: info.value.poster || '',
+    duration: Math.round(Number(duration.value) || 0),
+  })
+}
+
+/**
+ * 壳推来的播放状态。**这条是原生模式下唯一的时间来源**：
+ * 进度条、时间、字幕（subtitleHTML 依赖 current）都靠它。
+ */
+function onNativeAudioState(st) {
+  if (!nativeAudioMode.value || !st) return
+  if (st.error) {
+    isPlaying.value = false
+    error.value = '这段音频暂时放不了'
+    return
+  }
+  isPlaying.value = !!st.playing
+  const d = Number(st.duration) || 0
+  if (d > 0 && Math.abs(d - duration.value) > 1) duration.value = d
+  const p = Number(st.position) || 0
+  // 0.25 秒去重：字幕与进度条够细，又不会每 250ms 触发一次全页重渲染
+  if (Math.abs(p - current.value) >= 0.25) current.value = p
+  if (st.ended) onNativeAudioEnded()
+  if (Date.now() - lastNativePush > 5000) {
+    lastNativePush = Date.now()
+    pushNativeMedia()
+  }
+}
+
+function onNativeAudioEnded() {
+  isPlaying.value = false
+  flushProgress(true)
+  if (playMode.value === MODE_SINGLE) {
+    startNativeAudio(0)
+    return
+  }
+  const next = nextTrackId()
+  if (next) goTo(next)
+}
+
 /* ---------- 时间格式化 ---------- */
 function fmtClock(sec) {
   const s = Math.max(0, Math.floor(Number(sec) || 0))
@@ -839,6 +931,9 @@ async function load(resumeAt = 0) {
   error.value = ''
   errorRetried = false
   autoFallbackTried = false
+  // 换资源（下一集 / 点目录里别的书）时先把上一条的原生播放停掉：
+  // 否则壳里还是上一本的播放器，两本会叠在一起响。
+  if (nativeAudioMode.value) nativeCmd({ cmd: 'stop' })
   cleanupMedia()
   stopTranscodePolling()
 
@@ -948,6 +1043,13 @@ async function load(resumeAt = 0) {
     }
   } finally {
     loading.value = false
+  }
+  // 原生音频：等 DOM 落定再启动（nativeAudioMode 依赖 info，此刻才有值）
+  if (nativeAudioMode.value) {
+    const at = pendingSeek > 0 ? pendingSeek : 0
+    pendingSeek = 0
+    await nextTick()
+    startNativeAudio(at)
   }
   // 下载按钮的状态要按"这条资源有没有缓存"刷新
   refreshOfflineState()
@@ -1827,6 +1929,16 @@ function onMediaPlay() {
 }
 
 function togglePlay() {
+  if (nativeAudioMode.value) {
+    if (isPlaying.value) {
+      userPaused.value = true
+      nativeCmd({ cmd: 'pause' })
+    } else {
+      userPaused.value = false
+      nativeCmd({ cmd: 'resume' })
+    }
+    return
+  }
   const el = mediaEl()
   if (!el) return
   if (el.paused) {
@@ -1839,6 +1951,14 @@ function togglePlay() {
 }
 
 function seekBy(delta) {
+  if (nativeAudioMode.value) {
+    const d = duration.value || 0
+    let t = current.value + delta
+    t = Math.max(0, Math.min(t, d || t))
+    current.value = t
+    nativeCmd({ cmd: 'seek', position: t })
+    return
+  }
   const el = mediaEl()
   if (!el) return
   const d = Number.isFinite(el.duration) ? el.duration : duration.value
@@ -1852,6 +1972,13 @@ let seekCommitTimer = null
 function onSeekInput(e) {
   current.value = Number(e.target.value)
   // 拖动中做节流式预览 seek，手感更跟手
+  if (nativeAudioMode.value) {
+    clearTimeout(seekCommitTimer)
+    seekCommitTimer = setTimeout(() => {
+      nativeCmd({ cmd: 'seek', position: current.value })
+    }, 60)
+    return
+  }
   const el = mediaEl()
   if (!el) return
   clearTimeout(seekCommitTimer)
@@ -1861,15 +1988,25 @@ function onSeekInput(e) {
 }
 
 function onSeekCommit(e) {
+  clearTimeout(seekCommitTimer)
+  current.value = Number(e.target.value)
+  if (nativeAudioMode.value) {
+    nativeCmd({ cmd: 'seek', position: current.value })
+    return
+  }
   const el = mediaEl()
   if (!el) return
-  clearTimeout(seekCommitTimer)
-  el.currentTime = Number(e.target.value)
-  current.value = Number(e.target.value)
+  el.currentTime = current.value
 }
 
 function setRate(r) {
   rate.value = r
+  if (nativeAudioMode.value) {
+    // VLC 支持 rate，但走原生这一路要先在壳里加通道（1.6.0 还没做）。
+    // 与其假装生效（按钮亮了、语速没变），不如让用户知道这次没切成。
+    nativeCmd({ cmd: 'rate', rate: r })
+    return
+  }
   const el = mediaEl()
   if (el) el.playbackRate = r
 }
@@ -2020,7 +2157,10 @@ function nativePayload() {
     // 浏览器会按当前页面补全，而原生的 MediaPlayer 收到相对路径会把它
     // 当成一个本地文件名 —— 接管"成功"，但一点声音都没有。
     // 现象就是"控制中心在、点播放没反应、后台也没声"。
-    url: absoluteURL(info.value.url || ''),
+    // 原生模式下真正的播放地址是 nativeUrl（原文件）。给转码地址的话，
+    // 壳若按"最近在播"去接管，会拿 m4a 再起一个 MediaPlayer，
+    // 和 VLC 叠成两个播放器。
+    url: absoluteURL((nativeAudioMode.value ? info.value.nativeUrl : info.value.url) || ''),
     video: !!isVideo.value,
     paused: !!userPaused.value,
   }
@@ -2443,11 +2583,19 @@ onMounted(() => {
     // 系统会重复发 onPlay（耳机重连、蓝牙切车机、媒体面板回连都会），
     // 用 toggle 顶着会把正在播的暂停掉 —— 表现就是"点播放反而停了"。
     play: () => {
+      if (nativeAudioMode.value) {
+        if (!isPlaying.value) nativeCmd({ cmd: 'resume' })
+        return
+      }
       const el = mediaEl()
       if (!el || !el.paused) return
       el.play().catch(() => {})
     },
     pause: () => {
+      if (nativeAudioMode.value) {
+        if (isPlaying.value) nativeCmd({ cmd: 'pause' })
+        return
+      }
       const el = mediaEl()
       if (!el || el.paused) return
       el.pause()
@@ -2457,6 +2605,13 @@ onMounted(() => {
 
     // 系统媒体面板拖动进度条 → 原生 → 这里
     seekTo: (sec) => {
+      const t0 = Number(sec)
+      if (nativeAudioMode.value) {
+        if (!Number.isFinite(t0) || t0 < 0) return
+        current.value = t0
+        nativeCmd({ cmd: 'seek', position: t0 })
+        return
+      }
       const el = mediaEl()
       if (!el) return
       const t = Number(sec)
@@ -2510,6 +2665,8 @@ onMounted(() => {
       isPlaying.value = !el.paused
     },
   }
+  // 原生音频引擎的状态回调（wma 这类）。壳每 ~250ms 推一次。
+  window.__lsNative = { onState: onNativeAudioState }
   load()
   startReportTimer()
   document.addEventListener('visibilitychange', onVisibilityChange)
@@ -2527,6 +2684,14 @@ onBeforeUnmount(() => {
   stopTranscodePolling()
   // 正在下载就中断，别让一个已卸载的页面继续吃流量
   if (offlineAbort) offlineAbort.abort()
+  // 离开播放页停掉原生那一路，并摘掉回调（否则下一个页面挂上的
+  // 是最新一份，而旧闭包还在被壳持有）
+  if (nativeAudioMode.value) nativeCmd({ cmd: 'stop' })
+  try {
+    delete window.__lsNative
+  } catch (e) {
+    window.__lsNative = null
+  }
   // 释放 blob: 地址（只释放地址，不删已下载的数据）
   offlineReleaseUrls()
   document.removeEventListener('visibilitychange', onVisibilityChange)

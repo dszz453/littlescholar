@@ -68,6 +68,33 @@ object MediaBridge {
     /** 兼容旧调用点（页面里按钮仍是 toggle 语义）。 */
     fun toggle() = callMedia("toggle && window.__kidMedia.toggle()")
 
+    /**
+     * 原生引擎的状态回推（时间轴靠它）。
+     *
+     * wma 这类格式由 VLC 在服务里播，页面连 `<audio>` 都没有 ——
+     * 进度条、时间、字幕全靠这一路。**次数很密**（VLC 每 250ms 一次 TimeChanged），
+     * 所以参数用基本类型、拼一次 JSON，别在原生侧再做节流：
+     * 页面自己按 `Math.floor(sec * 2)` 去重比这里猜频率可靠。
+     */
+    fun nativeState(
+        playing: Boolean,
+        position: Double,
+        duration: Double,
+        ended: Boolean,
+        error: String,
+    ) {
+        // 用 JSONObject 拼而不是手写字符串：error 里可能带引号/换行，
+        // 手拼一次就是一个"页面整段脚本不执行"的悬案。
+        val o = org.json.JSONObject()
+            .put("playing", playing)
+            .put("position", if (position.isFinite()) position else 0.0)
+            .put("duration", if (duration.isFinite()) duration else 0.0)
+            .put("ended", ended)
+            .put("error", error)
+            .toString()
+        call("window.__lsNative && window.__lsNative.onState && window.__lsNative.onState($o)")
+    }
+
     /** 原生已接管：网页把自己静音并暂停，别两边一起出声。 */
     fun takeOverAck() {
         callMedia("takeOverAck && window.__kidMedia.takeOverAck()")
