@@ -710,11 +710,22 @@ function nativeAudioBridge() {
   return b && typeof b.nativeAudio === 'function' ? b : null
 }
 
+/**
+ * 原生引擎**已经在这次播放里失败过**。
+ *
+ * 置为 true 之后不再走原生，退回网页的转码地址（慢，但一定能出声）。
+ * 这是最后一道保险：壳里的 libVLC 万一在某个机型上起不来（JNI 注册失败、
+ * so 加载失败、解码器缺失），用户看到的最坏情况也只是"还是慢一分钟"，
+ * 而不是"点开就闪退"。
+ */
+const nativeBroken = ref(false)
+
 const nativeAudioMode = computed(
   () =>
     isAudio.value &&
     !!info.value.nativeAudio &&
     !!info.value.nativeUrl &&
+    !nativeBroken.value &&
     !!nativeAudioBridge(),
 )
 
@@ -751,8 +762,7 @@ function startNativeAudio(at) {
 function onNativeAudioState(st) {
   if (!nativeAudioMode.value || !st) return
   if (st.error) {
-    isPlaying.value = false
-    error.value = '这段音频暂时放不了'
+    fallbackToWebAudio()
     return
   }
   isPlaying.value = !!st.playing
@@ -765,6 +775,26 @@ function onNativeAudioState(st) {
   if (Date.now() - lastNativePush > 5000) {
     lastNativePush = Date.now()
     pushNativeMedia()
+  }
+}
+
+/**
+ * 原生引擎起不来 → 退回服务端转码地址，从当前进度接着播。
+ *
+ * 为什么不是直接报错：转码地址（`info.url`）服务端本来就会给，只是慢。
+ * 慢 20 秒和"完全放不了"对用户的差别很大，尤其是孩子已经坐在那儿等了。
+ */
+function fallbackToWebAudio() {
+  if (nativeBroken.value) return
+  nativeBroken.value = true
+  nativeCmd({ cmd: 'stop' })
+  // 交给 <audio>：它挂上之后会在 loadedmetadata 里按 pendingSeek 定位并自动播
+  pendingSeek = current.value > 0 ? current.value : 0
+  isPlaying.value = false
+  error.value = ''
+  if (!info.value.url) {
+    // 连转码地址都没有：这条确实放不了，别再转圈
+    error.value = '这段音频暂时放不了'
   }
 }
 

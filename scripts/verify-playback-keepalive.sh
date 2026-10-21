@@ -111,6 +111,35 @@ if grep -aq 'org/videolan/libvlc/LibVLC' "$WORK"/classes*.dex; then
 else
 	bad "dex 里没有 libvlc 的类引用 —— 页面调 nativeAudio 也没人接"
 fi
+if [ "$(count '引擎起不来')" -ge 1 ]; then
+	ok "引擎崩了也有兜底（runCatching + 诊断），页面会退回转码地址"
+else
+	bad "找不到「引擎起不来」兜底 —— native 抛 Error 时会把前台服务一起带走"
+fi
+
+# ---- 4b. libVLC 的 JNI 回调不能被 R8 动 ----
+#
+# 2026-10-21 的真实故障：`libvlc-all` 的 aar **没有自带 proguard 规则**
+# （解包确认只有 classes.jar / jni / R.txt），R8 于是把这些"只被 native
+# 调用"的成员当死代码 —— `VLCObject.dispatchEventFromNative` 被删、
+# `onReleaseNative` 被改名成 `b`。libvlcjni.so 用 GetMethodID 按**名字**
+# 回查，第一次收到 VLC 事件就拿到 null 句柄 → native abort。
+#
+# 现象不是"没声音"，是**点开 wma 客户端直接退出**：构建全绿、安装正常、
+# 页面也确实调进了 nativeAudio，然后进程没了。
+#
+# 断言用 dex 而不是 mapping：`-keep` 生效之后 R8 反而不在 mapping 里列
+# 这些方法（mapping 只记"被改名/被裁剪"的条目），拿 mapping 断言会假红。
+# 这三个名字在我们自己的源码里**一个都没有**，所以 dex 里出现只可能来自
+# libvlc 的类，不会因为注释之类的巧合而误判。
+for m in dispatchEventFromNative onReleaseNative onEventNative \
+         createAudioTrackFromNative createTitleFromNative; do
+	if grep -aq "$m" "$WORK"/classes*.dex; then
+		ok "libVLC 的 JNI 回调 $m 名字没被 R8 动"
+	else
+		bad "$m 在 dex 里没了 —— 点开 wma 必闪退（proguard 缺 -keep class org.videolan.**）"
+	fi
+done
 
 # ---- 5. 清单（AXML，字符串是 UTF-16LE）----
 #

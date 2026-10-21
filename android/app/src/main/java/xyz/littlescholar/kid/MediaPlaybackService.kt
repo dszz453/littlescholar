@@ -429,7 +429,11 @@ class MediaPlaybackService : Service() {
                 handoffMode = false
                 handoffPreparing = false
                 Diagnostics.add("原生播放", "VLC 加载：${url.take(80)}")
-                engine().play(url, state.position * 1000L)
+                // ⚠️ 必须接住 Throwable：libvlcjni 的 JNI 注册失败抛的是
+                // UnsatisfiedLinkError（Error 不是 Exception），裸调用会把
+                // 前台服务一起带走 —— 用户看到的就是"点开 wma 客户端直接退出"。
+                runCatching { engine().play(url, state.position * 1000L) }
+                    .onFailure { onEngineBroken(it) }
             }
             "pause" -> {
                 engine().pause()
@@ -452,6 +456,25 @@ class MediaPlaybackService : Service() {
 
     private fun engine(): VlcAudioEngine =
         vlc ?: VlcAudioEngine(applicationContext) { st -> onNativeState(st) }.also { vlc = it }
+
+    /**
+     * 原生引擎起不来（JNI 注册失败 / so 加载失败 / 解码器缺失）。
+     *
+     * 真正该挡住它的是 proguard 里的 `-keep class org.videolan.**`；这里是
+     * 兜底，只为保证**最坏情况也不闪退**：留一条诊断、把引擎丢掉，并推一个
+     * error 给页面 —— 页面收到就退回 `info.url`（服务端转码地址）。
+     * 慢一点，但一定出得来声。
+     */
+    private fun onEngineBroken(e: Throwable) {
+        Diagnostics.add(
+            "原生播放",
+            "引擎起不来：${e.javaClass.simpleName}: ${e.message}",
+        )
+        nativeMode = false
+        runCatching { vlc?.release() }
+        vlc = null
+        MediaBridge.nativeState(false, 0.0, 0.0, false, "NATIVE_UNAVAILABLE")
+    }
 
     /**
      * VLC 的状态回调（已切到主线程）。

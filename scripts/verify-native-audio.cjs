@@ -350,6 +350,38 @@ async function waitFor(cdp, expr, ms) {
       bad(`切后台仍调了 ${afterHide} 次 takeOver —— 会再起一个 MediaPlayer，可能双声道`)
     }
 
+    // ---------------- 引擎失败：必须自动退回转码地址 ----------------
+    //
+    // 1.7.1 的闪退根因在 R8（libVLC 的 JNI 回调被删/改名），壳侧已经修了。
+    // 但页面还得有一道兜底：万一某个机型上引擎真的起不来，
+    // 用户应该看到「慢一点但能听」，而不是永远转圈。
+    //
+    // 这里直接向页面推一个 error 状态（壳里起不来时就是这么推的），
+    // 看页面是否把 <audio> 重新挂回来、且 src 指向转码地址。
+    console.log('\n[1b] 引擎失败时的兜底')
+    await cdp.eval(`window.__lsNative.onState({playing:false,position:30.0,duration:217.0,ended:false,error:'NATIVE_UNAVAILABLE'})`)
+    await sleep(900)
+    const fb = await cdp.json(`(() => {
+      var a = document.querySelector('audio')
+      return {
+        count: document.querySelectorAll('audio').length,
+        src: a ? (a.getAttribute('src') || '') : '',
+        last: (window.__nativeLog || []).filter(e => e.kind === 'nativeAudio')
+                .map(e => { try { return JSON.parse(e.data).cmd } catch (x) { return '?' } })
+                .pop() || ''
+      }
+    })()`)
+    if (fb.count >= 1 && /\/api\/(audio|stream)\//.test(fb.src)) {
+      ok('引擎报错后页面自动回到 <audio>，地址是转码链接')
+    } else {
+      bad(`引擎报错后没回到网页播放（audio=${fb.count}, src=${fb.src.slice(0, 80)}）—— 用户会永远转圈`)
+    }
+    if (fb.last === 'stop') {
+      ok('退回之前先发了 stop（不会两路同时出声）')
+    } else {
+      bad(`退回前的最后一条指令是 ${fb.last || '空'}，应该是 stop`)
+    }
+
     // ---------------- 对照：能直放的音频不许走原生 ----------------
     console.log(`\n[2] 对照：mp3 资源 ${MP3_ID}（应留在网页里播）`)
     await cdp.eval(`location.href = ${JSON.stringify(SITE + '/play/' + MP3_ID)}`)

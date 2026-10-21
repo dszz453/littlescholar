@@ -34,6 +34,12 @@ import "fmt"
 //
 // 版本历史（倒序，最近的在上）：
 //
+//	1.19.0 孩子端：原生引擎起不来时**自动退回转码地址**。
+//	       1.6.0/1.7.0 的闪退根因在 R8：libVLC 的 aar 不带 proguard 规则，
+//	       `VLCObject.dispatchEventFromNative` 被删、`onReleaseNative` 被改名，
+//	       JNI 按名字回查拿到 null 句柄 → native abort。壳侧已修（1.7.1），
+//	       这一版再加一道：页面收到 error 就切回 `<audio>` 播转码地址 ——
+//	       最坏情况也比"点一下 App 就没了"好。
 //	1.18.0 修原生播放模式下切后台会"多出一条声轨"：页面原本在原生模式里
 //	       仍然判定"可以交接"，把 `nativeUrl`（原文件 wma）交给壳的 MediaPlayer。
 //	       支持 wma 的机型上会与 VLC **同时出声**；不支持的机型则 prepare 直接
@@ -93,7 +99,7 @@ import "fmt"
 //	1.8.0  版本号终于变成真值：后台「系统状态」不再硬编码 1.0.0，
 //	       /api/health 也回带版本与构建信息
 //	1.0.0  项目初始版本（此前的 1.0.0 是硬编码，不代表任何一次改动）
-var Version = "1.18.0"
+var Version = "1.19.0"
 
 // Commit 构建时的 git 提交全哈希。可空 —— 本地 `go run` 就没有。
 var Commit = ""
