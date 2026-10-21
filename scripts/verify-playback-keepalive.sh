@@ -80,7 +80,39 @@ else
 	bad "找不到 littlescholar:wifi —— 息屏几分钟后 WLAN 进省电模式，取流会超时"
 fi
 
-# ---- 4. 清单（AXML，字符串是 UTF-16LE）----
+# ---- 4. 原生音频（wma）这条链真的在包里 ----
+#
+# wma 这类格式 WebView 解不了，只能由壳里的 libVLC 播。三处失效都是静默的：
+#   · libvlc.so 没打进包 → 点开 wma 没声音（构建照样绿）；
+#   · 没有 nativeAudio 桥 → 页面永远走不到原生模式，退回服务端转码
+#     （一本绘本等 20 秒以上，接口却完全正常）；
+#   · 原生模式下仍允许"后台接管" → 页面把原文件交给 MediaPlayer，
+#     支持 wma 的机型会与 VLC **同时出声**。
+#
+# 第三条的指纹取那句诊断文案：它只在"原生模式拒绝接管"这条分支里出现，
+# 文案本身也是家长看诊断页时"为什么没接管"的唯一线索。
+if unzip -l "$APK" | awk '{print $4}' | grep -qx 'lib/arm64-v8a/libvlc.so'; then
+	ok "lib/arm64-v8a/libvlc.so 已打进 APK（原生解码 wma 靠它）"
+else
+	bad "lib/arm64-v8a/libvlc.so 缺失 —— wma 会没声音（libvlc 依赖没进包）"
+fi
+if [ "$(count nativeAudio)" -ge 1 ]; then
+	ok "桥上有 nativeAudio（页面据此切到原生模式）"
+else
+	bad "dex 里没有 nativeAudio —— 页面永远走不到原生模式，wma 只能等服务端转码"
+fi
+if [ "$(count '原生模式不需要接管')" -ge 1 ]; then
+	ok "原生模式下拒绝后台接管（不会与 VLC 抢出声）"
+else
+	bad "找不到「原生模式不需要接管」—— takeOver 没有拦 nativeMode，切后台可能双声道"
+fi
+if grep -aq 'org/videolan/libvlc/LibVLC' "$WORK"/classes*.dex; then
+	ok "VlcAudioEngine 真的进包了（dex 引用了 org/videolan/libvlc/LibVLC）"
+else
+	bad "dex 里没有 libvlc 的类引用 —— 页面调 nativeAudio 也没人接"
+fi
+
+# ---- 5. 清单（AXML，字符串是 UTF-16LE）----
 #
 # ⚠️ 直接 `grep 'WAKE_LOCK'` 在 AXML 上**恒不命中**（每个 ASCII 字符后面跟着
 #    一个 0 字节），看起来像"权限被删了"。必须先 `tr -d '\000'` 再比。

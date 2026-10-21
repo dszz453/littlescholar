@@ -210,6 +210,8 @@ class MediaPlaybackService : Service() {
         fun takeOverFromState(): Boolean {
             val s = instance ?: return false
             if (s.handingOffNow) return true
+            // 原生引擎已经在播了 —— 这时候"接管"只会凭空多出一个 MediaPlayer。
+            if (s.nativeMode) return true
             val st = s.lastPlaying ?: return false
             if (System.currentTimeMillis() - s.lastPlayingAt > 60_000L) return false
             if (st.paused) return false
@@ -508,6 +510,19 @@ class MediaPlaybackService : Service() {
      */
     fun takeOver(st: MediaState) {
         if (handoffMode || handoffPreparing) return
+        // 原生模式**不能被接管**：播放器已经是常驻的 VLC，再起一个 MediaPlayer
+        // 拉同一个地址就是两条声轨（支持 wma 的机型上会真的同时出声），
+        // 不支持 wma 的机型则 prepare 直接失败、面板闪一下又退回暂停。
+        //
+        // 页面侧 1.18.0 起已经在 `canHandoff()` 里挡了这一下，这里再挡一次是
+        // **纵深防御**：设备上可能还跑着 Service Worker 预缓存下来的旧 chunk，
+        // 那段时间里页面仍然是"会交出去"的旧逻辑。
+        if (nativeMode) {
+            // 留一条诊断：真机上"为什么切后台没接管"只看日志是猜不出来的，
+            // 而这一条恰恰是**正常**行为。
+            Diagnostics.add("接管", "原生模式不需要接管（播放器在服务里）")
+            return
+        }
         if (st.url.isBlank() || !st.playing) return
         if (st.url.startsWith("blob:", true) || st.url.startsWith("data:", true)) {
             Diagnostics.add("接管", "blob/data 地址无法交给原生，保持网页播放")
