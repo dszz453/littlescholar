@@ -2186,6 +2186,13 @@ function absoluteURL(u) {
 function canHandoff() {
   const bridge = nativeBridge()
   if (!bridge || typeof bridge.takeOver !== 'function') return false
+  // 原生模式自己就是"常驻播放器"，**不存在交接**这回事。
+  //
+  // 不拦这一下的后果不是"多此一举"，而是两种真故障：页面此刻没有 <audio>，
+  // takeOverAck 里的 el 为 null，交接确认不会把声音让出来 → 支持 wma 的机型上
+  // VLC 与 MediaPlayer 会**同时出声**；不支持 wma 的机型则 prepare 直接报错，
+  // 面板闪一下"播放中"再退回暂停，看着像后台播放坏了。
+  if (nativeAudioMode.value) return false
   if (!isVideo.value && !isAudio.value) return false
   if (offlinePlay.value) return false
   if (!isPlaying.value) return false

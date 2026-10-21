@@ -12,6 +12,24 @@ import { fileURLToPath, URL } from 'node:url'
 // 没法靠 import 打包成 chunk。所以构建前从 pdfjs-dist 拷进 public/，由 vite 原样搬到 dist。
 //
 // 不进版本库（1.5MB / 185 个文件，纯噪音），每次构建现拷一份。
+// ⚠️ 这里**不能**用 `fs.cpSync(src, dst, {recursive:true})`。
+//
+// 本机 node 22.22.2 上它会让进程直接消失（Windows 退出码 `0xC0000409`
+// STATUS_STACK_BUFFER_OVERRUN），而 `vite build` 的表现是：打完
+// `vite v6.4.4 building for production...` 就**一声不响地退出、rc=127、
+// 不打印任何错误**，也从来不生成 dist —— 极像"配置写错了"或"内存不够"，
+// 实测单独跑同一句 cpSync 一样崩（所以是它，不是 vite）。
+// 换成手写递归拷贝即可，行为完全一样。
+function copyDir(src, dst) {
+  fs.mkdirSync(dst, { recursive: true })
+  for (const e of fs.readdirSync(src, { withFileTypes: true })) {
+    const s = src + '/' + e.name
+    const d = dst + '/' + e.name
+    if (e.isDirectory()) copyDir(s, d)
+    else fs.copyFileSync(s, d)
+  }
+}
+
 function pdfjsStaticAssets() {
   return {
     name: 'copy-pdfjs-static-assets',
@@ -20,8 +38,7 @@ function pdfjsStaticAssets() {
         const src = fileURLToPath(new URL(`./node_modules/pdfjs-dist/${name}`, import.meta.url))
         const dst = fileURLToPath(new URL(`./public/${name}`, import.meta.url))
         if (!fs.existsSync(src)) continue
-        fs.mkdirSync(dst, { recursive: true })
-        fs.cpSync(src, dst, { recursive: true })
+        copyDir(src, dst)
       }
     },
   }
