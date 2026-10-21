@@ -111,8 +111,6 @@ func AllModels() []interface{} {
 		&StudyAward{},
 		&KnowledgeDigest{},
 		&ResourceSubtitle{},
-		&AISubtitleTask{},
-		&AISubtitlePlan{},
 		&AIConfig{},
 		&AIReport{},
 		&AIChatSession{},

@@ -4,54 +4,46 @@
       <h2 class="page-title">AI 配置</h2>
     </div>
 
-    <el-tabs v-model="tab" class="ai-tabs">
-      <el-tab-pane label="接口配置" name="configs">
-        <div class="row-between mb-16">
-          <el-alert type="info" :closable="false" class="flex-1">
-            兼容 OpenAI Chat Completions 协议，支持 OpenAI、DeepSeek、通义千问、月之暗面、Ollama 及任意兼容服务。
-            密钥会加密存储。
-          </el-alert>
-          <el-button type="primary" :icon="Plus" @click="openDialog()">新增配置</el-button>
-        </div>
+    <div class="row-between mb-16">
+      <el-alert type="info" :closable="false" class="flex-1">
+        兼容 OpenAI Chat Completions 协议，支持 OpenAI、DeepSeek、通义千问、月之暗面、Ollama 及任意兼容服务。
+        密钥会加密存储。
+      </el-alert>
+      <el-button type="primary" :icon="Plus" @click="openDialog()">新增配置</el-button>
+    </div>
 
-        <el-row :gutter="16">
-          <el-col :span="8" v-for="cfg in configs" :key="cfg.id">
-            <div class="card-box ai-card" :class="{ default: cfg.isDefault }">
-              <div class="ai-header">
-                <div>
-                  <div class="ai-name">
-                    {{ cfg.name }}
-                    <el-tag v-if="cfg.isDefault" size="small" type="warning">默认</el-tag>
-                  </div>
-                  <div class="text-secondary">{{ cfg.provider }}</div>
-                </div>
-                <el-tag :type="statusType(cfg.status)" size="small">{{ statusText(cfg.status) }}</el-tag>
+    <el-row :gutter="16">
+      <el-col :span="8" v-for="cfg in configs" :key="cfg.id">
+        <div class="card-box ai-card" :class="{ default: cfg.isDefault }">
+          <div class="ai-header">
+            <div>
+              <div class="ai-name">
+                {{ cfg.name }}
+                <el-tag v-if="cfg.isDefault" size="small" type="warning">默认</el-tag>
               </div>
-
-              <el-descriptions :column="1" size="small" class="mt-16">
-                <el-descriptions-item label="接口地址">{{ cfg.baseUrl }}</el-descriptions-item>
-                <el-descriptions-item label="模型">{{ cfg.model }}</el-descriptions-item>
-                <el-descriptions-item label="密钥">{{ cfg.apiKeyMasked || '未设置' }}</el-descriptions-item>
-                <el-descriptions-item label="温度">{{ cfg.temperature }}</el-descriptions-item>
-                <el-descriptions-item label="最大 Token">{{ cfg.maxTokens }}</el-descriptions-item>
-              </el-descriptions>
-
-              <div class="ai-actions">
-                <el-button link type="primary" size="small" @click="test(cfg)">测试连接</el-button>
-                <el-button link type="primary" size="small" @click="openDialog(cfg)">编辑</el-button>
-                <el-button link type="danger" size="small" @click="remove(cfg)">删除</el-button>
-              </div>
+              <div class="text-secondary">{{ cfg.provider }}</div>
             </div>
-          </el-col>
-        </el-row>
+            <el-tag :type="statusType(cfg.status)" size="small">{{ statusText(cfg.status) }}</el-tag>
+          </div>
 
-        <el-empty v-if="!configs.length" description="还没有配置 AI 接口，AI 学情分析和智能体问答依赖此配置" />
-      </el-tab-pane>
+          <el-descriptions :column="1" size="small" class="mt-16">
+            <el-descriptions-item label="接口地址">{{ cfg.baseUrl }}</el-descriptions-item>
+            <el-descriptions-item label="模型">{{ cfg.model }}</el-descriptions-item>
+            <el-descriptions-item label="密钥">{{ cfg.apiKeyMasked || '未设置' }}</el-descriptions-item>
+            <el-descriptions-item label="温度">{{ cfg.temperature }}</el-descriptions-item>
+            <el-descriptions-item label="最大 Token">{{ cfg.maxTokens }}</el-descriptions-item>
+          </el-descriptions>
 
-      <el-tab-pane label="批量字幕" name="subtitles">
-        <AISubtitlePlanner />
-      </el-tab-pane>
-    </el-tabs>
+          <div class="ai-actions">
+            <el-button link type="primary" size="small" @click="test(cfg)">测试连接</el-button>
+            <el-button link type="primary" size="small" @click="openDialog(cfg)">编辑</el-button>
+            <el-button link type="danger" size="small" @click="remove(cfg)">删除</el-button>
+          </div>
+        </div>
+      </el-col>
+    </el-row>
+
+    <el-empty v-if="!configs.length" description="还没有配置 AI 接口，AI 学情分析和智能体问答依赖此配置" />
 
     <el-dialog v-model="dialogVisible" :title="editing ? '编辑 AI 配置' : '新增 AI 配置'" width="580px">
       <el-form :model="form" label-width="110px">
@@ -108,10 +100,6 @@ import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import { aiApi } from '@/api'
-import AISubtitlePlanner from '@/components/AISubtitlePlanner.vue'
-
-// 两个页签：接口配置（原有）+ 批量字幕（让模型按标题/目录复原原文并生成中英对照）
-const tab = ref('configs')
 
 const configs = ref([])
 const dialogVisible = ref(false)
@@ -256,10 +244,6 @@ onMounted(load)
 </script>
 
 <style scoped>
-.ai-tabs {
-  margin-top: 4px;
-}
-
 .row-between {
   display: flex;
   align-items: center;

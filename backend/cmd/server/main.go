@@ -301,13 +301,6 @@ func main() {
 		rdeps.SubtitleCollector.Start(6 * time.Hour)
 	}
 
-	// 8.0.1 AI 批量写字幕：每分钟看一眼计划时段（见 AISubtitleService.Tick）。
-	// 不用固定周期：时段/开关改了要立刻生效，重启服务才能生效的配置
-	// 会让人以为"没做"。
-	if rdeps.AISubtitle != nil {
-		rdeps.AISubtitle.Start()
-	}
-
 	// 8.1 每周 AI 奖状
 	//
 	// 每天扫一次：打卡在任意时刻发生，每天检查能保证"本周达标"最迟第二天

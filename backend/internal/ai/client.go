@@ -97,21 +97,6 @@ func (c *Client) Model() string {
 	return c.model
 }
 
-// WithTimeout 返回一个超时不同的副本。
-//
-// 用于"这一类任务就是慢"的场景：批量写字幕要把一整本绘本的原文吐成 JSON，
-// 慢模型 60 秒（配置默认）经常不够，线上就撞过
-// `context deadline exceeded (Client.Timeout exceeded while awaiting headers)`。
-// 不改原实例：同一个 AI 配置还要服务聊天这类短请求，长超时会把它们拖死。
-func (c *Client) WithTimeout(d time.Duration) *Client {
-	if c == nil || d <= 0 {
-		return c
-	}
-	cp := *c
-	cp.http = service.NewHTTPDoer(d)
-	return &cp
-}
-
 // Chat 发起对话
 func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	reqBody := chatRequest{
