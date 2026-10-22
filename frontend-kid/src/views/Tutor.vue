@@ -366,7 +366,7 @@ onMounted(() => {
      否则底部会出现两倍安全区的空白。 */
   padding: 10px 16px;
   background: rgba(255, 255, 255, 0.96);
-  backdrop-filter: blur(12px);
+
   border-top: 1px solid var(--c-border);
 }
 .input-wrap {

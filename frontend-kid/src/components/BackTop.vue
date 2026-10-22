@@ -51,8 +51,7 @@ onUnmounted(() => window.removeEventListener('scroll', onScroll))
   height: 42px;
   border: 0;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.94);
-  backdrop-filter: blur(8px);
+  background: rgba(255, 255, 255, 0.96);
   box-shadow: var(--shadow-md);
   color: var(--c-primary);
   font-size: 20px;

@@ -2800,8 +2800,7 @@ watch(isPlaying, (v) => {
   gap: 10px;
   padding: calc(10px + var(--safe-top)) 12px 10px;
   background: rgba(247, 249, 252, 0.92);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+
   border-bottom: 1px solid var(--c-border);
 }
 .back,

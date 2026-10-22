@@ -51,8 +51,11 @@ function go(item) {
   bottom: 0;
   z-index: 100;
   display: flex;
-  background: rgba(255, 255, 255, 0.96);
-  backdrop-filter: blur(12px);
+  /* 不加 backdrop-filter：它在每页底部固定着，而 WebView 每帧都要把
+     背后的内容读回来做模糊 —— 滚动/切页时这是最贵的一笔开销，
+     低端机上直接表现成"点开菜单一顿一顿"。
+     底色本来就 0.96 不透明，去掉之后肉眼几乎看不出差别。 */
+  background: rgba(255, 255, 255, 0.97);
   border-top: 1px solid var(--c-border);
   padding-bottom: var(--safe-bottom);
 }
