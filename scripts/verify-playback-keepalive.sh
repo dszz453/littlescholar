@@ -141,6 +141,37 @@ for m in dispatchEventFromNative onReleaseNative onEventNative \
 	fi
 done
 
+# ---- 4c. 播放所有权：不能再出现"幽灵播放器"与"退出还在播" ----
+#
+# 2026-10-22 的三个真故障，全都在**产物**层面就能拦住：
+#
+#   · prepareAsync 的回调没校验身份 → 切后台又立刻回来时，一个已经
+#     release 掉的播放器回调照样 ack，网页被静音暂停，幽灵播放器开始出声
+#     （"播放中自己暂停"）；
+#   · 页面报 active=false（离开播放页 / 退出）时没人释放接管播放器，
+#     isHandingOff 又让服务无限续命（"退出之后还在播放"）；
+#   · 没有 onTaskRemoved → 划掉任务卡片之后 Activity 死了、服务还活着。
+if [ "$(count '丢弃过期的准备回调')" -ge 1 ]; then
+	ok "接管回调校验了批次号（迟到的 prepare 不会再暂停网页）"
+else
+	bad "找不到「丢弃过期的准备回调」—— giveBack 之后迟到的 onPrepared 会把网页静音暂停"
+fi
+if [ "$(count '页面已离开')" -ge 1 ]; then
+	ok "页面离开后有收尾计时器（不会一直续命）"
+else
+	bad "找不到「页面已离开」—— 页面退出后接管播放器没人释放，声音会一直响"
+fi
+if [ "$(count '任务被划掉')" -ge 1 ]; then
+	ok "划掉任务卡片会停播（onTaskRemoved）"
+else
+	bad "找不到「任务被划掉」—— 划掉卡片后服务存活，声音继续响"
+fi
+if [ "$(count '来源=')" -ge 1 ]; then
+	ok "暂停指令会记录来源（诊断页能回答"是谁按的暂停"）"
+else
+	bad "找不到「来源=」—— 再出现"自己暂停"时无从定位是哪条链路发的指令"
+fi
+
 # ---- 5. 清单（AXML，字符串是 UTF-16LE）----
 #
 # ⚠️ 直接 `grep 'WAKE_LOCK'` 在 AXML 上**恒不命中**（每个 ASCII 字符后面跟着

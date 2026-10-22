@@ -779,6 +779,14 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         webView.onResume()
+        // 回到前台**一定**把播放还回去。
+        //
+        // 不能只依赖网页的 visibilitychange：WebView 里这个事件报不报、
+        // 什么时候报，各家内核都不一样。一旦没报，后台接管的那一路停了，
+        // 网页却还停在"被静音 + 暂停"的状态 —— 用户看到的就是
+        // "切出去再回来，它自己暂停了，按播放也没声"。这里的 giveBack
+        // 是幂等的（没有接管时直接返回）。
+        runCatching { MediaPlaybackService.giveBack() }
     }
 
     override fun onDestroy() {
@@ -787,6 +795,14 @@ class MainActivity : AppCompatActivity() {
         // 而它在宽限期到点时还会去碰已经没了的 Activity。
         playbackHandler.removeCallbacks(stopPlayback)
         MediaBridge.detach()
+        // **真正退出**（返回键退出 / 划掉任务）时把声音一起收掉。
+        //
+        // 只认 isFinishing：配置变化（旋转、深色模式切换）也会走到 onDestroy，
+        // 那种情况不能把正在响的东西掐掉。服务的 onTaskRemoved 是第二道兜底
+        // （有些 ROM 划掉任务时不走 Activity 的 onDestroy）。
+        if (isFinishing) {
+            MediaPlaybackService.stop(this)
+        }
         webView.destroy()
         super.onDestroy()
     }

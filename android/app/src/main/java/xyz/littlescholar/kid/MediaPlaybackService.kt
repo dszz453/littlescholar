@@ -13,7 +13,9 @@ import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.support.v4.media.MediaMetadataCompat
@@ -232,6 +234,9 @@ class MediaPlaybackService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
+    /** 主线程 Handler：页面离开计时要在这里排，才能和 stopSelf 有序。 */
+    private val main = Handler(Looper.getMainLooper())
+
     private var session: MediaSessionCompat? = null
     internal var state: MediaState = MediaState()
         private set
@@ -248,6 +253,38 @@ class MediaPlaybackService : Service() {
     private var player: MediaPlayer? = null
     private var handoffMode = false
     private var handoffPreparing = false
+
+    /**
+     * 接管批次号。
+     *
+     * ============ ⚠️ 为什么必须有它（2026-10-22 的真故障） ============
+     *
+     * `prepareAsync()` 是异步的，而"切后台→马上切回来"在真机上非常常见
+     * （看一眼通知、锁屏又解锁、误触 Home）。原来的代码里：
+     *
+     *   onStop  → takeOver() → prepareAsync()     // 还没准备好
+     *   onResume→ giveBack() → releasePlayer()    // 把播放器 release 了
+     *   ……然后 prepare 回调照样会来……
+     *   onPrepared → handoffMode = true + MediaBridge.takeOverAck()
+     *                → 网页被静音并 pause，同时一个"幽灵播放器"开始出声
+     *
+     * 用户看到的就是**"正播着突然自己暂停了"**，而且按播放键也没用
+     * （页面被 mute 了）。更糟的是这个幽灵播放器没人释放，
+     * 退出 App 之后声音还在响 —— 正是"退出之后还在播放"。
+     *
+     * 所以每次 takeOver/giveBack 都让批次号 +1，回调里对不上就直接丢弃。
+     */
+    private var handoffToken = 0
+
+    /**
+     * 页面明确说"我不在播了"之后，多久真正收摊。
+     *
+     * 为什么要等：切集时页面会先 cleanupMedia（发 active=false）再 load
+     * 下一集，中间有 1~3 秒空窗；立刻停会把下一集的服务一起停掉。
+     * 但也不能像以前那样"只要还在接管就无限续命" ——
+     * 那样孩子退出播放页、退出 App 之后声音会一直响下去。
+     */
+    private var leaveStop: Runnable? = null
 
     /**
      * 原生解码引擎（libVLC）。**只有 nativeMode 为 true 时它才是"当前真正在播的那个"**。
@@ -274,11 +311,10 @@ class MediaPlaybackService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                // 页面主动要求收工：先把位置交还（页面可能还活着，要落进度），
+                // 再把三路声音全部停掉 —— 少停一路就是"退出后还在响"。
                 giveBack()
-                releaseLocks()
-                session?.isActive = false
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                shutdownPlayback("收到 STOP")
                 return START_NOT_STICKY
             }
             ACTION_PREV -> {
@@ -304,7 +340,7 @@ class MediaPlaybackService : Service() {
                 return START_STICKY
             }
             ACTION_PAUSE -> {
-                doPause()
+                doPause("通知栏")
                 return START_STICKY
             }
             else -> {
@@ -346,7 +382,15 @@ class MediaPlaybackService : Service() {
         MediaBridge.play()
     }
 
-    private fun doPause() {
+    /**
+     * 暂停。
+     *
+     * [from] 只用于诊断：孩子说"它自己停了"时，第一件要回答的事就是
+     * "这条暂停指令到底是谁发的" —— 用户按的、通知栏、耳机/蓝牙、
+     * 系统媒体面板，还是页面自己。以前这些来源在日志里长得一模一样。
+     */
+    private fun doPause(from: String = "未知") {
+        Diagnostics.add("暂停", "来源=$from")
         if (handoffMode) {
             runCatching { player?.pause() }
             markPlaying(false)
@@ -524,6 +568,58 @@ class MediaPlaybackService : Service() {
         stopSelf()
     }
 
+    // ============================================================
+    //  页面离开 / 任务被划掉：必须有人收尾
+    // ============================================================
+
+    /**
+     * 页面报"不在播"之后多久真正停。
+     *
+     * 只用来覆盖"切集"那段空窗（页面 cleanup → router.replace → 新一集 play，
+     * 实测 1~3 秒）。以前没有这个计时器，只要处于接管态就无限续命 ——
+     * 孩子退出播放页、甚至退出 App 之后，声音还在响。
+     */
+    private val leaveGraceMs = 12_000L
+
+    private fun scheduleLeaveStop() {
+        if (leaveStop != null) return
+        val r = Runnable {
+            leaveStop = null
+            shutdownPlayback("页面已离开 ${leaveGraceMs / 1000} 秒")
+        }
+        leaveStop = r
+        main.postDelayed(r, leaveGraceMs)
+    }
+
+    private fun cancelLeaveStop() {
+        leaveStop?.let { main.removeCallbacks(it) }
+        leaveStop = null
+    }
+
+    /**
+     * 收摊：停掉**所有**可能出声的东西，然后收掉前台服务。
+     *
+     * 三路都要停 —— 少停一路就是"退出后还在响"：
+     *   · [player]  后台接管用的 MediaPlayer（mp4/mp3）
+     *   · [vlc]     原生引擎（wma/ape）
+     *   · 前台服务本身 + 唤醒锁 + 媒体面板
+     */
+    private fun shutdownPlayback(reason: String) {
+        Diagnostics.add("播放", "收工：$reason")
+        cancelLeaveStop()
+        runCatching { releasePlayer() }
+        nativeMode = false
+        handoffMode = false
+        handoffPreparing = false
+        runCatching { vlc?.stop() }
+        releaseLocks()
+        session?.isActive = false
+        if (running) {
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        }
+        stopSelf()
+    }
+
     /**
      * 接管：用原生播放器接着播网页正在播的那个地址。
      *
@@ -560,6 +656,7 @@ class MediaPlaybackService : Service() {
         }
         state = st
         handoffPreparing = true
+        val token = ++handoffToken
         Diagnostics.add("接管", "后台接管播放：${st.url.take(80)} @ ${st.position}s")
         try {
             val p = MediaPlayer()
@@ -576,6 +673,15 @@ class MediaPlaybackService : Service() {
             p.setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
             p.setDataSource(st.url)
             p.setOnPreparedListener { mp ->
+                // ⚠️ 批次号/身份对不上 = 这次接管已经被取消了（页面已交还、
+                // 或已经换了另一条资源）。此时**什么都不能做**：
+                // 一旦继续 ack，网页会被静音暂停，而这个播放器没人管 ——
+                // 用户看到"自己停了"，退出后声音还在。见 handoffToken 的注释。
+                if (token != handoffToken || !handoffPreparing) {
+                    Diagnostics.add("接管", "丢弃过期的准备回调（已交还或已换源）")
+                    runCatching { mp.release() }
+                    return@setOnPreparedListener
+                }
                 handoffPreparing = false
                 handoffMode = true
                 player = mp
@@ -620,6 +726,8 @@ class MediaPlaybackService : Service() {
     }
 
     private fun releasePlayer() {
+        // 批次号 +1：把在飞的 prepare 回调一次性作废（见 handoffToken）
+        handoffToken++
         handoffMode = false
         handoffPreparing = false
         val p = player
@@ -640,7 +748,7 @@ class MediaPlaybackService : Service() {
             // 这些回调来自**系统**（锁屏、耳机线控、车机、蓝牙）。
             // 播放/暂停按语义分发，**不再用 toggle**（见 doPlay 的注释）。
             override fun onPlay() = doPlay()
-            override fun onPause() = doPause()
+            override fun onPause() = doPause("系统媒体面板")
             override fun onSkipToNext() = MediaBridge.next()
             override fun onSkipToPrevious() = MediaBridge.prev()
             override fun onSeekTo(pos: Long) {
@@ -659,7 +767,7 @@ class MediaPlaybackService : Service() {
                 }
             }
 
-            override fun onStop() = doPause()
+            override fun onStop() = doPause("系统 onStop")
         })
         s.isActive = true
         session = s
@@ -668,6 +776,17 @@ class MediaPlaybackService : Service() {
 
     /** 把最新状态灌进 session（元数据 + 播放状态 + 通知）。 */
     fun applyState(st: MediaState) {
+        // 页面说"我不在播了"（离开播放页、退出 App、切集时的过渡）：
+        // 给一个短宽限，到点还没回来就真的收摊。
+        //
+        // ⚠️ 这段是"退出之后还在播放"的正解：以前只要处于接管态，
+        // maybeStopPlayback 就会一轮一轮续命，页面早就不在了，
+        // 声音还在响，通知栏也一直在。宽限期只该覆盖"切集"那 1~3 秒。
+        if (!st.active) {
+            scheduleLeaveStop()
+        } else {
+            cancelLeaveStop()
+        }
         // 记下"最近一次真的在播"的样子：切后台时如果网页没来得及交接
         // （visibilitychange 没触发、或 JS 已经被冻结），壳里靠它主动接管。
         // 只记在播且地址可用的，避免被"暂停/空地址"的心跳覆盖掉。
@@ -905,9 +1024,24 @@ class MediaPlaybackService : Service() {
         wifiLock = null
     }
 
+    /**
+     * 任务被从"最近任务"里划掉。
+     *
+     * ⚠️ 以前没有这个回调。而 ACTIVITY 的 onDestroy 只管 Activity，
+     * **前台服务不会跟着死** —— 于是"划掉卡片"之后 MediaPlayer/VLC 继续播，
+     * 通知栏还在，声音一直响。用户表述就是"退出了还在播"。
+     * 这是系统给服务的最后一条通知，必须在这里收摊。
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Diagnostics.add("播放", "任务被划掉 → 停止播放")
+        shutdownPlayback("任务被划掉")
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         running = false
         instance = null
+        cancelLeaveStop()
         releasePlayer()
         runCatching { vlc?.release() }
         vlc = null

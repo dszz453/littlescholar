@@ -576,6 +576,34 @@ func (h *StreamHandler) fetchRange(ctx context.Context, link *adapter.DirectLink
 	return data, resp.Header.Get("Content-Type"), nil
 }
 
+// ============ 为什么是"边下边发"而不是"整块读完再发" ============
+//
+// 2026-10-22 之前这里（以及 PRO 的 accelerate 包）是这样的：
+// 每个 4MiB 分块用 io.ReadAll 读满，再按序号写出去。
+//
+// 后果在真机上是**肉眼可见的**：
+//   · 首块 256KiB 写完（约 2 秒画面）之后，客户端要等下一整块 4MiB ——
+//     而单条连接往往被网盘限到 300~600KB/s，也就是 **7~13 秒一个字节都没有**；
+//   · 播放器把缓冲吃干 → 转圈等；等 4 块几乎同时到达，又突然灌进 16MiB。
+//   · 用户看到的就是"打开视频慢"+"播放不流畅"，日志里却一切正常
+//     （每个请求都 200，没有报错）。
+//
+// 所以现在改成：每个分块**一条连接、一次请求**（请求数不变，不会被网盘
+// 判成异常流量），但响应体按 64KiB 读一块就往有序槽位里塞一块，
+// 写协程按序立刻 flush。数据从第一个 64KiB 起就是连续流动的。
+
+// streamBlock 流式转发的粒度。
+//
+// 64KiB 是"够小所以不会憋"与"够大所以不会把 syscall/flush 打爆"的折中：
+// 4K 会让 CPU 花在调度上，1MiB 又退回到"憋一秒"。
+const streamBlock = 64 << 10
+
+// slotBuffer 每个分块槽位的缓冲块数。
+//
+// 内存上限 ≈ 并发数 × slotBuffer × 64KiB = 4 × 8 × 64KiB = 2MiB。
+// 跑得快的连接会被自己的槽位挡住 —— 这就是背压，不需要额外的信号量。
+const slotBuffer = 8
+
 // serveMultiConn 用 n 个并发连接分块拉流。
 //
 // 返回 true 表示已经接管响应（可能已写出数据）；返回 false 表示
@@ -620,96 +648,187 @@ func (h *StreamHandler) serveMultiConn(c *gin.Context, res *model.Resource, link
 		return true
 	}
 
-	type result struct {
-		idx  int
-		data []byte
-		err  error
+	// ============ 流式转发 ============
+	//
+	// 槽位数组：slots[i] 是第 i 块的数据管道（64KiB 一块）。
+	// worker 只管往里写，写满就阻塞（背压）；写协程严格按 1,2,3… 的顺序取。
+	// 关键点：**worker 不能"提前太多"** —— 任务队列容量是 n，
+	// 也就是最多 n 块在飞，不会有 175 个槽位同时占着内存。
+	streamCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	// ⚠️ 必须"先取消再等"：写协程提前返回时，worker 可能正卡在
+	// `out <- piece` 上；不取消，wg.Wait() 会一直等下去（连接挂死）。
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	slots := make([]chan []byte, len(chunks))
+	for i := 1; i < len(slots); i++ {
+		slots[i] = make(chan []byte, slotBuffer)
 	}
 
-	tasks := make(chan adapter.Chunk, n)
-	results := make(chan result, n)
+	var (
+		errMu    sync.Mutex
+		firstErr error
+	)
+	setErr := func(err error) {
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
+		cancel() // 任何一路失败都立刻把其他连接停掉，别再拉没人要的字节
+	}
+	getErr := func() error {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return firstErr
+	}
 
-	var wg sync.WaitGroup
+	tasks := make(chan int, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for ck := range tasks {
-				data, _, err := h.fetchRange(ctx, link, ck)
-				select {
-				case results <- result{idx: ck.Index, data: data, err: err}:
-				case <-ctx.Done():
-					return
+			for idx := range tasks {
+				if err := h.pumpChunk(streamCtx, link, chunks[idx], slots[idx]); err != nil {
+					setErr(err)
 				}
 			}
 		}()
 	}
-	// 收尾：先关任务队列让 worker 退出，再等它们结束。
-	// 顺序反了会 panic（向已关闭 channel 发送）。
-	defer func() {
-		close(tasks)
-		wg.Wait()
-	}()
-
-	inFlight := 0
-	push := func(i int) bool {
-		if i >= len(chunks) {
-			return false
-		}
-		select {
-		case tasks <- chunks[i]:
-			inFlight++
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
-	// 第 0 块已写出，从 1 开始预填窗口
-	sent := 1
-	for i := 1; i < len(chunks) && inFlight < n; i++ {
-		if !push(i) {
-			break
-		}
-		sent = i + 1
-	}
-
-	pending := map[int]result{}
-	for next := 1; next < len(chunks); {
-		res, ok := pending[next]
-		if ok {
-			delete(pending, next)
-			inFlight--
-		} else {
+	go func() {
+		for i := 1; i < len(chunks); i++ {
 			select {
-			case r := <-results:
-				if r.idx != next {
-					// 还没轮到的块先攒着；它仍占着在飞名额。
-					pending[r.idx] = r
-					continue
-				}
-				inFlight--
-				res = r
-			case <-ctx.Done():
-				return true
+			case tasks <- i:
+			case <-streamCtx.Done():
+				close(tasks)
+				return
 			}
 		}
+		close(tasks)
+	}()
 
-		if res.err != nil {
-			// 已经写出一部分，没法再改状态码，只能断开让播放器重试。
-			return true
+	for next := 1; next < len(chunks); next++ {
+		for piece := range slots[next] {
+			if _, err := c.Writer.Write(piece); err != nil {
+				// 客户端断开（拖进度、关页面）—— 正常情况，安静收工
+				cancel()
+				return true
+			}
+			c.Writer.Flush()
 		}
-		if _, err := c.Writer.Write(res.data); err != nil {
+		if err := getErr(); err != nil {
+			// 已经写出一部分字节，改不了状态码了，只能断开让播放器重试。
+			// 这也是"播到一半卡住不动"的真实原因：Content-Length 还在，
+			// 但后面永远不会再有数据 —— 断开比让播放器干等更好。
+			log.Printf("[stream] 分块中断 resource=%d idx=%d: %v", res.ID, next, err)
 			return true
-		}
-		c.Writer.Flush()
-
-		next++
-		if sent < len(chunks) {
-			push(sent)
-			sent++
 		}
 	}
 	return true
+}
+
+// pumpChunk 把一个分块从上游流进槽位。
+//
+// 与原来的 fetchRange（整块 ReadAll）的区别只有一点：**不攒**。
+// 读到 64KiB 就交出去，下游写协程立刻能 flush。
+//
+// 断点续传：body 中途断了（网盘 CDN 常有）就从已经发出去的偏移继续发，
+// 而不是把整块丢掉 —— 丢掉意味着播放器要重开一个请求，用户看到一次卡顿。
+func (h *StreamHandler) pumpChunk(
+	ctx context.Context,
+	link *adapter.DirectLink,
+	ck adapter.Chunk,
+	out chan<- []byte,
+) error {
+	defer close(out)
+
+	pos := ck.Start
+	attempt := 0
+	for pos <= ck.End {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		body, _, err := h.openRange(ctx, link, pos, ck.End)
+		if err != nil {
+			attempt++
+			if attempt > 3 || ctx.Err() != nil {
+				return err
+			}
+			select {
+			case <-time.After(time.Duration(150*(1<<attempt)) * time.Millisecond):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			continue
+		}
+
+		readErr := func() error {
+			defer body.Close()
+			buf := make([]byte, streamBlock)
+			for pos <= ck.End {
+				n := int64(len(buf))
+				if rem := ck.End - pos + 1; rem < n {
+					n = rem
+				}
+				if _, e := io.ReadFull(body, buf[:n]); e != nil {
+					return e
+				}
+				// 必须拷贝：buf 下一轮会被覆盖，而槽位里的数据是异步消费的
+				piece := make([]byte, n)
+				copy(piece, buf[:n])
+				select {
+				case out <- piece:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				pos += n
+			}
+			return nil
+		}()
+
+		if readErr == nil {
+			return nil
+		}
+		// 中断：pos 已经推进到读失败的位置，下一轮从这里续
+		attempt++
+		if attempt > 3 || ctx.Err() != nil {
+			return readErr
+		}
+	}
+	return nil
+}
+
+// openRange 发起一次 Range 请求并返回响应体。
+//
+// 只接受 206：源站回 200 说明它不认 Range，会把整份文件当成这一段塞回来 ——
+// 那既撑爆内存，又会让后面每一个字节的偏移全部错位。
+func (h *StreamHandler) openRange(
+	ctx context.Context,
+	link *adapter.DirectLink,
+	start, end int64,
+) (io.ReadCloser, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link.URL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	for k, v := range link.Headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		_, _ = io.CopyN(io.Discard, resp.Body, 1<<10)
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("源站不支持分块请求（HTTP %d）", resp.StatusCode)
+	}
+	return resp.Body, resp.Header.Get("Content-Type"), nil
 }
 
 // applyAccel 把上游直链改写到外部加速代理。
