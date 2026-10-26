@@ -478,6 +478,16 @@ class MediaPlaybackService : Service() {
                 // 前台服务一起带走 —— 用户看到的就是"点开 wma 客户端直接退出"。
                 runCatching { engine().play(url, state.position * 1000L) }
                     .onFailure { onEngineBroken(it) }
+                // 与 VLC 并行地问一次同一个地址（只取 1KB）。
+                // 3.6.5 的 libVLC 不给日志回调，失败只有一个 EncounteredError，
+                // 分不清"证书不被信任""DNS 卡住""服务端 4xx"——这一问就是答案。
+                probeAsync(url)
+                // 12 秒后把诊断 + VLC 日志尾部回传一次：够 VLC 走完 demux
+                // 与首帧，又不会拖太久。只在真机排障期需要，见 reportDiag。
+                Thread {
+                    runCatching { Thread.sleep(12_000) }
+                    reportDiag("native+12s")
+                }.start()
             }
             "pause" -> {
                 engine().pause()
@@ -518,6 +528,110 @@ class MediaPlaybackService : Service() {
         runCatching { vlc?.release() }
         vlc = null
         MediaBridge.nativeState(false, 0.0, 0.0, false, "NATIVE_UNAVAILABLE")
+    }
+
+    // ============================================================
+    //  旁路探测：同一地址，用 Java 的 TLS 栈取 1KB
+    // ============================================================
+
+    /**
+     * 为什么要它：2026-10-26 标准版点开 wma **完全没有反应** ——
+     * 页面上连通话记录都没有，只有"点了播放没动静"。
+     *
+     * 探针已经证明前端把 `https://…/api/stream/9?t=…` 交给了壳，
+     * 所以问题只可能在壳拉这个地址这一步。而 libVLC 3.6.5 失败时只抛
+     * 一个 `EncounteredError`，不带原因 —— 常见的三种完全不同的病
+     * （系统 CA 里缺根证书、DNS 卡住、票据过期 401）在用户眼里长得一模一样。
+     *
+     * 这里用 **Java 自己的网络栈**（HttpsURLConnection，走 Android 系统
+     * TrustManager）再问一次同一个地址：
+     *   · 探测失败 → 网络/证书层就过不去，与 VLC 解码无关；
+     *   · 探测成功而 VLC 不播 → 问题在 VLC 内部（参数/解码器），
+     *     与 URL 无关。
+     * 两种结论都直接写进诊断，下一次就不用猜了。
+     *
+     * 探测只取 1KB 就断开（Range），对服务端与流量都可忽略。
+     */
+    private val probeExec = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "ls-native-probe").apply { isDaemon = true }
+    }
+
+    private fun probeAsync(url: String) {
+        probeExec.execute {
+            val verdict = runCatching { probeOnce(url) }
+                .getOrElse { "FAIL ${it.javaClass.simpleName}: ${it.message}" }
+            Diagnostics.add("原生播放", "探测 $verdict")
+            // 已经出声了就不打扰；还没出声就立刻让页面降级，
+            // 不用干等 15 秒的看门狗。
+            if (verdict.startsWith("FAIL") && nativeMode && !engine().isPlaying) {
+                onNativeState(
+                    VlcAudioEngine.State(
+                        playing = false,
+                        positionMs = 0,
+                        durationMs = state.duration * 1000L,
+                        ended = false,
+                        error = verdict.take(120),
+                    ),
+                )
+            }
+        }
+    }
+
+    /**
+     * 把诊断（**含 VLC 自己的日志尾部**）回传到服务端，直接从 nginx access log 读。
+     *
+     * 为什么走这条路：家长不会连 USB 抓 logcat；标准版也没有设置页
+     * （诊断面板只有 PRO 有）。那就把"需要用户配合取证"压缩成
+     * "点一次播放" —— 12 秒后自动上传，定位靠
+     * `grep 'LittleScholar-Kid-Diag'`。
+     *
+     * 用 GET + query 而不是 POST：服务端不必为此新增接口，
+     * nginx 本来就会把整个 $request 记进日志。
+     */
+    private fun reportDiag(tag: String) {
+        probeExec.execute {
+            runCatching {
+                val ctx = applicationContext
+                val base = ServerConfig.get(ctx)
+                if (base.isBlank()) return@runCatching
+                val diag = Diagnostics.dump(ctx).takeLast(700)
+                val vlc = runCatching {
+                    val f = java.io.File(ctx.filesDir, "vlc.log")
+                    if (f.exists()) f.readText().takeLast(1500) else "(vlc.log 不存在)"
+                }.getOrDefault("(读取失败)")
+                val msg = "[$tag]\n$diag\n--- vlc.log ---\n$vlc"
+                val enc = java.net.URLEncoder.encode(msg.take(1500), "UTF-8")
+                val conn = (URL(base.trimEnd('/') + "/api/health?kidlog=" + enc)
+                    .openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 8000
+                    readTimeout = 8000
+                    setRequestProperty("User-Agent", "LittleScholar-Kid-Diag")
+                }
+                try {
+                    runCatching { conn.inputStream.close() }
+                } finally {
+                    runCatching { conn.disconnect() }
+                }
+            }
+        }
+    }
+
+    /** 返回 `OK 206 audio/x-ms-wma len=…` 或 `FAIL SSLHandshakeException: …`。 */    private fun probeOnce(url: String): String {
+        val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+            connectTimeout = 8000
+            readTimeout = 8000
+            instanceFollowRedirects = true
+            setRequestProperty("Range", "bytes=0-1023")
+            setRequestProperty("User-Agent", "LittleScholar-Probe/1.0")
+        }
+        try {
+            val code = conn.responseCode
+            val ct = conn.contentType ?: "-"
+            val len = conn.getHeaderField("Content-Length") ?: "-"
+            return if (code in 200..299) "OK $code $ct len=$len" else "FAIL HTTP $code $ct len=$len"
+        } finally {
+            runCatching { conn.disconnect() }
+        }
     }
 
     /**

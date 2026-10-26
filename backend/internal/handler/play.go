@@ -19,18 +19,15 @@ import (
 
 // nativeAudioEnabled 是否在播放信息里给出「原始文件 + 原生解码」这条路。
 //
-// 默认**关闭**。2026-10-26 查实：标准版壳的 libVLC 这条路在真机上是断的 ——
-// 页面按 nativeAudio 切进原生模式后不渲染 `<audio>`，而壳收到指令后连一个
-// 网络请求都不发、也不推错误状态，表现就是"点播放毫无反应"。
+// **默认开启**：客户端用 libVLC 直接解 wma/ape，服务端不转码、不占盘，
+// 点开就出声。之前这条链路在标准版上"没反应"，真因不是它本身 ——
+// 而是 `/api/stream/:id` 既无扩展名、Content-Type 又是
+// application/octet-stream，libVLC 找不到容器线索（见 stream.go 的
+// audioContentType）。MIME 补正之后这条路是通的。
 //
-// 对照 PRO（littlescholar-edge）：它的 playInfo 结构体里没有 nativeAudio /
-// nativeUrl 字段，整体重新序列化时把这两个字段删掉了，页面只能走
-// `<audio>` + /api/audio 转好的 m4a —— 所以 PRO 一直是好的。
-//
-// 也就是说这条"省转码"的优化，代价是**整类格式在标准版上完全播不了**。
-// 转码产物是一次性成本（命中缓存 0.02 秒），不值得拿可用性去换。
-// 真要重新启用（壳修好之后）：KID_NATIVE_AUDIO=1。
-var nativeAudioEnabled = os.Getenv("KID_NATIVE_AUDIO") == "1"
+// 真遇到某台设备 VLC 起不来，运行时设 KID_NATIVE_AUDIO=0 可以让后端
+// 只给转码地址（页面侧会退到 `<audio>` + m4a）。
+var nativeAudioEnabled = os.Getenv("KID_NATIVE_AUDIO") != "0"
 
 // PlayHandler 播放
 //

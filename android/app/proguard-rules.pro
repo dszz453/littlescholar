@@ -1,10 +1,17 @@
-# WebView + JS 接口不需要额外规则；
-# 但开启 minify 后，JS 注入桥接类若将来新增需在此保留。
-
-# 保留 JS 桥（当前无 @JavascriptInterface，占位以防将来添加）
-# -keepclassmembers class xyz.littlescholar.kid.** {
-#     @android.webkit.JavascriptInterface <methods>;
-# }
+# ============ JS 桥必须原样保留 ============
+#
+# `window.KidNative` 由 addJavascriptInterface 挂上，它上面的方法
+# （setPlaying / mediaState / takeOver / nativeAudio / giveBack）
+# **只被 JavaScript 调用** —— 从 R8 的静态分析看没有任何 Java 调用者，
+# 于是 release 包（minifyEnabled=true）里它们会被当死代码删掉或改名。
+#
+# 这条以前是注释着的（当时还没有 @JavascriptInterface），后来加了桥
+# 却忘了打开。这类规则缺了不会编译报错、页面也不会白屏，只会**静默少能力**
+# —— 和 libVLC 那批 JNI 回调被删是同一类坑（那个更狠，直接闪退）。
+-keep class xyz.littlescholar.kid.MainActivity$PlaybackBridge { *; }
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
 
 # Kotlin 元数据
 -keep class kotlin.Metadata { *; }

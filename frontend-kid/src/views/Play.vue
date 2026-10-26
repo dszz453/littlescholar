@@ -774,34 +774,33 @@ function clearNativeStartTimer() {
 }
 
 /**
- * 原生音频（libVLC 解 wma/ape）总开关 —— **默认关闭**。
+ * 原生音频（libVLC 解 wma/ape）总开关 —— **默认开启**。
  *
- * 2026-10-26 查清的因果（对比 PRO 源码 `littlescholar-edge`）：
+ * 2026-10-26 查清的两段因果：
  *
- *   服务端对需要转码的音频同时给两个地址：
- *     · url       = /api/audio/{id}  ← 转好的 m4a，Chromium 直接能播
- *     · nativeUrl = /api/stream/{id} ← 原始 wma，只有 libVLC 能解
+ * 一、为什么标准版曾经"点播放没反应"
+ *   服务端对需转码音频同时给两个地址：`url`（转好的 m4a）与
+ *   `nativeUrl`（原始 wma，给 libVLC）。PRO 的 playInfo 结构体里没有
+ *   nativeAudio/nativeUrl 字段，重新序列化时把两者删掉，所以 PRO 一直走
+ *   `<audio>` + m4a；标准版是原样透传 → 页面切原生 → 壳的 VLC 不出声。
  *
- *   PRO 接管 play 接口时，它的 playInfo 结构体里**没有 nativeAudio/nativeUrl
- *   这两个字段**（internal/server/handlers_mirror.go），整体重新序列化后
- *   恰好把这两个字段删掉了 → PRO 的页面永远走 `<audio>` + 转好的 m4a → 能播。
+ * 二、VLC 为什么不出声（真因）
+ *   不是网络、不是证书、不是 Service 没起来 —— 孩子端 access log 里
+ *   VLC/3.0.22 明明把整份文件（3.2MB）都拉完了，就是没有声音。
+ *   根因是 `/api/stream/8391?t=…` **既没有扩展名、Content-Type 又是
+ *   `application/octet-stream`**（夸克原样透传），libVLC 拿不到任何容器
+ *   线索，只能当未知流读完。服务端已改成按 ext 补 `audio/x-ms-wma`
+ *   （handler/stream.go 的 audioContentType）。
  *
- *   标准版是后端响应的**原样透传**，页面看到 nativeAudio:true 就切成原生模式
- *   （不渲染 `<audio>`），把 wma 直链交给壳的 libVLC。而这条链路在真机上
- *   是断的：指令发出后壳里连一个网络请求都没有，也不推错误状态 →
- *   页面既不出声也不回退，就是"点播放没反应"。
- *
- * 所以默认按 PRO 的路走。m4a 转一次就落盘（缓存命中 0.02 秒），代价只有
- * 首次;而原生那条路长期不稳、坏了还不报错，不值得为它牺牲可用性。
- *
- * 真机调试要重新启用原生链路时：`localStorage.setItem('ls.nativeAudio','1')`。
- * 壳的 libVLC 修好之前不要打开。
+ * 所以现在默认走原生：点开就出声，服务端不转码、不占盘。
+ * 万一某台机器的 VLC 又出问题，`localStorage.setItem('ls.nativeAudio','0')`
+ * 可以退回服务端转码那条路（有缓存时 0.02 秒）。
  */
 const NATIVE_AUDIO_ENABLED = (() => {
   try {
-    return localStorage.getItem('ls.nativeAudio') === '1'
+    return localStorage.getItem('ls.nativeAudio') !== '0'
   } catch {
-    return false
+    return true
   }
 })()
 
