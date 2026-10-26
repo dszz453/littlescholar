@@ -804,6 +804,41 @@ const NATIVE_AUDIO_ENABLED = (() => {
   }
 })()
 
+/**
+ * 交给 libVLC 的地址一律用**明文 HTTP**。
+ *
+ * 2026-10-26 实录：原生模式下 nginx 访问日志里连一条 `/api/stream` 都看不到，
+ * 而同一次点击的 Java 探针（同一个 URL）拿到了 206 —— 说明 VLC 根本没把
+ * 请求发出去，卡在 TCP 之后的 TLS 握手。
+ *
+ * 原因：libVLC 的 TLS 用**它自己打包的 CA 库**，不走 Android 系统信任库；
+ * 而 8616 的证书链已经换成 Let's Encrypt 新一代根（`ISRG Root YR`，由
+ * ISRG Root X1 交叉签名）。Chromium（页面）和 Java 网络栈（探针）都认，
+ * 只有 VLC 的旧 CA 库认不出来。
+ *
+ * 同一份孩子端在 8093 上有明文入口，内容与票据校验完全一致，所以原生链路
+ * 改走它，直接绕开"VLC 认不认这张证书"。只在 https:8616 下替换，
+ * 其它端口/局域网地址不动，避免猜错映射。
+ */
+const NATIVE_PLAIN_BASE = (() => {
+  try {
+    const loc = window.location
+    if (loc.protocol !== 'https:') return ''
+    const map = { '8616': '8093' }
+    const p = map[loc.port]
+    return p ? `http://${loc.hostname}:${p}` : ''
+  } catch {
+    return ''
+  }
+})()
+
+/** 原生播放地址：先绝对化，必要时换成明文入口。 */
+function nativeMediaURL(u) {
+  const abs = absoluteURL(u)
+  if (!abs || !NATIVE_PLAIN_BASE) return abs
+  return abs.replace(/^https:\/\/[^/]+/i, NATIVE_PLAIN_BASE)
+}
+
 const nativeAudioMode = computed(
   () =>
     NATIVE_AUDIO_ENABLED &&
@@ -831,7 +866,7 @@ function startNativeAudio(at) {
   const pos = Number(at)
   const sent = nativeCmd({
     cmd: 'play',
-    url: absoluteURL(info.value.nativeUrl),
+    url: nativeMediaURL(info.value.nativeUrl),
     position: Number.isFinite(pos) && pos > 0 ? pos : 0,
     title: info.value.title || '',
     subtitle: info.value.categoryName || '',
