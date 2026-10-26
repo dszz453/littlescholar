@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/littlescholar/core/internal/adapter"
 	"github.com/littlescholar/core/internal/model"
+	"github.com/littlescholar/core/internal/service"
 	"github.com/littlescholar/core/internal/util"
 	"gorm.io/gorm"
 )
@@ -249,6 +250,56 @@ var serveHeaders = []string{
 	"ETag",
 }
 
+// audioContentType 按资源扩展名给出**准确的音频 MIME**。
+//
+// ============ 为什么非补这一个头不可 ============
+//
+// 网盘（尤其夸克）对媒体文件普遍只回 `application/octet-stream`，
+// 而我们的播放地址是 `/api/stream/8391?t=…` —— **既没有 MIME，
+// 也没有扩展名**。libVLC 挑 demuxer 就靠这两条线索，两条都没有时
+// 它把数据当未知流处理：**整份文件都下载完了，却一个音频帧都出不来**，
+// 而且只抛一个 EncounteredError、不带任何原因（2026-10-26 柯林斯大猫
+// 的 wma 实录 —— 日志里 VLC 明明把 3.2MB 全拉走，就是没声音）。
+//
+// 只补音频：视频的容器判定更依赖内容嗅探，乱标 MIME 反而可能让
+// 浏览器拒播（例如把 mkv 标成 video/mp4）。音频这几个格式 MIME 与
+// 容器一一对应，标错的风险为零。
+func audioContentType(ext string) string {
+	switch strings.ToLower(strings.TrimSpace(ext)) {
+	case "wma":
+		return "audio/x-ms-wma"
+	case "ape":
+		return "audio/x-ape"
+	case "amr":
+		return "audio/amr"
+	case "ac3":
+		return "audio/ac3"
+	case "dts":
+		return "audio/vnd.dts"
+	case "m4a":
+		return "audio/mp4"
+	case "mp3":
+		return "audio/mpeg"
+	case "flac":
+		return "audio/flac"
+	case "wav":
+		return "audio/wav"
+	case "aac":
+		return "audio/aac"
+	case "ogg":
+		return "audio/ogg"
+	case "opus":
+		return "audio/opus"
+	case "mka":
+		return "audio/x-matroska"
+	case "aiff":
+		return "audio/aiff"
+	case "au":
+		return "audio/basic"
+	}
+	return ""
+}
+
 // Serve 代理取流。路由：GET /api/stream/:id?t=<ticket>
 func (h *StreamHandler) Serve(c *gin.Context) {
 	id, ok := util.GetUintParam(c, "id")
@@ -424,6 +475,15 @@ func (h *StreamHandler) Serve(c *gin.Context) {
 	for _, name := range serveHeaders {
 		if v := resp.Header.Get(name); v != "" {
 			c.Header(name, v)
+		}
+	}
+	// 上游只给 octet-stream（或干脆没给）时，按资源自己的扩展名补一个
+	// 准确类型 —— 见 audioContentType 顶部那段：没有它 libVLC 会
+	// "文件下完了但不出声"。放在透传之后，是为了尊重上游给出的真实类型。
+	if ct := c.Writer.Header().Get("Content-Type"); ct == "" ||
+		strings.HasPrefix(strings.ToLower(ct), "application/octet-stream") {
+		if mt := audioContentType(service.ResourceExt(&res)); mt != "" {
+			c.Header("Content-Type", mt)
 		}
 	}
 	// 票据过期后同一 URL 不应被缓存复用
