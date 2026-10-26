@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +16,21 @@ import (
 	"github.com/littlescholar/core/internal/util"
 	"gorm.io/gorm"
 )
+
+// nativeAudioEnabled 是否在播放信息里给出「原始文件 + 原生解码」这条路。
+//
+// 默认**关闭**。2026-10-26 查实：标准版壳的 libVLC 这条路在真机上是断的 ——
+// 页面按 nativeAudio 切进原生模式后不渲染 `<audio>`，而壳收到指令后连一个
+// 网络请求都不发、也不推错误状态，表现就是"点播放毫无反应"。
+//
+// 对照 PRO（littlescholar-edge）：它的 playInfo 结构体里没有 nativeAudio /
+// nativeUrl 字段，整体重新序列化时把这两个字段删掉了，页面只能走
+// `<audio>` + /api/audio 转好的 m4a —— 所以 PRO 一直是好的。
+//
+// 也就是说这条"省转码"的优化，代价是**整类格式在标准版上完全播不了**。
+// 转码产物是一次性成本（命中缓存 0.02 秒），不值得拿可用性去换。
+// 真要重新启用（壳修好之后）：KID_NATIVE_AUDIO=1。
+var nativeAudioEnabled = os.Getenv("KID_NATIVE_AUDIO") == "1"
 
 // PlayHandler 播放
 //
@@ -275,9 +291,11 @@ func (h *PlayHandler) Info(c *gin.Context) {
 		// 自己选，只有一处判断，也不会因为版本号漏升级而退回干等一分钟。
 		playMode = "audioformat"
 		playURL = h.audioFmt.URLFor(res.ID)
-		if link := h.streamURL(res.ID); link != "" {
-			nativeAudio = true
-			nativeURL = link
+		if nativeAudioEnabled {
+			if link := h.streamURL(res.ID); link != "" {
+				nativeAudio = true
+				nativeURL = link
+			}
 		}
 	case mediaType == model.MediaTypeImage && h.imageFmt != nil && h.imageFmt.NeedsConvert(&res):
 		// HEIC / TIFF：<img> 在 WebView 里就是一块空白，转成 JPEG 再给

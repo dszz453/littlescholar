@@ -59,6 +59,12 @@
           <span v-for="n in 5" :key="n" :style="{ animationDelay: n * 90 + 'ms' }"></span>
         </div>
 
+        <!-- 首次收听要服务端转码（wma/ape）：这二十来秒页面本来是死寂的，
+             家长会当成"点了没反应"。所以把等待明说出来。 -->
+        <p v-if="info.url && !nativeAudioMode && !audioReady" class="audio-prep-tip">
+          正在准备音频，第一次听要等十几秒…
+        </p>
+
         <!-- 音频也有字幕：很多"听故事"其实是英语启蒙，字幕是刚需 -->
         <p v-if="subtitleOn && subtitleHTML" class="sub-audio-line" v-html="subtitleHTML"></p>
 
@@ -510,6 +516,28 @@ let autoFallbackTried = false
 const audioEl = ref(null)
 const videoEl = ref(null)
 
+// audioReady：音频元素是否已经拿到元数据（能算出时长、能播）。
+//
+// 意义不只是"显示个转圈"。需要转码的音频（wma/ape）第一次听时，
+// /api/audio 要**当场**从网盘抓源文件再 ffmpeg 转一遍 —— 实测一个
+// 2.4MB 的 wma 要 19.8 秒，转完就落盘（之后 0.02 秒）。
+// 这 20 秒里 <audio> 一直停在 loading，页面上没有任何变化，
+// 家长看到的就是"点了没反应"。所以必须把这段等待说出来。
+const audioReady = ref(false)
+watch(
+  () => info.value.url,
+  (u) => {
+    audioReady.value = false
+    // 已经就绪的地址换过来时，元数据事件可能比 watch 先到，
+    // 补一次判断，避免提示永远挂着。
+    nextTick(() => {
+      const el = audioEl.value
+      if (el && el.readyState >= 1) audioReady.value = true
+    })
+    if (!u) audioReady.value = false
+  },
+)
+
 const isPlaying = ref(false)
 // 用户自己按的暂停。切后台时原生要判断"该不该接着播" ——
 // 分不清"用户暂停"和"系统把网页压下去导致的暂停"，就会出现
@@ -720,8 +748,66 @@ function nativeAudioBridge() {
  */
 const nativeBroken = ref(false)
 
+/**
+ * 原生那一路「一点动静都没有」的看门狗（页面侧）。
+ *
+ * 为什么页面自己也要有一条：壳里那条 15 秒看门狗只在**壳真的收到指令**时
+ * 才装得上。实测（2026-10-26 标准版 wma）出现过更糟的形状 ——
+ * 页面把指令发出去了，壳里一个网络请求都没有，状态也不推：
+ * 服务端日志里 play/subtitle/playlist 之后就断了，`/api/stream`（VLC 直链）
+ * 和 `/api/audio`（转码地址）**两条都没有**。
+ *
+ * 这时页面侧 `nativeAudioMode` 为真 → 不渲染 `<audio>`；壳又不出声，
+ * 用户看到的就是"点播放没有任何反应"。所以这里加一条独立的保险：
+ * 指令发出后 8 秒内**没收到任何状态推送**，就主动放弃原生、退回 `info.url`。
+ * 服务端转码产物通常是现成的（缓存命中 0.02 秒），切过去立刻有声。
+ */
+let nativeStartTimer = null
+let nativeGotState = false
+const NATIVE_FIRST_STATE_MS = 8000
+
+function clearNativeStartTimer() {
+  if (nativeStartTimer) {
+    clearTimeout(nativeStartTimer)
+    nativeStartTimer = null
+  }
+}
+
+/**
+ * 原生音频（libVLC 解 wma/ape）总开关 —— **默认关闭**。
+ *
+ * 2026-10-26 查清的因果（对比 PRO 源码 `littlescholar-edge`）：
+ *
+ *   服务端对需要转码的音频同时给两个地址：
+ *     · url       = /api/audio/{id}  ← 转好的 m4a，Chromium 直接能播
+ *     · nativeUrl = /api/stream/{id} ← 原始 wma，只有 libVLC 能解
+ *
+ *   PRO 接管 play 接口时，它的 playInfo 结构体里**没有 nativeAudio/nativeUrl
+ *   这两个字段**（internal/server/handlers_mirror.go），整体重新序列化后
+ *   恰好把这两个字段删掉了 → PRO 的页面永远走 `<audio>` + 转好的 m4a → 能播。
+ *
+ *   标准版是后端响应的**原样透传**，页面看到 nativeAudio:true 就切成原生模式
+ *   （不渲染 `<audio>`），把 wma 直链交给壳的 libVLC。而这条链路在真机上
+ *   是断的：指令发出后壳里连一个网络请求都没有，也不推错误状态 →
+ *   页面既不出声也不回退，就是"点播放没反应"。
+ *
+ * 所以默认按 PRO 的路走。m4a 转一次就落盘（缓存命中 0.02 秒），代价只有
+ * 首次;而原生那条路长期不稳、坏了还不报错，不值得为它牺牲可用性。
+ *
+ * 真机调试要重新启用原生链路时：`localStorage.setItem('ls.nativeAudio','1')`。
+ * 壳的 libVLC 修好之前不要打开。
+ */
+const NATIVE_AUDIO_ENABLED = (() => {
+  try {
+    return localStorage.getItem('ls.nativeAudio') === '1'
+  } catch {
+    return false
+  }
+})()
+
 const nativeAudioMode = computed(
   () =>
+    NATIVE_AUDIO_ENABLED &&
     isAudio.value &&
     !!info.value.nativeAudio &&
     !!info.value.nativeUrl &&
@@ -744,7 +830,7 @@ function nativeCmd(obj) {
 function startNativeAudio(at) {
   if (!nativeAudioMode.value) return
   const pos = Number(at)
-  nativeCmd({
+  const sent = nativeCmd({
     cmd: 'play',
     url: absoluteURL(info.value.nativeUrl),
     position: Number.isFinite(pos) && pos > 0 ? pos : 0,
@@ -753,6 +839,20 @@ function startNativeAudio(at) {
     poster: info.value.poster || '',
     duration: Math.round(Number(duration.value) || 0),
   })
+  // 连桥都没接住：当场退回，不用等
+  if (!sent) {
+    fallbackToWebAudio()
+    return
+  }
+  // 指令发出去了，但壳可能根本没动作（见上方注释）。等第一条状态，
+  // 等不到就自己切回服务端转码。
+  nativeGotState = false
+  clearNativeStartTimer()
+  nativeStartTimer = setTimeout(() => {
+    nativeStartTimer = null
+    if (!nativeAudioMode.value || nativeGotState) return
+    fallbackToWebAudio()
+  }, NATIVE_FIRST_STATE_MS)
 }
 
 /**
@@ -761,6 +861,9 @@ function startNativeAudio(at) {
  */
 function onNativeAudioState(st) {
   if (!nativeAudioMode.value || !st) return
+  // 只要有第一条状态回来，就说明壳真的动了：撤掉页面侧看门狗
+  nativeGotState = true
+  clearNativeStartTimer()
   if (st.error) {
     fallbackToWebAudio()
     return
@@ -787,6 +890,7 @@ function onNativeAudioState(st) {
 function fallbackToWebAudio() {
   if (nativeBroken.value) return
   nativeBroken.value = true
+  clearNativeStartTimer()
   nativeCmd({ cmd: 'stop' })
   // 交给 <audio>：它挂上之后会在 loadedmetadata 里按 pendingSeek 定位并自动播
   pendingSeek = current.value > 0 ? current.value : 0
@@ -1762,6 +1866,7 @@ function ebookErrorText(e) {
 
 /* ---------- 媒体事件 ---------- */
 function onLoadedMetadata() {
+  audioReady.value = true
   const el = mediaEl()
   if (!el) return
   duration.value = Number(el.duration) || duration.value || 0
@@ -2723,6 +2828,7 @@ onBeforeUnmount(() => {
   if (offlineAbort) offlineAbort.abort()
   // 离开播放页停掉原生那一路，并摘掉回调（否则下一个页面挂上的
   // 是最新一份，而旧闭包还在被壳持有）
+  clearNativeStartTimer()
   if (nativeAudioMode.value) nativeCmd({ cmd: 'stop' })
   try {
     delete window.__lsNative
@@ -2847,6 +2953,27 @@ watch(isPlaying, (v) => {
   display: flex;
   flex-direction: column;
   align-items: center;
+}
+/* 转码等待提示：要显眼但不抢戏 —— 它出现在封面下面，
+   播放开始（loadedmetadata）后立刻消失。 */
+.audio-prep-tip {
+  margin: 10px 0 0;
+  padding: 6px 14px;
+  border-radius: 14px;
+  background: rgba(127, 127, 127, 0.12);
+  font-size: 13px;
+  line-height: 1.5;
+  color: #8a8a8a;
+  animation: prep-pulse 1.6s ease-in-out infinite;
+}
+@keyframes prep-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 .cover-blob {
   width: 190px;
