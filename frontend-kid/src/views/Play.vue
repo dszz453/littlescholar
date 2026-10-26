@@ -940,16 +940,25 @@ function startNativeAudio(at) {
  */
 function onNativeAudioState(st) {
   if (!nativeAudioMode.value || !st) return
-  // 只要有第一条状态回来，就说明壳真的动了：撤掉页面侧看门狗
-  nativeGotState = true
-  clearNativeStartTimer()
+  // ⚠️ 只有「真的出声」或「真的报错」才算壳动了。
+  //
+  // 2026-10-26 实录：壳在 `mp.play()` 之后**立刻**emit 一条 playing=false 的
+  // 空状态（此时 VLC 连 TCP 都还没建）。旧代码把它当成"壳已经接手"，
+  // 当场撤掉页面看门狗 → 页面就一直等到壳自己那 15 秒看门狗才兜底，
+  // 用户看到的就是"点了播放，十几秒后才响"。8407 那次日志正是 15 秒。
   if (st.error) {
+    nativeGotState = true
+    clearNativeStartTimer()
     fallbackToWebAudio()
     return
   }
-  // 真出声了：把上次的失败记录抹掉。以后换了 APK/网络，这里会自己恢复原生，
-  // 不需要家长去清缓存。
-  if (st.playing) forgetNativeBroken()
+  if (st.playing) {
+    nativeGotState = true
+    clearNativeStartTimer()
+    // 真出声了：把上次的失败记录抹掉。以后换了 APK/网络，这里会自己恢复原生，
+    // 不需要家长去清缓存。
+    forgetNativeBroken()
+  }
   isPlaying.value = !!st.playing
   const d = Number(st.duration) || 0
   if (d > 0 && Math.abs(d - duration.value) > 1) duration.value = d
