@@ -746,7 +746,48 @@ function nativeAudioBridge() {
  * so 加载失败、解码器缺失），用户看到的最坏情况也只是"还是慢一分钟"，
  * 而不是"点开就闪退"。
  */
-const nativeBroken = ref(false)
+/**
+ * 「这台设备上原生引擎坏了」的**跨页面记忆**。
+ *
+ * 为什么不能只存在内存里：`nativeBroken` 是页面级 ref，孩子每点开一本新书
+ * 都是一个新页面 → 重新等一遍。2026-10-26 的实测日志就是这个形状：
+ * 10:32:22 探针打 `/api/stream` → 10:32:29 才出现 `/api/audio`（正好 7 秒，
+ * 就是下面那条 8 秒看门狗），而**整段日志里 VLC 一条请求都没有**。
+ * 也就是说那 8 秒是纯空等，第二本起因为同一页面内已经 nativeBroken 才变快。
+ *
+ * 所以把失败落到 localStorage：6 小时内不再尝试原生，直接走转码（缓存命中
+ * 基本是秒开）；过了 6 小时再试一次 —— 万一哪天换了 APK/网络，
+ * 原生能用了就自动恢复（见 onNativeAudioState 里清标记那段）。
+ */
+const NATIVE_BROKEN_KEY = 'ls.nativeBrokenAt'
+const NATIVE_BROKEN_TTL = 6 * 3600 * 1000
+
+function nativeBrokenRecently() {
+  try {
+    const t = Number(localStorage.getItem(NATIVE_BROKEN_KEY)) || 0
+    return t > 0 && Date.now() - t < NATIVE_BROKEN_TTL
+  } catch {
+    return false
+  }
+}
+
+function rememberNativeBroken() {
+  try {
+    localStorage.setItem(NATIVE_BROKEN_KEY, String(Date.now()))
+  } catch {
+    /* 隐私模式存不了就只影响本次，不影响播放 */
+  }
+}
+
+function forgetNativeBroken() {
+  try {
+    localStorage.removeItem(NATIVE_BROKEN_KEY)
+  } catch {
+    /* 同上 */
+  }
+}
+
+const nativeBroken = ref(nativeBrokenRecently())
 
 /**
  * 原生那一路「一点动静都没有」的看门狗（页面侧）。
@@ -757,14 +798,15 @@ const nativeBroken = ref(false)
  * 服务端日志里 play/subtitle/playlist 之后就断了，`/api/stream`（VLC 直链）
  * 和 `/api/audio`（转码地址）**两条都没有**。
  *
- * 这时页面侧 `nativeAudioMode` 为真 → 不渲染 `<audio>`；壳又不出声，
- * 用户看到的就是"点播放没有任何反应"。所以这里加一条独立的保险：
- * 指令发出后 8 秒内**没收到任何状态推送**，就主动放弃原生、退回 `info.url`。
- * 服务端转码产物通常是现成的（缓存命中 0.02 秒），切过去立刻有声。
+ * 注意日志里**同时**有一条 `LittleScholar-Probe/1.0` 的 206（壳用 Java 网络栈
+ * 探同一地址，通了）→ 说明地址是通的，卡的是 VLC 自己。
+ *
+ * 时长从 8 秒收到 3 秒：既然实测 VLC 连 TCP 都没建起来，多等 5 秒只是让孩子
+ * 对着转圈发呆。真正能播的设备在 3 秒内一定推得出第一条状态。
  */
 let nativeStartTimer = null
 let nativeGotState = false
-const NATIVE_FIRST_STATE_MS = 8000
+const NATIVE_FIRST_STATE_MS = 3000
 
 function clearNativeStartTimer() {
   if (nativeStartTimer) {
@@ -792,9 +834,12 @@ function clearNativeStartTimer() {
  *   线索，只能当未知流读完。服务端已改成按 ext 补 `audio/x-ms-wma`
  *   （handler/stream.go 的 audioContentType）。
  *
- * 所以现在默认走原生：点开就出声，服务端不转码、不占盘。
- * 万一某台机器的 VLC 又出问题，`localStorage.setItem('ls.nativeAudio','0')`
- * 可以退回服务端转码那条路（有缓存时 0.02 秒）。
+ * ⚠️ 2026-10-26 晚更新：地址换成明文 8093 之后，nginx 日志里**依然**看不到
+ * 任何 VLC 请求（连 TCP 都没建起来），同时壳的 Java 探针对同一地址拿到了 206。
+ * 所以"证书链"这个假设**不成立**，卡点还在 VLC 自己（IPv6 优先无可达地址、
+ * 引擎初始化、编解码加载都可能），需要 APK 侧的 VLC 日志才能定案。
+ * 现状：靠页面 3 秒看门狗退回转码地址，能播但不是原生。详见下面的
+ * `NATIVE_BROKEN_KEY` 与本文件顶部的说明。
  */
 const NATIVE_AUDIO_ENABLED = (() => {
   try {
@@ -902,6 +947,9 @@ function onNativeAudioState(st) {
     fallbackToWebAudio()
     return
   }
+  // 真出声了：把上次的失败记录抹掉。以后换了 APK/网络，这里会自己恢复原生，
+  // 不需要家长去清缓存。
+  if (st.playing) forgetNativeBroken()
   isPlaying.value = !!st.playing
   const d = Number(st.duration) || 0
   if (d > 0 && Math.abs(d - duration.value) > 1) duration.value = d
@@ -924,6 +972,8 @@ function onNativeAudioState(st) {
 function fallbackToWebAudio() {
   if (nativeBroken.value) return
   nativeBroken.value = true
+  // 记一笔：下次进播放页（新开的书是新页面实例）就不用再空等这三秒
+  rememberNativeBroken()
   clearNativeStartTimer()
   nativeCmd({ cmd: 'stop' })
   // 交给 <audio>：它挂上之后会在 loadedmetadata 里按 pendingSeek 定位并自动播
