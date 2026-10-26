@@ -595,25 +595,64 @@ class MediaPlaybackService : Service() {
                 val base = ServerConfig.get(ctx)
                 if (base.isBlank()) return@runCatching
                 val diag = Diagnostics.dump(ctx).takeLast(700)
+                // vlc.log 尾部 1500 字符基本是 demux 的心跳噪声，肉眼找不到结论。
+                // 只捞带错误线索的行；一行都没有时退回最后 12 行。
                 val vlc = runCatching {
                     val f = java.io.File(ctx.filesDir, "vlc.log")
-                    if (f.exists()) f.readText().takeLast(1500) else "(vlc.log 不存在)"
+                    if (!f.exists()) return@runCatching "(vlc.log 不存在)"
+                    val lines = f.readLines().takeLast(4000)
+                    val keys = listOf(
+                        "error", "warn", "cannot", "failed", "refused", "unreachable",
+                        "timed out", "timeout", "no route", "socket", "http", "tls", "ssl",
+                        "access_", "demux", "cannot open",
+                    )
+                    val hit = lines.filter { l ->
+                        val s = l.lowercase()
+                        keys.any { s.contains(it) }
+                    }.takeLast(40)
+                    if (hit.isEmpty()) lines.takeLast(12).joinToString("\n") else hit.joinToString("\n")
                 }.getOrDefault("(读取失败)")
                 val msg = "[$tag]\n$diag\n--- vlc.log ---\n$vlc"
-                val enc = java.net.URLEncoder.encode(msg.take(1500), "UTF-8")
-                val conn = (URL(base.trimEnd('/') + "/api/health?kidlog=" + enc)
-                    .openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 8000
-                    readTimeout = 8000
-                    setRequestProperty("User-Agent", "LittleScholar-Kid-Diag")
-                }
-                try {
-                    runCatching { conn.inputStream.close() }
-                } finally {
-                    runCatching { conn.disconnect() }
+                // nginx 默认 8k 的 header buffer：编码后控制在 2600 字符，
+                // 既装得下结论行，又不会因为 414 白跑一趟。
+                val enc = java.net.URLEncoder.encode(msg.take(2600), "UTF-8")
+                for (b in reportBases(base)) {
+                    val ok = runCatching {
+                        val conn = (URL(b.trimEnd('/') + "/api/health?kidlog=" + enc)
+                            .openConnection() as HttpURLConnection).apply {
+                            connectTimeout = 8000
+                            readTimeout = 8000
+                            setRequestProperty("User-Agent", "LittleScholar-Kid-Diag")
+                        }
+                        try {
+                            runCatching { conn.inputStream.close() }
+                        } finally {
+                            runCatching { conn.disconnect() }
+                        }
+                        true
+                    }.getOrDefault(false)
+                    if (ok) return@runCatching
                 }
             }
         }
+    }
+
+    /**
+     * 回传地址候选：先按家长填的地址，再退一份明文。
+     *
+     * 为什么要有第二份：8616 是 https，壳里的 HttpsURLConnection 走的是
+     * **系统信任库**；而这台机器上 VLC 恰好就卡在"认不出证书"这类问题上，
+     * 同一个坑没理由只坑 VLC。8093 是同一份孩子端的明文入口，票据校验一致。
+     */
+    private fun reportBases(base: String): List<String> {
+        val out = mutableListOf(base)
+        runCatching {
+            val u = java.net.URI(base)
+            if (u.scheme.equals("https", true) && u.port == 8616) {
+                out.add("http://${u.host}:8093")
+            }
+        }
+        return out
     }
 
     /** 返回 `OK 206 audio/x-ms-wma len=…` 或 `FAIL SSLHandshakeException: …`。 */    private fun probeOnce(url: String): String {
