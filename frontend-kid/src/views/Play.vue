@@ -64,7 +64,13 @@
              才说**：命中缓存时这条请求是毫秒级的，立刻挂上去只会闪一下。
              后面跟着秒数，是为了让"到底卡住了没有"一眼能看出来。 -->
         <p v-if="prepWaitSec > 0" class="audio-prep-tip">
-          正在准备音频，第一次听要转码，已等 {{ prepWaitSec }} 秒…
+          正在准备音频，首次收听要转码，已等 {{ prepWaitSec }} 秒…
+        </p>
+        <!-- 原生模式（交给壳的 libVLC）不转码，但起 VLC 到出声之间有几秒。
+             这段同样不能一声不响 —— 用户 2026-10-29 报的"点了没反应"
+             有一部分就是这段空窗。 -->
+        <p v-else-if="nativeWaitSec > 0" class="audio-prep-tip">
+          正在打开音频，已等 {{ nativeWaitSec }} 秒…
         </p>
 
         <!-- 音频也有字幕：很多"听故事"其实是英语启蒙，字幕是刚需 -->
@@ -762,7 +768,13 @@ function nativeAudioBridge() {
  * 原生能用了就自动恢复（见 onNativeAudioState 里清标记那段）。
  */
 const NATIVE_BROKEN_KEY = 'ls.nativeBrokenAt'
-const NATIVE_BROKEN_TTL = 6 * 3600 * 1000
+// ⚠️ 2026-10-29：从 6 小时收到 20 分钟，并且**只有 VLC 真报错才写**。
+//
+// 原来那套逻辑会把自己锁死：进播放页 → 先试原生 → 3 秒没动静 → 写时间戳
+// → 之后 6 小时内压根不试、直接去转码；6 小时后的第一次又只给 3 秒。
+// 用户看到的就是「这台设备一直在等十几秒」，而且越用越"确定"要转码。
+// 慢 ≠ 坏：连上夸克、起 VLC、填缓冲本来就可能超过 3 秒。
+const NATIVE_BROKEN_TTL = 20 * 60 * 1000
 
 function nativeBrokenRecently() {
   try {
@@ -803,12 +815,17 @@ const nativeBroken = ref(nativeBrokenRecently())
  * 注意日志里**同时**有一条 `LittleScholar-Probe/1.0` 的 206（壳用 Java 网络栈
  * 探同一地址，通了）→ 说明地址是通的，卡的是 VLC 自己。
  *
- * 时长从 8 秒收到 3 秒：既然实测 VLC 连 TCP 都没建起来，多等 5 秒只是让孩子
- * 对着转圈发呆。真正能播的设备在 3 秒内一定推得出第一条状态。
+ * 时长 2026-10-29 从 3 秒改回 12 秒。
+ *
+ * 3 秒的初衷是"别让孩子对着转圈发呆"，但它把**慢**判成了**坏**：
+ * 从夸克拉一个 3MB 的 wma、起 VLC、填第一段缓冲，跨公网经常要 4~8 秒。
+ * 于是每一次都被判死 → 退回转码（又 8~12 秒）+ 写 6 小时封杀标记 →
+ * 用户体感就是"这台设备永远要等十几秒"。真正该判死的是**报错**（st.error），
+ * 不是"还没出声"。超时现在只在本次播放内退回网页，不写盘、不影响下一本书。
  */
 let nativeStartTimer = null
 let nativeGotState = false
-const NATIVE_FIRST_STATE_MS = 3000
+const NATIVE_FIRST_STATE_MS = 12000
 
 function clearNativeStartTimer() {
   if (nativeStartTimer) {
@@ -896,17 +913,22 @@ const nativeAudioMode = computed(
     !!nativeAudioBridge(),
 )
 
+// 原生模式专用的两个状态：
+//   nativeStarted —— 壳真的出声了（收到 playing=true）。
+//   nativeWaitSec —— 「正在打开音频」挂了多久，给等待期一个活着的证据。
+//
+// 为什么原生也要提示：2026-10-29 把看门狗从 3 秒放宽到 12 秒之后，
+// VLC 起得慢的那几秒页面是**完全死寂**的（没有 <audio>、没有转码提示），
+// 家长只会以为点了没反应。
+const nativeStarted = ref(false)
+const nativeWaitSec = ref(0)
+
 // prepWaitSec：「正在准备音频」已经挂了多少秒（0 = 不显示）。
 //
 // 为什么不直接 `!audioReady` 就显示：
-//   服务端会把转好的 m4a 缓存到盘上（2026-10-29 起还有后台预热提前转），
-//   命中缓存时这次请求是毫秒级的。按 `!audioReady` 渲染的话，
-//   每次点开都会闪一下"正在准备音频"，看着像卡了一下。
-// 所以拖到 1.5 秒之后才说，并且每秒加一 —— 慢的时候家长能确认它真在动，
-// 而不是以为按钮没点上（用户报的就是"标准版第一次开大猫要等十几秒"）。
-//
-// ⚠️ 必须放在 nativeAudioMode 之后：watch 是 immediate 的，
-// 在它之前引用这个 computed 会撞上 TDZ（const 还没初始化），整个 setup 直接抛错。
+//   服务端会把转好的 m4a 缓存到盘上，命中缓存时这次请求是毫秒级的。
+//   按 `!audioReady` 渲染的话，每次点开都会闪一下"正在准备音频"，
+//   看着像卡了一下。所以拖到 1.5 秒之后才说，并且每秒加一。
 const prepWaitSec = ref(0)
 let prepDelayTimer = null
 let prepTickTimer = null
@@ -921,16 +943,19 @@ function stopPrepTimers() {
   }
 }
 watch(
-  [() => info.value.url, audioReady, nativeAudioMode, error],
+  [() => info.value.url, audioReady, nativeAudioMode, nativeStarted, error],
   () => {
     stopPrepTimers()
     prepWaitSec.value = 0
-    // 已经有结论了（能播 / 报错 / 走原生）就别再数秒
-    if (!info.value.url || nativeAudioMode.value || audioReady.value || error.value) return
+    nativeWaitSec.value = 0
+    if (!info.value.url || audioReady.value || error.value) return
+    // 原生那一路：出声（nativeStarted）之后就不用再数了
+    if (nativeAudioMode.value && nativeStarted.value) return
     prepDelayTimer = setTimeout(() => {
-      prepWaitSec.value = 1
+      const counter = nativeAudioMode.value ? nativeWaitSec : prepWaitSec
+      counter.value = 1
       prepTickTimer = setInterval(() => {
-        prepWaitSec.value += 1
+        counter.value += 1
       }, 1000)
     }, 1500)
   },
@@ -952,6 +977,7 @@ function nativeCmd(obj) {
 
 function startNativeAudio(at) {
   if (!nativeAudioMode.value) return
+  nativeStarted.value = false
   const pos = Number(at)
   const sent = nativeCmd({
     cmd: 'play',
@@ -962,9 +988,9 @@ function startNativeAudio(at) {
     poster: info.value.poster || '',
     duration: Math.round(Number(duration.value) || 0),
   })
-  // 连桥都没接住：当场退回，不用等
+  // 连桥都没接住：当场退回，不用等。这是"这台壳没有原生能力"，写盘有意义
   if (!sent) {
-    fallbackToWebAudio()
+    fallbackToWebAudio(true)
     return
   }
   // 指令发出去了，但壳可能根本没动作（见上方注释）。等第一条状态，
@@ -974,6 +1000,7 @@ function startNativeAudio(at) {
   nativeStartTimer = setTimeout(() => {
     nativeStartTimer = null
     if (!nativeAudioMode.value || nativeGotState) return
+    // 没等到≠坏了：只在本次播放退回网页，不写封杀标记，下一本还先试原生
     fallbackToWebAudio()
   }, NATIVE_FIRST_STATE_MS)
 }
@@ -993,11 +1020,13 @@ function onNativeAudioState(st) {
   if (st.error) {
     nativeGotState = true
     clearNativeStartTimer()
-    fallbackToWebAudio()
+    // 明确报错 = 这台设备真的解不了，写盘免得每次都空等
+    fallbackToWebAudio(true)
     return
   }
   if (st.playing) {
     nativeGotState = true
+    nativeStarted.value = true
     clearNativeStartTimer()
     // 真出声了：把上次的失败记录抹掉。以后换了 APK/网络，这里会自己恢复原生，
     // 不需要家长去清缓存。
@@ -1022,11 +1051,12 @@ function onNativeAudioState(st) {
  * 为什么不是直接报错：转码地址（`info.url`）服务端本来就会给，只是慢。
  * 慢 20 秒和"完全放不了"对用户的差别很大，尤其是孩子已经坐在那儿等了。
  */
-function fallbackToWebAudio() {
+function fallbackToWebAudio(permanent = false) {
   if (nativeBroken.value) return
   nativeBroken.value = true
-  // 记一笔：下次进播放页（新开的书是新页面实例）就不用再空等这三秒
-  rememberNativeBroken()
+  // 只有"桥都调不通"或"VLC 明确报错"才写盘。单纯没等到出声（超时）不写：
+  // 那只是这次慢，不该让后面 20 分钟内的每一本书都放弃原生。
+  if (permanent) rememberNativeBroken()
   clearNativeStartTimer()
   nativeCmd({ cmd: 'stop' })
   // 交给 <audio>：它挂上之后会在 loadedmetadata 里按 pendingSeek 定位并自动播
