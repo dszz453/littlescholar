@@ -151,12 +151,16 @@ func TestWarmOncePicksOnlyConvertible(t *testing.T) {
 	if stat.Todo != 2 {
 		t.Fatalf("候选应为 2 条（wma 存量行 + 只有标题带后缀），实际 %d（%s）", stat.Todo, stat)
 	}
-	// 这两条都没有转存信息 → 取源立刻失败，不该算成功
+	// 这两条都没有转存信息 → 取不到直链，算"跳过"而不是"失败"：
+	// 它们本来就走 external 兜底，预热对它们没有意义，混进 Failed 只会淹掉真故障。
 	if stat.Converted != 0 {
 		t.Fatalf("没有转存信息不该算转好，实际 Converted=%d", stat.Converted)
 	}
-	if stat.Failed != 2 {
-		t.Fatalf("两条都该记为失败，实际 %d（%s）", stat.Failed, stat)
+	if stat.Skipped != 2 {
+		t.Fatalf("两条都该记为跳过，实际 Skipped=%d（%s）", stat.Skipped, stat)
+	}
+	if stat.Failed != 0 {
+		t.Fatalf("跳过不该记成失败，实际 Failed=%d（%s）", stat.Failed, stat)
 	}
 }
 
@@ -169,8 +173,14 @@ func TestWarmOnceStopsRetryingBroken(t *testing.T) {
 	db := newAudioTestDB(t)
 	dir := t.TempDir()
 
+	// ⚠️ 必须带上 DiskAccountID，否则会走"没有转存信息 → 跳过"那条路，
+	// 这条测试就变成永远绿的空断言。它同时钉住的是 2026-10-29 那个真实故障：
+	// 预热查询里多写了一个 `Select(...)`，`disk_account_id` 没被查出来 →
+	// 每一条都被判成"缺少转存信息"，整轮 93 条全"失败"、产物一条没多。
+	accID := uint64(1) // 库里并没有这个账号 → 解析直链时必然报"账号不存在"
 	broken := model.Resource{CategoryID: 1, Title: "Big Cat - Broken",
-		MediaType: model.MediaTypeAudio, Ext: "wma", DiskType: "quark"}
+		MediaType: model.MediaTypeAudio, Ext: "wma", DiskType: "quark",
+		DiskAccountID: &accID, FileID: "fid-broken"}
 	if err := db.Create(&broken).Error; err != nil {
 		t.Fatalf("造资源失败: %v", err)
 	}
@@ -200,7 +210,7 @@ func newAudioTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("打开测试库失败: %v", err)
 	}
-	if err := db.AutoMigrate(&model.Resource{}); err != nil {
+	if err := db.AutoMigrate(&model.Category{}, &model.Resource{}); err != nil {
 		t.Fatalf("建表失败: %v", err)
 	}
 	return db

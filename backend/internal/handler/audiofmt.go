@@ -86,14 +86,15 @@ type WarmStat struct {
 	Todo      int     // 扫到的"该转但还没缓存"的条数
 	Cached    int     // 已经有产物的条数
 	Converted int     // 本轮真转成功的
-	Failed    int     // 本轮转失败的
+	Failed    int     // 本轮转失败的（网盘/ffmpeg 出错，要盯）
+	Skipped   int     // 本轮跳过的（没有转存信息，取不到直链，转也白转）
 	CacheGB   float64 // 产物目录当前占用
 	Note      string
 }
 
 func (s WarmStat) String() string {
-	return fmt.Sprintf("待转 %d 条、已有缓存 %d 条、本轮转好 %d 条、失败 %d 条、缓存占用 %.2fGB",
-		s.Todo, s.Cached, s.Converted, s.Failed, s.CacheGB)
+	return fmt.Sprintf("待转 %d 条、已有缓存 %d 条、本轮转好 %d 条、失败 %d 条、无转存跳过 %d 条、缓存占用 %.2fGB",
+		s.Todo, s.Cached, s.Converted, s.Failed, s.Skipped, s.CacheGB)
 }
 
 func NewAudioFormatHandler(db *gorm.DB, enc *util.Encryptor, acc *task.Accelerator,
@@ -355,15 +356,25 @@ func (h *AudioFormatHandler) WarmOnce(ctx context.Context) WarmStat {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
 
+	// 起手先喊一声。不然一轮要跑七八分钟（30 条 × 十来秒），
+	// 这段时间日志里只有转码成功行、没有任何"我在干活"的标记，
+	// 排查时会以为预热压根没起来（2026-10-29 就这么怀疑过一次）。
+	log.Printf("[audiofmt] 预热开始：产物占用 %.2fGB，开始扫描待转音频", stat.CacheGB)
+
 	// 一次把候选捞出来：ext 命中转码表，或者"ext 空但 media_type 是音频"
 	// （存量行 ext 可能是空，格式只能从标题/FileID 反推 → 交给 NeedsConvert 再筛一遍）。
 	//
 	// ⚠️ 括号不能省：这里只有一个 Where，但 SQL 里同时有 AND 和 OR，
 	// 拆成两条 Where 时 gorm 是**直接 AND 拼**、不加括号，
 	// 那个 OR 分支就会把"跳过 dead 资源"绕过去（去转一堆已失效的）。
+	//
+	// ⚠️⚠️ **不要在这里加 `Select(...)` 只查几列**。第一版就是这么写的，
+	// 少选了 `disk_account_id`，于是 `DiskAccountID` 是 nil，
+	// `resolveDirectLinkFor` 当场判"缺少转存信息" —— 整轮 93 条全部"失败"，
+	// 而库里那条 SQL 明明写着 125 条都有账号。教训：这条链下游要的是**整个资源**，
+	// 少一列就是全零值，且报错信息会指向完全错误的方向。
 	var rows []model.Resource
 	err := h.db.
-		Select("id", "ext", "title", "file_id", "media_type", "status").
 		Where("COALESCE(status, '') <> ? AND (lower(COALESCE(ext, '')) IN ? OR (COALESCE(ext, '') = '' AND media_type = ?))",
 			model.ResourceStatusDead, service.AudioTranscodeExts(), model.MediaTypeAudio).
 		Order("id").
@@ -391,6 +402,13 @@ func (h *AudioFormatHandler) WarmOnce(ctx context.Context) WarmStat {
 		stat.Todo++
 		if stat.Converted >= audioWarmBatch {
 			// 额度用完：后面的只统计、不再转，下一轮接着来
+			continue
+		}
+		// 压根没有转存信息的资源（早年从搜索结果导入、从没转存过）根本取不到直链，
+		// 这种不算"失败"：它连播放都走 external 兜底，预热对它没有意义。
+		// 单独计数，免得每轮几十条"失败"把真正的故障淹掉。
+		if res.DiskAccountID == nil || res.FileID == "" {
+			stat.Skipped++
 			continue
 		}
 		if h.warmFail[res.ID] >= 2 {
