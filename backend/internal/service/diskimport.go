@@ -153,6 +153,20 @@ func NeedsTranscodeExt(ext string) bool { return needsTranscodeExts[ext] }
 // AudioNeedsTranscodeExt 音频是否必须转码才能给浏览器播。
 func AudioNeedsTranscodeExt(ext string) bool { return audioNeedsTranscodeExts[ext] }
 
+// AudioTranscodeExts 需要转码的音频扩展名列表，供 SQL 的 `IN ?` 用。
+//
+// 存在的理由是后台预热任务：它要一次把"可能需要转"的资源全捞出来，
+// 在 SQL 里筛掉绝大部分行，剩下的再交给 NeedsConvert 判（那条路径
+// 会从标题/FileID 反推扩展名，SQL 做不到）。
+// 新增格式只要进 audioNeedsTranscodeExts，这里自动跟着变。
+func AudioTranscodeExts() []string {
+	out := make([]string, 0, len(audioNeedsTranscodeExts))
+	for ext := range audioNeedsTranscodeExts {
+		out = append(out, ext)
+	}
+	return out
+}
+
 // EbookNeedsConvertExt 电子书是否必须服务端转换（mobi/azw3/cbr/fb2 …）。
 func EbookNeedsConvertExt(ext string) bool { return ebookNeedsConvertExts[ext] }
 

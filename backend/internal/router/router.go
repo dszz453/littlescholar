@@ -49,6 +49,11 @@ type Deps struct {
 	// 一进去就起一个"每 6 小时列一遍网盘目录"的 goroutine，
 	// 单测会莫名其妙地变慢、还会打真实接口。
 	SubtitleCollector *handler.SubtitleCollector
+	// AudioFormat 由 Setup 内部构造后写回，供 main 启动后台预热。
+	//
+	// 和 SubtitleCollector 同一个理由：Setup 也会被测试调用，
+	// 一进去就起一个"扫全库音频挨个转码"的 goroutine 显然不行。
+	AudioFormat *handler.AudioFormatHandler
 	Plan              *handler.PlanHandler
 	// Digest 同上：每日知识沉淀的定时任务也挂在 main 的优雅退出链上。
 	Digest *handler.DigestHandler
@@ -103,6 +108,7 @@ func Setup(deps *Deps) *gin.Engine {
 	audioFmtDir := filepath.Join(filepath.Dir(deps.Cfg.Storage.TranscodeDir), "audiofmt")
 	audioFmtH := handler.NewAudioFormatHandler(deps.DB, deps.Encryptor, nil,
 		deps.Cfg.Transcode.FFmpegPath, audioFmtDir, deps.Cfg.JWT.Secret)
+	deps.AudioFormat = audioFmtH
 	imageFmtDir := filepath.Join(filepath.Dir(deps.Cfg.Storage.TranscodeDir), "imagefmt")
 	imageFmtH := handler.NewImageFormatHandler(deps.DB, deps.Encryptor, nil,
 		deps.Cfg.Transcode.FFmpegPath, imageFmtDir, deps.Cfg.JWT.Secret)

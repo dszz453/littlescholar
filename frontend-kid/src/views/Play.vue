@@ -59,10 +59,12 @@
           <span v-for="n in 5" :key="n" :style="{ animationDelay: n * 90 + 'ms' }"></span>
         </div>
 
-        <!-- 首次收听要服务端转码（wma/ape）：这二十来秒页面本来是死寂的，
-             家长会当成"点了没反应"。所以把等待明说出来。 -->
-        <p v-if="info.url && !nativeAudioMode && !audioReady" class="audio-prep-tip">
-          正在准备音频，第一次听要等十几秒…
+        <!-- 首次收听要服务端转码（wma/ape）：这十几秒页面本来是死寂的，
+             家长会当成"点了没反应"。所以把等待明说出来 —— 但**等了一秒半
+             才说**：命中缓存时这条请求是毫秒级的，立刻挂上去只会闪一下。
+             后面跟着秒数，是为了让"到底卡住了没有"一眼能看出来。 -->
+        <p v-if="prepWaitSec > 0" class="audio-prep-tip">
+          正在准备音频，第一次听要转码，已等 {{ prepWaitSec }} 秒…
         </p>
 
         <!-- 音频也有字幕：很多"听故事"其实是英语启蒙，字幕是刚需 -->
@@ -893,6 +895,48 @@ const nativeAudioMode = computed(
     !nativeBroken.value &&
     !!nativeAudioBridge(),
 )
+
+// prepWaitSec：「正在准备音频」已经挂了多少秒（0 = 不显示）。
+//
+// 为什么不直接 `!audioReady` 就显示：
+//   服务端会把转好的 m4a 缓存到盘上（2026-10-29 起还有后台预热提前转），
+//   命中缓存时这次请求是毫秒级的。按 `!audioReady` 渲染的话，
+//   每次点开都会闪一下"正在准备音频"，看着像卡了一下。
+// 所以拖到 1.5 秒之后才说，并且每秒加一 —— 慢的时候家长能确认它真在动，
+// 而不是以为按钮没点上（用户报的就是"标准版第一次开大猫要等十几秒"）。
+//
+// ⚠️ 必须放在 nativeAudioMode 之后：watch 是 immediate 的，
+// 在它之前引用这个 computed 会撞上 TDZ（const 还没初始化），整个 setup 直接抛错。
+const prepWaitSec = ref(0)
+let prepDelayTimer = null
+let prepTickTimer = null
+function stopPrepTimers() {
+  if (prepDelayTimer) {
+    clearTimeout(prepDelayTimer)
+    prepDelayTimer = null
+  }
+  if (prepTickTimer) {
+    clearInterval(prepTickTimer)
+    prepTickTimer = null
+  }
+}
+watch(
+  [() => info.value.url, audioReady, nativeAudioMode, error],
+  () => {
+    stopPrepTimers()
+    prepWaitSec.value = 0
+    // 已经有结论了（能播 / 报错 / 走原生）就别再数秒
+    if (!info.value.url || nativeAudioMode.value || audioReady.value || error.value) return
+    prepDelayTimer = setTimeout(() => {
+      prepWaitSec.value = 1
+      prepTickTimer = setInterval(() => {
+        prepWaitSec.value += 1
+      }, 1000)
+    }, 1500)
+  },
+  { immediate: true },
+)
+onBeforeUnmount(stopPrepTimers)
 
 function nativeCmd(obj) {
   const b = nativeAudioBridge()

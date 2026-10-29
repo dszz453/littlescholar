@@ -301,6 +301,14 @@ func main() {
 		rdeps.SubtitleCollector.Start(6 * time.Hour)
 	}
 
+	// 音频后台预热：wma/ape 这些浏览器放不了的音频，转码是**同步**发生在
+	// 播放请求里的（解析直链 → 拉源文件 → ffmpeg），孩子点开就干等十几秒。
+	// 这里在空闲时提前转好落盘，点开即缓存命中。
+	// 启动后延迟 5 分钟、每 15 分钟一轮、每轮最多 30 条（见 WarmOnce）。
+	if rdeps.AudioFormat != nil {
+		rdeps.AudioFormat.StartWarmup(15 * time.Minute)
+	}
+
 	// 8.1 每周 AI 奖状
 	//
 	// 每天扫一次：打卡在任意时刻发生，每天检查能保证"本周达标"最迟第二天

@@ -19,6 +19,33 @@ import (
 	"gorm.io/gorm"
 )
 
+// 转码输出参数。
+//
+// 2026-10-29 从 `128k / 立体声` 降到这里，起因是用户报「标准版打开大猫
+// 里的音频，挂着"正在准备音频"要等十几秒」。
+//
+// 这十几秒由三段串起来：解析直链（网盘 API）、从网盘拉源文件（网络）、
+// ffmpeg 编码（纯 CPU）。前两段只能靠预热绕开，第三段能直接砍：
+// AAC 编码耗时近似正比于「码率 × 声道数」，64k 单声道只有原来 1/4 的
+// 编码量 —— 对 J1900 这种没有 AVX 的老 CPU 差别很实在。
+//
+// 敢降到单声道，是因为这批"要转码的音频"全是**朗读**（大猫、分级读物、
+// 故事），人声单声道听感没有损失；同样时长下产物体积也减半，
+// 孩子在 4G 上拉第一个字节更快。真要放音乐类的，改这两个常量即可。
+const (
+	audioOutBitrate  = "64k"
+	audioOutChannels = "1"
+)
+
+// 预热参数：一轮最多转多少条、产物目录超过多少 GB 就停手。
+//
+// 上限存在的意义是"别把硬盘吃满"——缓存写满是**静默**恶化，
+// 出事的时候通常已经是几天后了。绘本音频一条也就一两兆，6GB 够装几千条。
+const (
+	audioWarmBatch = 30
+	audioWarmMaxGB = 6.0
+)
+
 // AudioFormatHandler 把浏览器放不出来的音频（wma / ape / amr / ac3 / dts …）
 // 转成单文件 AAC（.m4a）再交给 <audio>。
 //
@@ -28,14 +55,45 @@ import (
 //
 // 产物按资源 ID 落盘缓存，第二次打开直接读文件。
 type AudioFormatHandler struct {
-	db      *gorm.DB
-	enc     *util.Encryptor
-	acc     *task.Accelerator
-	ffmpeg  string
-	outDir  string
-	secret  string
-	locks   sync.Map
+	db     *gorm.DB
+	enc    *util.Encryptor
+	acc    *task.Accelerator
+	ffmpeg string
+	outDir string
+	secret string
+	locks  sync.Map
+	// sem 是"用户正在等"的那两个槽位。预热用另一条 warmSem，
+	// 既能并行，又能在有播放请求时立刻让路（见 WarmOnce）。
 	sem     chan struct{}
+	warmSem chan struct{}
+
+	// 预热状态：只允许一轮在跑，失败两次的资源本轮之后不再重试
+	// （坏资源重试只会白打一遍网盘 API，还占着 CPU）。
+	warmMu   sync.Mutex
+	warmFail map[uint64]int
+	// warmFailAt 失败计数是何时开始攒的。
+	// 攒满 6 小时就整体清零：这个计数的用途只是"别每 15 分钟对着同一条
+	// 坏资源重试"，不是"永久拉黑" —— 网盘偶发限流/抖动造成的那两次失败
+	// 如果记一辈子，那条音频就再也不会被预热了，孩子每次都还得等。
+	warmFailAt time.Time
+	statMu     sync.RWMutex
+	lastWarm   WarmStat
+}
+
+// WarmStat 预热进度快照（日志 + 排障用）。
+type WarmStat struct {
+	At        time.Time
+	Todo      int     // 扫到的"该转但还没缓存"的条数
+	Cached    int     // 已经有产物的条数
+	Converted int     // 本轮真转成功的
+	Failed    int     // 本轮转失败的
+	CacheGB   float64 // 产物目录当前占用
+	Note      string
+}
+
+func (s WarmStat) String() string {
+	return fmt.Sprintf("待转 %d 条、已有缓存 %d 条、本轮转好 %d 条、失败 %d 条、缓存占用 %.2fGB",
+		s.Todo, s.Cached, s.Converted, s.Failed, s.CacheGB)
 }
 
 func NewAudioFormatHandler(db *gorm.DB, enc *util.Encryptor, acc *task.Accelerator,
@@ -53,7 +111,10 @@ func NewAudioFormatHandler(db *gorm.DB, enc *util.Encryptor, acc *task.Accelerat
 	return &AudioFormatHandler{
 		db: db, enc: enc, acc: acc,
 		ffmpeg: ffmpegPath, outDir: outDir, secret: jwtSecret,
-		sem: make(chan struct{}, 2),
+		sem:        make(chan struct{}, 2),
+		warmSem:    make(chan struct{}, 1),
+		warmFail:   make(map[uint64]int),
+		warmFailAt: time.Now(),
 	}
 }
 
@@ -85,6 +146,11 @@ func (h *AudioFormatHandler) URLFor(id uint64) string {
 	return fmt.Sprintf("/api/audio/%d?t=%s", id, SignStreamTicket(h.secret, id, exp))
 }
 
+// pathFor 这条资源的产物路径（平铺在 outDir 下，`{id}.m4a`）。
+func (h *AudioFormatHandler) pathFor(id uint64) string {
+	return filepath.Join(h.outDir, fmt.Sprintf("%d.m4a", id))
+}
+
 // Serve GET /api/audio/:id?t=<ticket>
 func (h *AudioFormatHandler) Serve(c *gin.Context) {
 	id, ok := util.GetUintParam(c, "id")
@@ -108,7 +174,7 @@ func (h *AudioFormatHandler) Serve(c *gin.Context) {
 		return
 	}
 
-	dst := filepath.Join(h.outDir, fmt.Sprintf("%d.m4a", id))
+	dst := h.pathFor(id)
 	if !fileExists(dst) {
 		if err := h.convert(c.Request.Context(), &res, dst); err != nil {
 			log.Printf("[audiofmt] 转换失败 resource=%d: %v", id, err)
@@ -122,6 +188,13 @@ func (h *AudioFormatHandler) Serve(c *gin.Context) {
 }
 
 func (h *AudioFormatHandler) convert(ctx context.Context, res *model.Resource, dst string) error {
+	return h.convertWith(ctx, res, dst, h.sem)
+}
+
+// convertWith sem 由调用方给：用户请求走 h.sem（2 槽），
+// 后台预热走 h.warmSem（1 槽），这样预热既不会把播放请求堵死，
+// 也不会和视频转码一起把 J1900 的 4 个核吃干净。
+func (h *AudioFormatHandler) convertWith(ctx context.Context, res *model.Resource, dst string, sem chan struct{}) error {
 	mu, _ := h.locks.LoadOrStore(res.ID, &sync.Mutex{})
 	mtx := mu.(*sync.Mutex)
 	mtx.Lock()
@@ -131,8 +204,8 @@ func (h *AudioFormatHandler) convert(ctx context.Context, res *model.Resource, d
 	}
 
 	select {
-	case h.sem <- struct{}{}:
-		defer func() { <-h.sem }()
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(30 * time.Second):
@@ -145,9 +218,15 @@ func (h *AudioFormatHandler) convert(ctx context.Context, res *model.Resource, d
 	ext := service.ResourceExt(res)
 	src := filepath.Join(h.outDir, fmt.Sprintf("%d.src.%s", res.ID, ext))
 	defer os.Remove(src)
+
+	// 两段分别计时：这段等待里"取源"和"编码"到底谁是瓶颈，日志说了算。
+	// 之前只有总耗时，"等十几秒"就只能靠猜 —— 而这两段的优化手段完全不同
+	// （取源靠预热/直读网盘，编码靠降码率），猜错等于白改。
+	tFetch := time.Now()
 	if err := h.fetchSource(ctx, res, src); err != nil {
 		return err
 	}
+	fetchDur := time.Since(tFetch)
 
 	tmp := dst + ".part"
 	defer os.Remove(tmp)
@@ -157,24 +236,210 @@ func (h *AudioFormatHandler) convert(ctx context.Context, res *model.Resource, d
 		// 不 -vn 的话 ffmpeg 会尝试把它当视频编码，白等一场。
 		"-vn",
 		"-c:a", "aac",
-		"-b:a", "128k",
-		"-ac", "2",
+		"-b:a", audioOutBitrate,
+		"-ac", audioOutChannels,
 		// faststart：把 moov 放到文件头，边下边播不用等整首下完
 		"-movflags", "+faststart",
 		"-f", "mp4",
 		"-loglevel", "error",
 		tmp,
 	}
+	tEnc := time.Now()
 	cmd := exec.CommandContext(ctx, h.ffmpeg, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("ffmpeg: %v: %s", err, truncateTail(string(out), 400))
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		return err
+	}
+	var size int64
+	if st, e := os.Stat(dst); e == nil {
+		size = st.Size()
+	}
+	log.Printf("[audiofmt] 资源 %d 转好：取源 %.1fs + 编码 %.1fs = %.1fs，产物 %.1fMB（%s/%s）",
+		res.ID, fetchDur.Seconds(), time.Since(tEnc).Seconds(),
+		fetchDur.Seconds()+time.Since(tEnc).Seconds(),
+		float64(size)/1024/1024, audioOutBitrate, audioOutChannels)
+	return nil
 }
 
 func (h *AudioFormatHandler) fetchSource(ctx context.Context, res *model.Resource, dst string) error {
 	return downloadResourceSource(ctx, h.db, h.enc, h.acc, res, dst)
+}
+
+// ---------------------------------------------------------------------------
+// 预热
+//
+// 为什么需要它：`/api/audio/:id` 是**同步**的——解析直链、从网盘拉源文件、
+// ffmpeg 转码，全都在这一次请求里做完，孩子点下去就干等。
+// 缓存命中之后是毫秒级，所以"第一次"永远慢，而"第一次"恰恰是唯一的体验。
+//
+// 所以把这件事挪到前面：启动后空闲时扫一遍库里所有"该转但没转"的音频，
+// 一条一条转好落盘。孩子点开时就是缓存命中。
+// ---------------------------------------------------------------------------
+
+// StartWarmup 起后台预热循环。
+//
+// ⚠️ 先跑一次再进 ticker（和字幕采集器同一个坑）：只挂 ticker 的话第一次
+// 要等一整个周期，部署完当天看不到任何效果，会让人以为没做。
+func (h *AudioFormatHandler) StartWarmup(interval time.Duration) {
+	if h == nil || h.db == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = 15 * time.Minute
+	}
+	go func() {
+		// 启动瞬间要抢数据库迁移、缓存预热，别和它们挤
+		time.Sleep(5 * time.Minute)
+		h.WarmOnce(context.Background())
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for range t.C {
+			h.WarmOnce(context.Background())
+		}
+	}()
+}
+
+// LastWarm 上一轮预热的结果。**不阻塞**：跑着的时候返回中间进度。
+func (h *AudioFormatHandler) LastWarm() WarmStat {
+	if h == nil {
+		return WarmStat{}
+	}
+	h.statMu.RLock()
+	defer h.statMu.RUnlock()
+	return h.lastWarm
+}
+
+func (h *AudioFormatHandler) setWarm(s WarmStat) {
+	h.statMu.Lock()
+	h.lastWarm = s
+	h.statMu.Unlock()
+}
+
+// WarmOnce 扫一轮并把本轮额度内的音频转好。
+func (h *AudioFormatHandler) WarmOnce(ctx context.Context) WarmStat {
+	stat := WarmStat{At: time.Now()}
+	if h == nil || h.db == nil {
+		stat.Note = "预热器未初始化"
+		return stat
+	}
+	// 同一时刻只允许一轮：手动触发和定时任务撞上会重复打网盘 API
+	if !h.warmMu.TryLock() {
+		return h.LastWarm()
+	}
+	defer h.warmMu.Unlock()
+	// 兜底：结构体字面量造出来的 handler（单测、或将来别处直接用）
+	// 没有这个 map，写进去就是 nil map panic。
+	if h.warmFail == nil {
+		h.warmFail = make(map[uint64]int)
+		h.warmFailAt = time.Now()
+	}
+	if time.Since(h.warmFailAt) > 6*time.Hour {
+		h.warmFail = make(map[uint64]int)
+		h.warmFailAt = time.Now()
+	}
+
+	stat.CacheGB = dirSizeGB(h.outDir)
+	if stat.CacheGB >= audioWarmMaxGB {
+		stat.Note = fmt.Sprintf("产物已占 %.1fGB，达到上限 %.0fGB，本轮跳过", stat.CacheGB, audioWarmMaxGB)
+		h.setWarm(stat)
+		log.Printf("[audiofmt] 预热：%s", stat.Note)
+		return stat
+	}
+
+	// 一轮给个总时限：候选里有失效资源时，每条都要等一次"取直链"失败
+	// （最坏 20 秒），不封顶的话一轮能拖着跑几个小时，而下一轮还在排队。
+	// 到点就停，剩下的下一轮接着来 —— 反正失败计数会让坏资源尽快退场。
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+	defer cancel()
+
+	// 一次把候选捞出来：ext 命中转码表，或者"ext 空但 media_type 是音频"
+	// （存量行 ext 可能是空，格式只能从标题/FileID 反推 → 交给 NeedsConvert 再筛一遍）。
+	//
+	// ⚠️ 括号不能省：这里只有一个 Where，但 SQL 里同时有 AND 和 OR，
+	// 拆成两条 Where 时 gorm 是**直接 AND 拼**、不加括号，
+	// 那个 OR 分支就会把"跳过 dead 资源"绕过去（去转一堆已失效的）。
+	var rows []model.Resource
+	err := h.db.
+		Select("id", "ext", "title", "file_id", "media_type", "status").
+		Where("COALESCE(status, '') <> ? AND (lower(COALESCE(ext, '')) IN ? OR (COALESCE(ext, '') = '' AND media_type = ?))",
+			model.ResourceStatusDead, service.AudioTranscodeExts(), model.MediaTypeAudio).
+		Order("id").
+		Find(&rows).Error
+	if err != nil {
+		stat.Note = "查询失败：" + err.Error()
+		h.setWarm(stat)
+		log.Printf("[audiofmt] 预热：%s", stat.Note)
+		return stat
+	}
+
+	for i := range rows {
+		if ctx.Err() != nil {
+			break
+		}
+		res := rows[i]
+		if !h.NeedsConvert(&res) {
+			continue
+		}
+		dst := h.pathFor(res.ID)
+		if fileExists(dst) {
+			stat.Cached++
+			continue
+		}
+		stat.Todo++
+		if stat.Converted >= audioWarmBatch {
+			// 额度用完：后面的只统计、不再转，下一轮接着来
+			continue
+		}
+		if h.warmFail[res.ID] >= 2 {
+			continue
+		}
+		// 让路：h.sem 里有东西 = 有孩子正在等这条音频/这个视频，
+		// 后台任务不该跟他抢那几个核。
+		if len(h.sem) > 0 {
+			stat.Note = "有播放请求在转码，本轮提前收工"
+			break
+		}
+		if err := h.convertWith(ctx, &res, dst, h.warmSem); err != nil {
+			stat.Failed++
+			h.warmFail[res.ID]++
+			log.Printf("[audiofmt] 预热失败 resource=%d: %v", res.ID, err)
+			continue
+		}
+		stat.Converted++
+		// 连续转码之间喘一口：J1900 长时间满载会热降频，
+		// 也顺手把对网盘的请求摊开（一轮 30 条别撞成一串）。
+		select {
+		case <-ctx.Done():
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	h.setWarm(stat)
+	log.Printf("[audiofmt] 预热：%s %s", stat, strings.TrimSpace(stat.Note))
+	return stat
+}
+
+// dirSizeGB 产物目录当前占用（GB）。
+//
+// 只扫一层：产物是平铺的 `{id}.m4a`，没有子目录。
+func dirSizeGB(dir string) float64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			total += info.Size()
+		}
+	}
+	return float64(total) / 1024 / 1024 / 1024
 }
 
 func truncateTail(s string, n int) string {
