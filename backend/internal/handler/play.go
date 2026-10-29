@@ -271,6 +271,8 @@ func (h *PlayHandler) Info(c *gin.Context) {
 	// 原生解码（见上面 audioformat 分支）
 	nativeAudio := false
 	nativeURL := ""
+	// 产物是否已在盘上（只对"必须转码的音频"有意义）
+	audioCached := false
 	switch {
 	case mediaType == model.MediaTypeEbook:
 		ebookFormat = h.setupEbook(&res, &playMode, &playURL)
@@ -288,6 +290,7 @@ func (h *PlayHandler) Info(c *gin.Context) {
 		// 自己选，只有一处判断，也不会因为版本号漏升级而退回干等一分钟。
 		playMode = "audioformat"
 		playURL = h.audioFmt.URLFor(res.ID)
+		audioCached = h.audioFmt.Cached(res.ID)
 		if nativeAudioEnabled {
 			if link := h.streamURL(res.ID); link != "" {
 				nativeAudio = true
@@ -377,6 +380,13 @@ func (h *PlayHandler) Info(c *gin.Context) {
 		// url 只在没有原生引擎时用（浏览器/老 APK，走服务端转码）。
 		"nativeAudio": nativeAudio,
 		"nativeUrl":   nativeURL,
+		// audioCached：这条音频的 m4a 产物是否已经在服务端盘上。
+		//
+		// 页面据此排**顺序**（2026-10-29）：有产物就直接用 `url`（命中缓存
+		// 0.5 秒、零 CPU），没有才去赌 nativeUrl 那条 libVLC 直连。
+		// 反过来做的代价很实在 —— libVLC 连不上时是静默的，页面只能干等
+		// 12 秒看门狗，然后才回到本来 0.5 秒就能给的东西。
+		"audioCached": audioCached,
 		"poster":            res.Cover,
 		"duration":          res.Duration,
 		"lastPosition":      lastPosition,

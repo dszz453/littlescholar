@@ -152,6 +152,24 @@ func (h *AudioFormatHandler) pathFor(id uint64) string {
 	return filepath.Join(h.outDir, fmt.Sprintf("%d.m4a", id))
 }
 
+// Cached 产物是否已经在盘上（之前转过 / 预热过）。
+//
+// 页面用它决定**先走哪条路**（2026-10-29）：
+//   · 有产物 → 直接 `<audio src=/api/audio/…>`，命中缓存是 0.5 秒，
+//     而且完全不占 CPU（只是把一个早就转好的文件发出去）。
+//   · 没有产物 → 才交给壳里的 libVLC 直连原文件，避免现场转码。
+//
+// 为什么要这么排：libVLC 这条路本身没问题，但它要从公网拉原文件，
+// 而且失败时是**静默**的（不报错、不出声、连 TCP 都未必建），
+// 页面只能靠看门狗兜底 —— 那是 12 秒的干等。既然盘上已经有现成的，
+// 就没有理由让孩子去赌那条路。
+func (h *AudioFormatHandler) Cached(id uint64) bool {
+	if h == nil {
+		return false
+	}
+	return fileExists(h.pathFor(id))
+}
+
 // Serve GET /api/audio/:id?t=<ticket>
 func (h *AudioFormatHandler) Serve(c *gin.Context) {
 	id, ok := util.GetUintParam(c, "id")

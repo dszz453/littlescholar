@@ -903,10 +903,23 @@ function nativeMediaURL(u) {
   return abs.replace(/^https:\/\/[^/]+/i, NATIVE_PLAIN_BASE)
 }
 
+// nativeAudioMode：这条音频交给壳里的 libVLC 直接播原文件。
+//
+// ⚠️ 2026-10-29 修正：**有产物时不要走这条路**。
+//
+// 起因（用户报「打开还要等 12 秒」）：libVLC 连不上时是**静默**的 ——
+// 不报错、不出声、服务端 access log 里连一条 TCP 都看不到，页面只能靠
+// 12 秒看门狗兜底，然后才退回 /api/audio。而库里 125 条 wma 的 m4a
+// 早就转好在盘上了，读它就是 **0.5 秒**、零 CPU。
+//
+// 所以顺序反过来：`audioCached=true` 时直接用 `url`（现成文件），
+// 只有**没有产物**的新书才去赌 libVLC 那条直连（省掉现场转码）。
+// 这不是"回到转码"—— 转码早在没人看的时候做完了，这里只是把文件发出去。
 const nativeAudioMode = computed(
   () =>
     NATIVE_AUDIO_ENABLED &&
     isAudio.value &&
+    !info.value.audioCached &&
     !!info.value.nativeAudio &&
     !!info.value.nativeUrl &&
     !nativeBroken.value &&
