@@ -301,11 +301,16 @@ func main() {
 		rdeps.SubtitleCollector.Start(6 * time.Hour)
 	}
 
-	// 音频后台预热：wma/ape 这些浏览器放不了的音频，转码是**同步**发生在
-	// 播放请求里的（解析直链 → 拉源文件 → ffmpeg），孩子点开就干等十几秒。
-	// 这里在空闲时提前转好落盘，点开即缓存命中。
+	// 音频后台预热：wma/ape 这些浏览器放不了的音频，转出来的 m4a 是缓存。
 	// 启动后延迟 5 分钟、每 15 分钟一轮、每轮最多 30 条（见 WarmOnce）。
-	if rdeps.AudioFormat != nil {
+	//
+	// ⚠️ 2026-10-29 起**默认关闭**，只留 `AUDIO_WARMUP=1` 手动开。
+	// 原因：孩子端 1.7.5 起 wma 由壳里的 libVLC 直连播放（`/api/stream` 原文件，
+	// 不再过 `/api/audio`），实测 16:10 之后一次转码请求都没有。既然不转了，
+	// 预热就是在 J1900 上白烧 CPU —— 而它烧的时候正好是孩子在看视频的时候。
+	// 转码接口 `/api/audio` 本身保留：万一下次某台设备的 VLC 又起不来，
+	// 页面 12 秒后仍会退回到它，孩子不至于没声音。
+	if rdeps.AudioFormat != nil && (envOr("AUDIO_WARMUP", "") == "1" || envOr("AUDIO_WARMUP", "") == "true") {
 		rdeps.AudioFormat.StartWarmup(15 * time.Minute)
 	}
 
