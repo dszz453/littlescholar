@@ -594,7 +594,7 @@ class MediaPlaybackService : Service() {
                 val ctx = applicationContext
                 val base = ServerConfig.get(ctx)
                 if (base.isBlank()) return@runCatching
-                val diag = Diagnostics.dump(ctx).takeLast(700)
+                val diag = Diagnostics.dump(ctx).takeLast(1500)
                 // vlc.log 尾部 1500 字符基本是 demux 的心跳噪声，肉眼找不到结论。
                 // 只捞带错误线索的行；一行都没有时退回最后 12 行。
                 val vlc = runCatching {
@@ -613,25 +613,38 @@ class MediaPlaybackService : Service() {
                     if (hit.isEmpty()) lines.takeLast(12).joinToString("\n") else hit.joinToString("\n")
                 }.getOrDefault("(读取失败)")
                 val msg = "[$tag]\n$diag\n--- vlc.log ---\n$vlc"
-                // nginx 默认 8k 的 header buffer：编码后控制在 2600 字符，
-                // 既装得下结论行，又不会因为 414 白跑一趟。
-                val enc = java.net.URLEncoder.encode(msg.take(2600), "UTF-8")
-                for (b in reportBases(base)) {
-                    val ok = runCatching {
-                        val conn = (URL(b.trimEnd('/') + "/api/health?kidlog=" + enc)
-                            .openConnection() as HttpURLConnection).apply {
-                            connectTimeout = 8000
-                            readTimeout = 8000
-                            setRequestProperty("User-Agent", "LittleScholar-Kid-Diag")
+                // ⚠️ 2026-10-29：原来把 2600 字符一次性塞进 query，实测**被截断**了 ——
+                // access log 里那行只剩 2018 字节，而开头的关键记录（[原生播放]
+                // 加载地址、探针结果）恰好是被切掉的那一头，等于白跑一趟。
+                // 现在按 700 字符分段：每段编码后约 2.1KB，稳稳在 header 限制内，
+                // 到服务端按 p=1/3 拼回去就行。
+                val chunks = msg.chunked(700).take(8)
+                val total = chunks.size
+                for ((idx, c) in chunks.withIndex()) {
+                    val enc = java.net.URLEncoder.encode(c, "UTF-8")
+                    var sent = false
+                    for (b in reportBases(base)) {
+                        val ok = runCatching {
+                            val conn = (URL(b.trimEnd('/') + "/api/health?kidlog=" + enc +
+                                "&p=" + (idx + 1) + "/" + total)
+                                .openConnection() as HttpURLConnection).apply {
+                                connectTimeout = 8000
+                                readTimeout = 8000
+                                setRequestProperty("User-Agent", "LittleScholar-Kid-Diag")
+                            }
+                            try {
+                                runCatching { conn.inputStream.close() }
+                            } finally {
+                                runCatching { conn.disconnect() }
+                            }
+                            true
+                        }.getOrDefault(false)
+                        if (ok) {
+                            sent = true
+                            break
                         }
-                        try {
-                            runCatching { conn.inputStream.close() }
-                        } finally {
-                            runCatching { conn.disconnect() }
-                        }
-                        true
-                    }.getOrDefault(false)
-                    if (ok) return@runCatching
+                    }
+                    if (!sent) break
                 }
             }
         }

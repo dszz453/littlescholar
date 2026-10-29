@@ -63,6 +63,15 @@ class VlcAudioEngine(
                 "--audio-time-stretch",
                 // 网络源缓冲 2 秒：再大就"按了播放半天不响"，再小容易卡
                 "--network-caching=2000",
+                // ⚠️ 2026-10-29：强制 IPv4 —— 这是"VLC 一个请求都不发"的头号嫌疑。
+                //
+                // 现象：同一个 URL，壳里的 Java 探针 206 拿到 audio/x-ms-wma
+                // （1024 字节），而 VLC 在 12 秒里连一条 TCP 都没建，
+                // 服务端 access log 里 VLC 的 UA 一条都看不到。
+                // 地址是域名（study.19860819.xyz:8093），DNS 同时有 A 和 AAAA；
+                // Java 的 HttpURLConnection 会自己回退到 IPv4，**libVLC 不会** ——
+                // 它优先试 AAAA，连不上就一直"正在打开"，既不报错也不出声。
+                "--ipv4",
                 // 3.6.5 没有 setLogCb（那是 4.x 的 API），所以 VLC 的
                 // 证书/连接/解码问题在 App 里读不到 —— 它只给一个 EncounteredError。
                 // 那就让它**落到文件里**：诊断上报会把末尾几 KB 一起带回服务端
@@ -184,6 +193,22 @@ class VlcAudioEngine(
         media.release()
         mp.play()
         armWatchdog(mp)
+        // 2026-10-29：play() 之后 VLC 是"没开始"还是"开始了但连不上"，
+        // 光凭"12 秒没出声"分不出来 —— 这两种要改的地方完全相反。
+        // 两次采样用 time/length 当分界线（3.6.5 的 MediaPlayer 没有
+        // getState()，拿不到 1=Opening/7=Error 那套枚举）：
+        //   time 一直在涨      → 真的在解码，问题在声音输出
+        //   time=0 且 len=0    → 引擎没开始拉流（IPv6/证书/DNS）
+        //   len>0 但 time 不动 → 拿到头了，卡在缓冲
+        for (delay in longArrayOf(1500L, 6000L)) {
+            main.postDelayed({
+                if (player === mp) {
+                    val t = runCatching { mp.time }.getOrDefault(-1L)
+                    val len = runCatching { mp.length }.getOrDefault(-1L)
+                    Diagnostics.add("VLC 采样", "${delay}ms: playing=$isPlaying time=$t len=$len err=$lastError")
+                }
+            }, delay)
+        }
         emit()
     }
 
