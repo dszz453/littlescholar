@@ -322,6 +322,20 @@ func (h *StudyHandler) recordsGroupedByResource(c *gin.Context, page, pageSize i
 		list = append(list, it)
 	}
 
+	// 补「所属目录」。category_name 只是资源直接挂的那一级（常常是「第一册」），
+	// 家长看不出属于哪个系列，所以给一条完整的物化路径（乐学英语 / 新概念 / 第一册）。
+	catIDs := make([]uint64, 0, len(list))
+	for _, it := range list {
+		catIDs = append(catIDs, it.CategoryID)
+	}
+	paths := resolveCategoryPaths(h.db, catIDs)
+	for i := range list {
+		list[i].CategoryPath = paths[list[i].CategoryID]
+		if list[i].CategoryPath == "" {
+			list[i].CategoryPath = list[i].CategoryName
+		}
+	}
+
 	util.Page(c, total, page, pageSize, list)
 }
 
@@ -356,10 +370,13 @@ type studyItem struct {
 	ResourceTitle string    `json:"resourceTitle"`
 	CategoryID    uint64    `json:"categoryId"`
 	CategoryName  string    `json:"categoryName"`
-	MediaType     string    `json:"mediaType"`
-	Duration      int64     `json:"duration"`
-	HappenedAt    time.Time `json:"happenedAt"`
-	Times         int64     `json:"times"`
+	// CategoryPath 多级目录路径（乐学英语 / 新概念英语 / 第一册）。
+	// 与 CategoryName 的区别：后者只有叶子那一级。
+	CategoryPath string    `json:"categoryPath"`
+	MediaType    string    `json:"mediaType"`
+	Duration     int64     `json:"duration"`
+	HappenedAt   time.Time `json:"happenedAt"`
+	Times        int64     `json:"times"`
 }
 
 // Analyze 生成 AI 学情报告

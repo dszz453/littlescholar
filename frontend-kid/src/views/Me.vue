@@ -93,6 +93,9 @@
             <span class="r-ico">{{ recEmoji(r) }}</span>
             <div class="r-body">
               <div class="r-title ellipsis">{{ r.resourceTitle || r.title }}</div>
+              <!-- 所属目录：孩子学过的东西常常同名（「第一册」「Unit 3」），
+                   没有目录就分不清是哪一套。后端给的是多级路径。 -->
+              <div v-if="recDir(r)" class="r-dir ellipsis">📁 {{ recDir(r) }}</div>
               <div class="r-meta">
                 <span>{{ fmtTime(r.happenedAt || r.createdAt) }}</span>
                 <span v-if="r.duration">· {{ fmtDuration(r.duration) }}</span>
@@ -165,6 +168,11 @@ function fmtDuration(sec) {
 function recEmoji(r) {
   const map = { audio: '🎧', video: '🎬', pdf: '📄', image: '🖼️', ebook: '📖' }
   return map[r.mediaType] || '📚'
+}
+
+// recDir 展示用的目录：优先完整路径，老接口没有 categoryPath 时退回叶子名
+function recDir(r) {
+  return r.categoryPath || r.categoryName || ''
 }
 
 function fmtTime(t) {
@@ -429,6 +437,12 @@ watch(tab, load)
 .r-title {
   font-size: 15px;
   font-weight: 600;
+}
+.r-dir {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--c-text-sub);
+  opacity: 0.9;
 }
 .r-meta {
   margin-top: 3px;

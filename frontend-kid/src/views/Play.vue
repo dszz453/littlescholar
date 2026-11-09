@@ -83,7 +83,7 @@
           v-if="info.url && !nativeAudioMode"
           ref="audioEl"
           :src="info.url"
-          preload="metadata"
+          preload="auto"
           playsinline
           @timeupdate="onTimeUpdate"
           @loadedmetadata="onLoadedMetadata"
@@ -915,13 +915,41 @@ function nativeMediaURL(u) {
 // 所以顺序反过来：`audioCached=true` 时直接用 `url`（现成文件），
 // 只有**没有产物**的新书才去赌 libVLC 那条直连（省掉现场转码）。
 // 这不是"回到转码"—— 转码早在没人看的时候做完了，这里只是把文件发出去。
+/**
+ * 原生此刻在播哪一条（壳推上来的影子状态）。
+ *
+ * 为什么需要：息屏后网页被系统冻结，切集链路断在页面这一侧。壳会自己
+ * 接上预置的下一集（见 MediaPlaybackService.playArmed）—— 等页面醒过来，
+ * 声音其实已经是**下一条**了。页面必须知道这件事，否则会：
+ *   · 发一条 play 把壳正在播的那条从头重放；
+ *   · 或者显示着上一集的标题，进度条从 0 开始乱跳。
+ * 这不是响应式数据：只在几个函数里读一下，不需要触发重渲染。
+ */
+let nativeShadow = { resourceId: 0, playing: false, position: 0 }
+
+// adoptId 非 0 表示"这一条不是我起播的，是原生自己接上的，我只负责显示"。
+// 用它把 nativeAudioMode 强行拉起来，避免页面的 <audio> 也挂上、变成双声道。
+const adoptId = ref(0)
+
+/**
+ * 追认的时间戳。
+ *
+ * 页面被冻结时，壳重推的"播完了"会排队；页面一醒，几条回调连着跑。
+ * 那会儿壳已经在播下一集了，让这些迟到的通知再触发一次切集，就是
+ * 一集连跳两集 —— 孩子会直接丢掉一段。追认后短时间内一律不理。
+ */
+let adoptAt = 0
+
+function adoptingNative() {
+  return adoptId.value > 0 && Number(adoptId.value) === Number(resourceId.value)
+}
+
 const nativeAudioMode = computed(
   () =>
     NATIVE_AUDIO_ENABLED &&
     isAudio.value &&
-    !info.value.audioCached &&
-    !!info.value.nativeAudio &&
-    !!info.value.nativeUrl &&
+    (adoptingNative() ||
+      (!info.value.audioCached && !!info.value.nativeAudio && !!info.value.nativeUrl)) &&
     !nativeBroken.value &&
     !!nativeAudioBridge(),
 )
@@ -1000,6 +1028,8 @@ function startNativeAudio(at) {
     subtitle: info.value.categoryName || '',
     poster: info.value.poster || '',
     duration: Math.round(Number(duration.value) || 0),
+    // 壳要用它回推"现在播的是第几条"，页面据此对齐路由
+    resourceId: Number(resourceId.value) || 0,
   })
   // 连桥都没接住：当场退回，不用等。这是"这台壳没有原生能力"，写盘有意义
   if (!sent) {
@@ -1023,7 +1053,20 @@ function startNativeAudio(at) {
  * 进度条、时间、字幕（subtitleHTML 依赖 current）都靠它。
  */
 function onNativeAudioState(st) {
-  if (!nativeAudioMode.value || !st) return
+  if (!st) return
+  // 先记影子状态（即使当前不是原生模式也记：兜底切集之后页面可能还没
+  // 把 info 换成新的一条，此时 nativeAudioMode 可能短暂为 false）。
+  const stRid = Number(st.resourceId) || 0
+  if (stRid > 0) {
+    nativeShadow = {
+      resourceId: stRid,
+      playing: !!st.playing,
+      position: Number(st.position) || 0,
+    }
+  } else if (nativeShadow.resourceId > 0) {
+    nativeShadow.playing = !!st.playing
+  }
+  if (!nativeAudioMode.value) return
   // ⚠️ 只有「真的出声」或「真的报错」才算壳动了。
   //
   // 2026-10-26 实录：壳在 `mp.play()` 之后**立刻**emit 一条 playing=false 的
@@ -1038,12 +1081,16 @@ function onNativeAudioState(st) {
     return
   }
   if (st.playing) {
+    const firstSound = !nativeStarted.value
     nativeGotState = true
     nativeStarted.value = true
     clearNativeStartTimer()
     // 真出声了：把上次的失败记录抹掉。以后换了 APK/网络，这里会自己恢复原生，
     // 不需要家长去清缓存。
     forgetNativeBroken()
+    // 确认能播了，再把后面几集预置给壳。放在这里而不是起播前：
+    // 播不了的话这些请求纯属浪费，而且壳里也放不了。
+    if (firstSound) armNext()
   }
   isPlaying.value = !!st.playing
   const d = Number(st.duration) || 0
@@ -1051,7 +1098,7 @@ function onNativeAudioState(st) {
   const p = Number(st.position) || 0
   // 0.25 秒去重：字幕与进度条够细，又不会每 250ms 触发一次全页重渲染
   if (Math.abs(p - current.value) >= 0.25) current.value = p
-  if (st.ended) onNativeAudioEnded()
+  if (st.ended) onNativeAudioEnded(st)
   if (Date.now() - lastNativePush > 5000) {
     lastNativePush = Date.now()
     pushNativeMedia()
@@ -1082,15 +1129,50 @@ function fallbackToWebAudio(permanent = false) {
   }
 }
 
-function onNativeAudioEnded() {
-  isPlaying.value = false
-  flushProgress(true)
+/**
+ * 「这一集播完了」的**幂等闸门**。
+ *
+ * 同一个结尾现在有三条来源，任何两条撞在一起都会连切两集：
+ *   ① 原生 VLC 的 EndReached（壳还会重推 2~3 次兜底）；
+ *   ② `<audio>` 自己的 `ended` 事件；
+ *   ③ 后台接管播完后 `giveBack(ended=true)`。
+ *
+ * 所以统一走这里：加载中（切集空窗）一律忽略，同一集只放行一次。
+ * 返回 true 才继续往下切集。
+ */
+let endedHandledFor = ''
+function claimEnded() {
+  if (loading.value) return false
+  const key = String(resourceId.value)
+  if (endedHandledFor === key) return false
+  endedHandledFor = key
+  return true
+}
+
+function onNativeAudioEnded(st) {
+  // ① 这条 ended 是"另一条"的：页面挂起期间壳已经自己切过去了，
+  //    现在收到的只是上一集的迟到通知。交给路由同步去对齐，别再切一次。
+  const rid = Number(st?.resourceId) || 0
+  if (rid > 0 && rid !== Number(resourceId.value)) return
+  // ② 刚追认完（见 adoptAt）：同样是一批迟到的回调，一律不理
+  if (adoptAt && Date.now() - adoptAt < 8000) return
+  // 单曲循环不走闸门：它要能对同一集反复触发
   if (playMode.value === MODE_SINGLE) {
+    isPlaying.value = false
+    flushProgress(true)
     startNativeAudio(0)
     return
   }
+  if (!claimEnded()) return
+  isPlaying.value = false
+  flushProgress(true)
   const next = nextTrackId()
-  if (next) goTo(next)
+  if (next) {
+    goTo(next)
+  } else if (nativeCmd({ cmd: 'stop', final: true })) {
+    // 顺序播到最后一集：把前台服务一起收掉，
+    // 否则通知栏会一直挂着"正在播放"，而它其实早就安静了
+  }
 }
 
 /* ---------- 时间格式化 ---------- */
@@ -1245,9 +1327,18 @@ async function load(resumeAt = 0) {
   error.value = ''
   errorRetried = false
   autoFallbackTried = false
-  // 换资源（下一集 / 点目录里别的书）时先把上一条的原生播放停掉：
-  // 否则壳里还是上一本的播放器，两本会叠在一起响。
-  if (nativeAudioMode.value) nativeCmd({ cmd: 'stop' })
+  // 壳是不是**已经在播这一条**了？
+  //
+  // 息屏时页面被挂起，壳自己接了下一集（playArmed）；页面醒来后按壳推的
+  // resourceId 改路由，走到这里 —— 这时候绝不能再发 play，否则会把已经
+  // 播到一半的那一集从头重放一遍。这就是"追认"。
+  const adopt =
+    nativeShadow.resourceId > 0 &&
+    Number(nativeShadow.resourceId) === Number(resourceId.value) &&
+    nativeShadow.playing
+  adoptId.value = adopt ? Number(resourceId.value) : 0
+  if (adopt) adoptAt = Date.now()
+  if (nativeAudioMode.value && !adopt) nativeCmd({ cmd: 'stop' })
   cleanupMedia()
   stopTranscodePolling()
 
@@ -1359,12 +1450,24 @@ async function load(resumeAt = 0) {
     loading.value = false
   }
   // 原生音频：等 DOM 落定再启动（nativeAudioMode 依赖 info，此刻才有值）
-  if (nativeAudioMode.value) {
+  if (adopt) {
+    // 壳正在播这一条，只把界面切到"播放中"，不重新起播
+    pendingSeek = 0
+    isPlaying.value = true
+  } else if (nativeAudioMode.value) {
     const at = pendingSeek > 0 ? pendingSeek : 0
     pendingSeek = 0
     await nextTick()
     startNativeAudio(at)
+  } else {
+    // <audio>/<video> 这条路：正常由 loadedmetadata 里的 play() 起播，
+    // 但息屏切集时那条事件偶发不触发（后台不预载），一停就是永久停住。
+    // 这里补两次重试兜底，元素已经在播就直接返回。
+    armAutoplayRetry()
   }
+  // 新一集已经开始加载：把"上一集的 ended 已处理"的闸门放开。
+  // 放在这里（而不是 load 开头）是为了让切集空窗里的重推继续被 loading 拦住。
+  endedHandledFor = ''
   // 下载按钮的状态要按"这条资源有没有缓存"刷新
   refreshOfflineState()
   // loading 关掉之后媒体区才挂载，PDF 的 canvas 这时候才存在
@@ -2071,6 +2174,39 @@ function onLoadedMetadata() {
   })
 }
 
+/* ---------- 起播兜底（息屏切集专用） ---------- */
+//
+// 为什么需要：`loadedmetadata` 是"起播"的唯一触发点，而页面在后台时
+// 媒体预载会被大幅降级（`preload="metadata"` 常常真的一个字节都不取），
+// 那个事件就一直不来 —— 新的 `<audio>` 静静挂在那里，没有任何东西
+// 会再叫它播一次。孩子听到的就是"上一集播完，就没声了"。
+//
+// 两次重试只覆盖"后台慢"，不做无限轮询：真的拉不到（断网/直链失效）
+// 由 onMediaError 去处理，别用定时器盖住真正的错误。
+let autoplayRetryTimers = []
+
+function clearAutoplayRetry() {
+  autoplayRetryTimers.forEach((t) => clearTimeout(t))
+  autoplayRetryTimers = []
+}
+
+function armAutoplayRetry() {
+  clearAutoplayRetry()
+  ;[6000, 15000].forEach((ms) => {
+    autoplayRetryTimers.push(
+      setTimeout(() => {
+        if (loading.value || nativeAudioMode.value || error.value) return
+        if (isPlaying.value) return
+        const el = mediaEl()
+        if (!el || !info.value.url || !el.paused) return
+        el.play().catch(() => {
+          /* 拉不起来就等用户点，别把错误态盖掉 */
+        })
+      }, ms),
+    )
+  })
+}
+
 function onTimeUpdate() {
   const el = mediaEl()
   if (!el) return
@@ -2088,11 +2224,10 @@ function onTimeUpdate() {
 }
 
 function onEnded() {
-  isPlaying.value = false
-  flushProgress(true)
-
   // 单曲循环：原地重播。不用 <audio loop>（见上面播放模式那段注释）
   if (playMode.value === MODE_SINGLE) {
+    isPlaying.value = false
+    flushProgress(true)
     const el = mediaEl()
     if (el) {
       try {
@@ -2105,9 +2240,20 @@ function onEnded() {
     return
   }
 
+  // 闸门：`<audio>` 的 ended 与"后台播完交还"可能同时到达，
+  // 不去重就会连跳两集（见 claimEnded）
+  if (!claimEnded()) return
+  isPlaying.value = false
+  flushProgress(true)
+
   const next = nextTrackId()
   // nextTrackId 返回 0 表示没有下一集（顺序播放的最后一集）→ 停在这里
-  if (next) goTo(next)
+  if (next) {
+    goTo(next)
+  } else {
+    // 最后一集播完：告诉壳可以收摊了，否则通知栏/前台服务会一直挂着
+    pushNativeInactive()
+  }
 }
 
 function onMediaError() {
@@ -2241,6 +2387,19 @@ async function reloadInfo() {
 function onMediaPlay() {
   isPlaying.value = true
   userPaused.value = false
+  // 网页这条通道（PRO 的日常音频、以及标准版转码兜底）也要预置下一集：
+  // 壳的接管播完、页面又被冻结时，兜底才有人接得住。
+  if (isAudio.value) armNext()
+  // 后台切集：新一集刚起播时页面仍然是 hidden（不会再有 visibilitychange），
+  // 壳的 onStop 也早就过去了。不在这里补一次接管，这一集就一直留在
+  // WebView 里，息屏一会儿就被系统掐掉 —— 表现为"连播几集后突然没声"。
+  if (document.visibilityState === 'hidden' && canHandoff()) {
+    try {
+      nativeBridge()?.takeOver?.(JSON.stringify(nativePayload()))
+    } catch {
+      /* noop */
+    }
+  }
 }
 
 function togglePlay() {
@@ -2355,6 +2514,19 @@ function startReportTimer() {
   stopReportTimer()
   reportTimer = setInterval(() => {
     if (isPlaying.value) reportProgress(false)
+    // 息屏时每一拍都确认一次"原生在替我们播"（2026-11-02）。
+    //
+    // 切集会换一条 URL，而接管只在 visibilitychange / Activity.onStop 时
+    // 发生一次 —— 新的一集起播时页面仍然是 hidden，这两个事件都不会再来，
+    // 于是新一集就留在 WebView 里，被系统掐掉后表现为"下一集放着放着就停"。
+    // takeOver 是幂等的（已在接管时直接返回），这里重复调用没有副作用。
+    if (document.visibilityState === 'hidden' && canHandoff()) {
+      try {
+        nativeBridge()?.takeOver?.(JSON.stringify(nativePayload()))
+      } catch {
+        /* 桥不可用就留在网页里播 */
+      }
+    }
   }, REPORT_MS)
 }
 
@@ -2788,6 +2960,113 @@ function prevTrackId() {
   return idx > 0 ? playlist.value[idx - 1].id : 0
 }
 
+// nextIdAfter 与 nextTrackId 同口径，只是起点可以指定 —— 预置队列要能
+// 顺着往下数好几集。
+function nextIdAfter(id) {
+  const list = playlist.value
+  if (!list.length) return 0
+  if (playMode.value === MODE_SHUFFLE) return randomOtherId()
+  const idx = list.findIndex((p) => Number(p.id) === Number(id))
+  if (idx < 0) return 0
+  return idx < list.length - 1 ? Number(list[idx + 1].id) : 0
+}
+
+/**
+ * 「预置下一集」这条通道。
+ *
+ * 标准版走 `KidNative.nativeAudio`（和播放指令共用一条 JSON 通道）；
+ * PRO 的桥是独立的 `EdgeNative.arm`。两边能力一样，页面只写一份逻辑，
+ * 由这里适配成同一个发送函数。
+ *
+ * 返回 null 表示这台壳不支持预置（纯浏览器、老版本 APK），
+ * 那就维持原样 —— 息屏连播只能靠页面自己醒着。
+ */
+function armBridge() {
+  const k = window.KidNative
+  if (k && typeof k.nativeAudio === 'function') {
+    return (items) => k.nativeAudio(JSON.stringify({ cmd: 'arm', items }))
+  }
+  const e = window.EdgeNative
+  if (e && typeof e.arm === 'function') {
+    return (items) => e.arm(JSON.stringify(items))
+  }
+  return null
+}
+
+/**
+ * armNext 把"后面几集"预先交给壳。
+ *
+ * 为什么非做不可：息屏之后 WebView 的 JS 会被系统冻结（小米/OPPO 上尤其干脆），
+ * 页面既收不到 ended、也拉不动 playInfo，切集这段路整个断在这里 ——
+ * 用户看到的就是"一集播完就停住"。
+ *
+ * 所以在页面**还醒着**的时候，把后几集的播放地址先取好送进壳里；
+ * 真到那一刻页面没接上，壳自己接（标准版 playArmed / PRO 的同名实现）。
+ *
+ * 只取 3 集：够覆盖一集最长的时长，又不会为了息屏这件事一次性打十几次接口。
+ */
+let armSeq = 0
+// 已经为哪一条预置过：onMediaPlay 会因为回前台续播等原因重复触发，
+// 同一集不要反复打接口。
+let armedFor = 0
+async function armNext() {
+  const send = armBridge()
+  if (!send) return
+  if (adoptingNative()) return
+  const rid = Number(resourceId.value)
+  if (armedFor === rid) return
+  const seq = ++armSeq
+  // 单曲循环：壳自己原地重播，预置反而会把它带到下一集去
+  if (playMode.value === MODE_SINGLE) {
+    try {
+      send([])
+    } catch {
+      /* 桥挂了不影响播放 */
+    }
+    return
+  }
+  // 标准版交给 libVLC 解原文件；PRO 没有这条，接管的是页面 <audio> 的地址。
+  const useNativeURL = nativeAudioMode.value
+  const items = []
+  let cur = Number(resourceId.value)
+  for (let i = 0; i < 3; i++) {
+    const nextId = nextIdAfter(cur)
+    if (!nextId) break
+    try {
+      const d = await playApi.info(nextId, quality.value)
+      // 用户已经切走了：这批预置作废，别覆盖更新的那一份
+      if (seq !== armSeq) return
+      // 只预置"壳自己能播"的：音视频、非 HLS。
+      // HLS 交给系统 MediaPlayer 在很多机型上直接失败，宁可不预置。
+      if (!d || d.playMode === 'hls') break
+      const u = useNativeURL
+        ? d.nativeAudio && d.nativeUrl
+          ? nativeMediaURL(d.nativeUrl)
+          : ''
+        : d.url || ''
+      if (!u) break
+      items.push({
+        url: u,
+        resourceId: Number(nextId),
+        title: d.title || '',
+        subtitle: d.categoryName || '',
+        poster: d.poster || '',
+        duration: Math.round(Number(d.duration) || 0),
+      })
+    } catch {
+      break
+    }
+    cur = Number(nextId)
+  }
+  if (seq !== armSeq) return
+  armedFor = rid
+  try {
+    send(items)
+  } catch {
+    /* 同上 */
+  }
+}
+
 /* ---------- 上一首 / 下一首（页面按钮） ---------- */
 // 只有一集时不显示这一栏：摆两个必然点不动的按钮只会让人困惑。
 const canSwitch = computed(() => !error.value && playlist.value.length > 1)
@@ -2836,12 +3115,20 @@ function goBack() {
 }
 
 /* ---------- 生命周期 ---------- */
-function cleanupMedia() {
+function cleanupMedia(notifyInactive = false) {
   resetPdf()
   resetEbook()
   resetSubtitle()
-  pushNativeInactive()
+  // ⚠️ 切集时**不能**告诉壳"页面走了"（2026-11-02）。
+  //
+  // 这个函数在 `load()` 里也会被调（换下一集），而 `pushNativeInactive`
+  // 会让壳开始 12 秒倒计时收摊。锁屏时拉一次 playInfo 常常就超过 12 秒，
+  // 服务正好在"下一集还没起来"的空窗里被收掉 —— 声音断在这里，
+  // 而且再也起不来（Android 12+ 禁止从后台启动前台服务）。
+  // 只有真正离开播放页（onBeforeUnmount）才算"走了"。
+  if (notifyInactive) pushNativeInactive()
   stopReportTimer()
+  clearAutoplayRetry()
   const el = mediaEl()
   if (el) {
     try {
@@ -2874,6 +3161,15 @@ function onVisibilityChange() {
       }
     }
   } else {
+    // 息屏期间壳可能已经自己接了下一集（页面被冻结，没人响应 ended）。
+    // 回前台第一件事是把这层偏差对齐 —— 否则界面还显示着上一集、
+    // 声音却是下一集，孩子连"我在哪儿"都对不上。
+    const shadowId = Number(nativeShadow.resourceId) || 0
+    if (shadowId > 0 && shadowId !== Number(resourceId.value) && nativeShadow.playing) {
+      isPlaying.value = true
+      router.replace(`/play/${shadowId}`)
+      return
+    }
     // 回前台：先要回播放位置，再同步真实状态
     if (handoffActive) {
       try {
@@ -2884,6 +3180,19 @@ function onVisibilityChange() {
     }
     const el = mediaEl()
     if (el) isPlaying.value = !el.paused
+    // 回前台兜底续播（2026-11-02）：息屏期间被系统掐掉的播放，
+    // 元素会停在暂停态 —— 而**没有任何事件会再触发一次 play()**，
+    // 用户看到的就是"亮屏了它还停在那儿，进度条也不动"。
+    // 只要不是用户主动暂停、也没报错，就自己拉起来。
+    if (el && el.paused && !userPaused.value && !error.value && info.value.url) {
+      el.play().catch(() => {
+        /* 拉不起来就保持暂停，用户点一下播放始终有效 */
+      })
+    }
+    if (nativeAudioMode.value && !isPlaying.value && !userPaused.value && !error.value) {
+      // 原生引擎同理：切后台时若被静音/暂停过，回来续上
+      nativeCmd({ cmd: 'resume' })
+    }
   }
 }
 
@@ -3002,14 +3311,17 @@ onBeforeUnmount(() => {
   } catch (e) {
     window.__kidMedia = null
   }
-  cleanupMedia()
+  // 真正离开播放页：这里才告诉壳"我走了"（切集不能发，见 cleanupMedia）
+  cleanupMedia(true)
   stopTranscodePolling()
   // 正在下载就中断，别让一个已卸载的页面继续吃流量
   if (offlineAbort) offlineAbort.abort()
   // 离开播放页停掉原生那一路，并摘掉回调（否则下一个页面挂上的
-  // 是最新一份，而旧闭包还在被壳持有）
+  // 是最新一份，而旧闭包还在被壳持有）。
+  // `final:true` = 连前台服务一起收摊；换集时发的是普通 stop，服务留着
+  // 等下一集 —— 否则下一集要"从后台启动前台服务"，安卓 12+ 会直接拒绝。
+  if (nativeAudioMode.value) nativeCmd({ cmd: 'stop', final: true })
   clearNativeStartTimer()
-  if (nativeAudioMode.value) nativeCmd({ cmd: 'stop' })
   try {
     delete window.__lsNative
   } catch (e) {

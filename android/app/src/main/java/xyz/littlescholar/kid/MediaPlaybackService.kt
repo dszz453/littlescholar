@@ -149,10 +149,24 @@ class MediaPlaybackService : Service() {
          * 这条是"网页根本播不了（wma），从头就由原生播"。两者互斥，
          * 且原生模式不需要交还 —— 切前后台用的都是同一个 VLC 播放器。
          *
-         * 走 Intent 而不是 instance 直调：服务没起来时也要能一条命令把它拉起来，
-         * 否则第一次点开 wma 就是"没声"。
+         * ⚠️ 服务**已经在跑**时一律直调，绝不走 `startForegroundService` ——
+         * 这是"息屏自动连播"的命门（2026-11-02）：
+         *
+         * 页面切下一集时先发 `stop` 再发 `play`。若两条都走 Intent，
+         * `stop` 会把前台服务收掉（`stopForeground` + `stopSelf`），
+         * 紧接着的 `play` 就是**从后台启动前台服务** —— Android 12+ 直接抛
+         * `ForegroundServiceStartNotAllowedException`，被 catch 掉只留一行诊断，
+         * 表现就是"这一集播完，再也没有下一集"（锁屏时 100% 复现，亮屏时偶发）。
+         *
+         * 服务活着的时候它本来就在前台，指令直接交给实例即可，
+         * 既绕开后台启动限制，也让 stop→play 的顺序变成同步的。
          */
         fun nativeAudio(ctx: Context, json: String) {
+            val live = instance
+            if (live != null && running) {
+                live.main.post { live.handleNative(json) }
+                return
+            }
             val i = Intent(ctx, MediaPlaybackService::class.java).apply {
                 action = ACTION_NATIVE
                 putExtra(EXTRA_JSON, json)
@@ -467,11 +481,26 @@ class MediaPlaybackService : Service() {
                     position = o.optDouble("position", 0.0).toLong().coerceAtLeast(0),
                     url = url,
                     video = false,
+                    resourceId = o.optLong("resourceId", 0).coerceAtLeast(0),
                 )
                 nativeMode = true
+                // 页面自己接上了新一集：预置队列作废（那是给"页面没反应"准备的，
+                // 留着会让下一集播完后切到过期的条目上）。
+                armedQueue.clear()
+                cancelEndFallback()
                 // 原生模式不存在"接管"这回事：播放器本来就在服务里。
                 handoffMode = false
                 handoffPreparing = false
+                // 来了新一集：把"页面走了要收摊"和"播完没人接"两个计时器都撤掉，
+                // 否则它们在息屏弱网下会抢在加载完成之前把服务/兜底关掉。
+                cancelLeaveStop()
+                cancelEndRetry()
+                // 直调通道进来时可能还没进前台（首次指令走的是 onStartCommand，
+                // 那条路已经 startForeground 过了）。这里补一次是幂等的。
+                running = true
+                session?.isActive = true
+                runCatching { startForeground(NOTI_ID, buildNotification()) }
+                acquireLocks()
                 Diagnostics.add("原生播放", "VLC 加载：${url.take(80)}")
                 // ⚠️ 必须接住 Throwable：libvlcjni 的 JNI 注册失败抛的是
                 // UnsatisfiedLinkError（Error 不是 Exception），裸调用会把
@@ -503,7 +532,16 @@ class MediaPlaybackService : Service() {
                 state = state.copy(position = sec)
                 updateSession()
             }
-            "stop" -> stopNative()
+            // 预置"后面几集"。页面在起播时顺手把下一集的地址取好交过来，
+            // 息屏后网页被系统挂起、切集链路断掉时，由原生接着播。
+            // 见 scheduleEndFallback。
+            "arm" -> handleArm(o)
+            // ⚠️ 默认**只停播放器、不拆服务**（见 stopNative 的注释）。
+            // 页面切集时也是发 stop —— 那之后 1~3 秒就要播下一集，
+            // 这时候把前台服务收掉，下一集就得从后台重新启动前台服务，
+            // Android 12+ 必被拒 → "播完这一集就没了"。
+            // 只有页面真正离开（onBeforeUnmount）才带 `final:true`。
+            "stop" -> stopNative(keepService = !o.optBoolean("final", false))
             else -> Diagnostics.add("原生播放", "未知指令：$cmd")
         }
     }
@@ -716,11 +754,36 @@ class MediaPlaybackService : Service() {
             st.durationMs / 1000.0,
             st.ended,
             "",
+            state.resourceId,
         )
+        // 播完这一条只推一次太脆：页面那条 evaluateJavascript 落空就没有第二次，
+        // 表现是"反复停在同一集"。补几次重推，收到新的 play 就撤销。
+        if (st.ended) {
+            scheduleEndRetry()
+            // 页面被系统挂起时，重推再多也没人接。兜底：过一会儿原生自己播下一集。
+            scheduleEndFallback()
+        }
     }
 
-    private fun stopNative() {
+    /**
+     * 停掉原生引擎。
+     *
+     * [keepService] = true 表示"只是换了/停了这一条，服务留着" ——
+     * 页面切集走的就是这一条。为什么不能顺手 stopSelf：
+     *
+     *   切集的真实时序是 `stop`（旧书）→ 拉 playInfo → `play`（新书），
+     *   中间隔着一次网络请求（息屏时可能好几秒）。这期间只要
+     *   `stopForeground` + `stopSelf`，服务就不再是前台服务，
+     *   而 Android 12+ **禁止 App 从后台 `startForegroundService`** ——
+     *   下一集的 play 会被系统直接拒掉，异常还被 catch 吞了，
+     *   用户看到的就是"一集播完就没声了，按播放也没反应"。
+     *
+     *   所以停播放器但保留前台状态与唤醒锁，由宽限计时器兜"页面真的走了"
+     *   这种情况（见 scheduleLeaveStop）。
+     */
+    private fun stopNative(keepService: Boolean = false) {
         if (!nativeMode && vlc == null) {
+            if (keepService) return
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
@@ -728,6 +791,19 @@ class MediaPlaybackService : Service() {
         nativeMode = false
         runCatching { vlc?.stop() }
         MediaBridge.nativeState(false, 0.0, 0.0, false, "")
+        cancelEndRetry()
+        cancelEndFallback()
+        // 页面主动 stop = 它要换一条了（切集 / 退回转码 / 离开）。
+        // 预置队列作废：留着会在下一集播完后切到一条已经过时的地址上。
+        armedQueue.clear()
+        if (keepService) {
+            state = state.copy(playing = false)
+            updateSession()
+            // 页面没在播了，但服务继续留着等下一集。
+            scheduleLeaveStop()
+            return
+        }
+        cancelLeaveStop()
         releaseLocks()
         session?.isActive = false
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -742,24 +818,203 @@ class MediaPlaybackService : Service() {
      * 页面报"不在播"之后多久真正停。
      *
      * 只用来覆盖"切集"那段空窗（页面 cleanup → router.replace → 新一集 play，
-     * 实测 1~3 秒）。以前没有这个计时器，只要处于接管态就无限续命 ——
+     * 亮屏实测 1~3 秒）。以前没有这个计时器，只要处于接管态就无限续命 ——
      * 孩子退出播放页、甚至退出 App 之后，声音还在响。
+     *
+     * ⚠️ 息屏时给 60 秒而不是 12 秒（2026-11-02）：
+     * 锁屏后 WebView 的后台网络被降优先级，拉一次 playInfo 花十几秒是常事，
+     * 12 秒的宽限会在"下一集的接口还没回来"时把服务收掉 ——
+     * 声音断在这里，而且再也起不来（后台启动前台服务被系统禁止）。
+     * 亮屏时仍按 12 秒收，保证退出播放页后通知栏不会赖着不走。
      */
-    private val leaveGraceMs = 12_000L
+    private val leaveGraceMs: Long
+        get() = if (screenInteractive()) 12_000L else 60_000L
 
     private fun scheduleLeaveStop() {
         if (leaveStop != null) return
+        val ms = leaveGraceMs
         val r = Runnable {
             leaveStop = null
-            shutdownPlayback("页面已离开 ${leaveGraceMs / 1000} 秒")
+            shutdownPlayback("页面已离开 ${ms / 1000} 秒")
         }
         leaveStop = r
-        main.postDelayed(r, leaveGraceMs)
+        main.postDelayed(r, ms)
     }
 
     private fun cancelLeaveStop() {
         leaveStop?.let { main.removeCallbacks(it) }
         leaveStop = null
+    }
+
+    private fun screenInteractive(): Boolean = try {
+        (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive ?: true
+    } catch (e: Exception) {
+        true
+    }
+
+    // ============================================================
+    //  播完 → 切下一集：原生侧的重试兜底
+    // ============================================================
+
+    /**
+     * "这一集播完了"推给页面之后的重试。
+     *
+     * 现状只有一次机会：VLC 报 EndReached → `nativeState(ended=true)` →
+     * 页面 `onNativeAudioEnded()` → 切下一集。这条 `evaluateJavascript`
+     * 一旦落空（页面刚被重新加载、闭包换掉、WebView 那一瞬间在忙），
+     * 就没有第二次 —— 用户看到的就是"反复停在同一集"。
+     *
+     * 所以补成"推三次"：5s / 11s / 17s。收到新的 play 指令就撤销
+     * （正常切集 1~2 秒就回来了，多推的两下根本不会发生）。
+     *
+     * ⚠️ 第一次刻意等到 5 秒：**服务器上可能还跑着旧版页面**，那一版没有
+     * "同一集只切一次"的闸门。切集链路（拉接口 → 起播）要是有一次超过
+     * 2 秒，重推就会被旧页面当成新的一次播完，连跳两集。5 秒的余量足够
+     * 让页面的 `stop` 先到（那一条会撤销本计时器）。
+     */
+    private var endRetry: Runnable? = null
+    private var endRetryLeft = 0
+
+    private fun scheduleEndRetry() {
+        cancelEndRetry()
+        endRetryLeft = 3
+        val r = object : Runnable {
+            override fun run() {
+                endRetry = null
+                if (endRetryLeft <= 0) return
+                endRetryLeft--
+                Diagnostics.add("原生播放", "重推「播完了」（剩 $endRetryLeft 次）")
+                MediaBridge.nativeState(false, state.duration.toDouble(), state.duration.toDouble(), true, "")
+                if (endRetryLeft > 0) {
+                    endRetry = this
+                    main.postDelayed(this, 6000L)
+                }
+            }
+        }
+        endRetry = r
+        main.postDelayed(r, 5000L)
+    }
+
+    private fun cancelEndRetry() {
+        endRetry?.let { main.removeCallbacks(it) }
+        endRetry = null
+        endRetryLeft = 0
+    }
+
+    // ============================================================
+    //  「页面失联时自己接上」—— 预置队列 + 兜底切集
+    // ============================================================
+
+    private data class ArmedItem(
+        val url: String,
+        val resourceId: Long,
+        val title: String,
+        val subtitle: String,
+        val poster: String,
+        val duration: Long,
+    )
+
+    /**
+     * 页面预置的"后面几集"。
+     *
+     * 为什么需要它：切集本来只该有一份实现（见 MediaBridge 顶部），但那份
+     * 跑在 WebView 里。**息屏之后系统会冻结网页的 JS**：页面收不到 ended、
+     * 也跑不完"拉接口 → 发 play"这条链路，表现就是"这一集播完就停住"。
+     * 小米 / OPPO 这类 ROM 上尤其明显，因为它们的后台管控更激进。
+     *
+     * 所以让页面在**还醒着的时候**把下一集地址先取好交过来；真到那一刻
+     * 页面没接上，由原生自己播，播完再把 resourceId 推回去让页面把路由对齐。
+     */
+    private var armedQueue: MutableList<ArmedItem> = mutableListOf()
+    private var endFallback: Runnable? = null
+
+    /**
+     * 兜底延迟。
+     *
+     * 要够长：页面醒着但网络慢时，"收到 ended → 下一集出声"实测 3~10 秒，
+     * 抢在它前面就会两边同时播同一集（听起来是从头放两遍）。
+     * 又不能太长：锁屏的孩子会以为故事就这么结束了。
+     */
+    private val endFallbackMs = 14_000L
+
+    private fun handleArm(o: JSONObject) {
+        val arr = o.optJSONArray("items")
+        val q = mutableListOf<ArmedItem>()
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val it = arr.optJSONObject(i) ?: continue
+                val u = it.optString("url", "")
+                if (u.isBlank()) continue
+                q.add(
+                    ArmedItem(
+                        url = u.take(4096),
+                        resourceId = it.optLong("resourceId", 0).coerceAtLeast(0),
+                        title = it.optString("title", "").take(120),
+                        subtitle = it.optString("subtitle", "").take(120),
+                        poster = it.optString("poster", "").take(2048),
+                        duration = it.optLong("duration", 0).coerceIn(0, 24 * 3600),
+                    )
+                )
+            }
+        }
+        armedQueue = q
+        Diagnostics.add("原生播放", "预置下一集 ${q.size} 条")
+    }
+
+    private fun scheduleEndFallback() {
+        cancelEndFallback()
+        val r = Runnable {
+            endFallback = null
+            if (!nativeMode) return@Runnable
+            if (armedQueue.isEmpty()) {
+                Diagnostics.add("原生播放", "播完了，没有预置下一集，等页面")
+                return@Runnable
+            }
+            val next = armedQueue.removeAt(0)
+            Diagnostics.add("原生播放", "页面没接上，兜底播下一集：${next.title.take(30)}")
+            playArmed(next)
+        }
+        endFallback = r
+        main.postDelayed(r, endFallbackMs)
+    }
+
+    private fun cancelEndFallback() {
+        endFallback?.let { main.removeCallbacks(it) }
+        endFallback = null
+    }
+
+    /**
+     * 原生自己接下一集。
+     *
+     * 走的是和页面点播同一个引擎入口，只是地址来自预置队列 ——
+     * 不依赖页面、不依赖接口请求，所以息屏也照播。
+     */
+    private fun playArmed(item: ArmedItem) {
+        state = state.copy(
+            active = true,
+            playing = true,
+            title = item.title.ifBlank { state.title },
+            subtitle = item.subtitle,
+            poster = item.poster.ifBlank { state.poster },
+            duration = if (item.duration > 0) item.duration else 0,
+            position = 0,
+            url = item.url,
+            video = false,
+            resourceId = item.resourceId,
+        )
+        nativeMode = true
+        handoffMode = false
+        handoffPreparing = false
+        cancelLeaveStop()
+        running = true
+        session?.isActive = true
+        runCatching { startForeground(NOTI_ID, buildNotification()) }
+        acquireLocks()
+        updateSession()
+        // 先告诉页面"现在播的是第几条"：回到前台时它据此改路由，
+        // 否则页面还显示着上一集的标题，进度条也会从 0 开始跳。
+        MediaBridge.nativeState(true, 0.0, item.duration.toDouble(), false, "", item.resourceId)
+        runCatching { engine().play(item.url, 0L) }.onFailure { onEngineBroken(it) }
     }
 
     /**
@@ -773,6 +1028,7 @@ class MediaPlaybackService : Service() {
     private fun shutdownPlayback(reason: String) {
         Diagnostics.add("播放", "收工：$reason")
         cancelLeaveStop()
+        cancelEndRetry()
         runCatching { releasePlayer() }
         nativeMode = false
         handoffMode = false
@@ -874,6 +1130,18 @@ class MediaPlaybackService : Service() {
                 MediaBridge.giveBack(pos, ended = false)
                 false
             }
+            // 接管超时（2026-11-02）：`prepareAsync` 在某些网络下**永远不回调**
+            // （网盘直链排队、DNS 卡住、Wi-Fi 刚断）。没有这个计时器，
+            // 页面就一直停在"等待交接"里，而壳这边也没有播放器在响 ——
+            // 用户看到的就是"息屏后它自己停了，怎么点都没声"。
+            val guard = Runnable {
+                if (token != handoffToken || !handoffPreparing) return@Runnable
+                Diagnostics.add("接管", "15 秒仍未就绪，放弃接管、交还网页")
+                handoffPreparing = false
+                releasePlayer()
+                MediaBridge.giveBack(nativePositionSec(), ended = false)
+            }
+            main.postDelayed(guard, 15_000L)
             p.prepareAsync()
         } catch (e: Exception) {
             handoffPreparing = false
@@ -1208,6 +1476,7 @@ class MediaPlaybackService : Service() {
         running = false
         instance = null
         cancelLeaveStop()
+        cancelEndRetry()
         releasePlayer()
         runCatching { vlc?.release() }
         vlc = null
@@ -1235,6 +1504,14 @@ data class MediaState(
     val position: Long = 0,
     val hasPrev: Boolean = false,
     val hasNext: Boolean = false,
+    /**
+     * 当前在播的资源 ID。
+     *
+     * 为什么原生也要知道：息屏后网页被系统挂起，切集这条链路（页面拉接口
+     * 再发 play）会断在这里。兜底切集是原生自己做的，做完必须告诉页面
+     * "现在播的是哪一条"，否则回到前台时页面显示的还是上一集的标题和进度。
+     */
+    val resourceId: Long = 0,
     /** 当前在播的地址。后台接管要用，所以必须由网页带过来。 */
     val url: String = "",
     /** 是不是视频（决定 AudioAttributes 的 content type）。 */
@@ -1266,6 +1543,7 @@ data class MediaState(
                     url = o.optString("url", "").take(4096),
                     video = o.optBoolean("video", false),
                     paused = o.optBoolean("paused", false),
+                    resourceId = o.optLong("resourceId", 0).coerceAtLeast(0),
                 )
             } catch (e: Exception) {
                 null

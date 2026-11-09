@@ -82,6 +82,9 @@ object MediaBridge {
         duration: Double,
         ended: Boolean,
         error: String,
+        // 当前在播的资源 ID：兜底切集之后页面靠它把路由对齐。
+        // 给默认值，老的调用点（只报状态）不用改。
+        resourceId: Long = 0,
     ) {
         // 用 JSONObject 拼而不是手写字符串：error 里可能带引号/换行，
         // 手拼一次就是一个"页面整段脚本不执行"的悬案。
@@ -91,6 +94,7 @@ object MediaBridge {
             .put("duration", if (duration.isFinite()) duration else 0.0)
             .put("ended", ended)
             .put("error", error)
+            .put("resourceId", if (resourceId > 0) resourceId else 0L)
             .toString()
         call("window.__lsNative && window.__lsNative.onState && window.__lsNative.onState($o)")
     }

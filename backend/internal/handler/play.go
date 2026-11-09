@@ -740,17 +740,44 @@ func (h *PlayHandler) History(c *gin.Context) {
 		Title        string `json:"title"`
 		Cover        string `json:"cover"`
 		CategoryName string `json:"categoryName"`
+		// CategoryPath 多级目录（乐学英语 / 新概念英语 / 第一册），
+		// 让「最近听过」也能看出这条属于哪个目录。
+		CategoryPath string `json:"categoryPath"`
 	}
+
+	// 批量取资源，别在循环里一条一条 Preload：
+	// 30 条历史就是 30 次往返，而这里只要一次 IN 查询。
+	resIDs := make([]uint64, 0, len(records))
+	for _, r := range records {
+		resIDs = append(resIDs, r.ResourceID)
+	}
+	resMap := make(map[uint64]model.Resource, len(resIDs))
+	if len(resIDs) > 0 {
+		var resList []model.Resource
+		h.db.Where("id IN ?", resIDs).Find(&resList)
+		for _, res := range resList {
+			resMap[res.ID] = res
+		}
+	}
+
+	catIDs := make([]uint64, 0, len(resMap))
+	for _, res := range resMap {
+		catIDs = append(catIDs, res.CategoryID)
+	}
+	paths := resolveCategoryPaths(h.db, catIDs)
+
 	list := make([]out, 0, len(records))
 	for _, r := range records {
-		var res model.Resource
-		h.db.Preload("Category").First(&res, r.ResourceID)
-		cn := ""
-		if res.Category != nil {
-			cn = res.Category.Name
+		res := resMap[r.ResourceID]
+		full := paths[res.CategoryID]
+		cn := full
+		// CategoryName 保持原语义 = 叶子那一级
+		if i := strings.LastIndex(full, " / "); i >= 0 {
+			cn = full[i+3:]
 		}
 		list = append(list, out{
-			PlayRecord: r, Title: res.Title, Cover: res.Cover, CategoryName: cn,
+			PlayRecord: r, Title: res.Title, Cover: res.Cover,
+			CategoryName: cn, CategoryPath: full,
 		})
 	}
 	util.Page(c, total, page, pageSize, list)

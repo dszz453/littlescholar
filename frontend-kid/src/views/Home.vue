@@ -13,6 +13,21 @@
     </header>
 
     <div class="page-pad">
+      <!-- 接着上次听：一进首页就能续上，不用自己去翻目录找那一集。
+           只在「真的播到一半」时出现（听完的、刚点开没播的不算）。 -->
+      <div v-if="resumeCard" class="resume-strip pressable" @click="goResume">
+        <span class="rs-ico">{{ resumeCard.emoji }}</span>
+        <div class="rs-body">
+          <div class="rs-title ellipsis">{{ resumeCard.title }}</div>
+          <div class="rs-sub ellipsis">
+            <template v-if="resumeCard.dir">{{ resumeCard.dir }} · </template>
+            已听 {{ resumeCard.percent }}%
+          </div>
+          <div class="rs-bar"><i :style="{ width: resumeCard.percent + '%' }" /></div>
+        </div>
+        <span class="rs-go">继续 ›</span>
+      </div>
+
       <!-- 今日任务：有学习计划时置顶，孩子一进首页就知道今天要做什么 -->
       <div v-if="planTask" class="plan-strip pressable" :class="{ done: planTask.done }" @click="goPlan">
         <span class="p-ico">{{ planTask.done ? '✅' : '🎯' }}</span>
@@ -78,7 +93,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import SearchBar from '@/components/SearchBar.vue'
 import { useUserStore } from '@/stores/user'
-import { planApi, digestApi } from '@/api'
+import { planApi, digestApi, playApi } from '@/api'
 import { resolveIcon, tint } from '@/assets/icons'
 
 const router = useRouter()
@@ -90,6 +105,8 @@ const loading = ref(true)
 const planTask = ref(null)
 // 小书童说（null = 还没有沉淀，不显示这张卡）
 const digestCard = ref(null)
+// 接着上次听（null = 没有"播到一半"的内容）
+const resumeCard = ref(null)
 
 const roots = computed(() => userStore.tree || [])
 
@@ -187,6 +204,55 @@ async function loadDigestCard() {
   }
 }
 
+// loadResumeCard 「接着上次听」卡片。
+//
+// 数据就是播放历史（按 played_at 倒序），但**不能直接用第一条**：
+// 孩子刚看完一集的话，最近一条是"已完成"的，点"继续"却从头播，
+// 比不显示更让人困惑。所以要挑最近一条真的停在中间的。
+//
+// 门槛：播过 10 秒以上（少于这个数多半只是点开看了一眼）、
+// 完成度 95% 以下（后端 95% 就标 finished 了，这里再兜一次）。
+async function loadResumeCard() {
+  try {
+    const data = await playApi.history({ page: 1, pageSize: 8 })
+    const list = data?.list || data || []
+    if (!Array.isArray(list) || !list.length) {
+      resumeCard.value = null
+      return
+    }
+    const hit = list.find((r) => {
+      if (r.finished) return false
+      const pos = Number(r.position) || 0
+      const pct = Number(r.percentage) || 0
+      return pos > 10 && pct < 95
+    })
+    if (!hit) {
+      resumeCard.value = null
+      return
+    }
+    const dur = Number(hit.duration) || 0
+    const pos = Number(hit.position) || 0
+    const pct = dur > 0 ? Math.round((pos / dur) * 100) : Math.round(Number(hit.percentage) || 0)
+    const emoji = { audio: '🎧', video: '🎬', pdf: '📄', image: '🖼️', ebook: '📖' }
+    resumeCard.value = {
+      resourceId: hit.resourceId || hit.id,
+      title: hit.title || '上次的内容',
+      dir: hit.categoryPath || hit.categoryName || '',
+      percent: Math.max(1, Math.min(99, pct)),
+      emoji: emoji[hit.mediaType] || '📚',
+    }
+  } catch {
+    resumeCard.value = null
+  }
+}
+
+function goResume() {
+  const c = resumeCard.value
+  if (!c?.resourceId) return
+  // 播放页会自己按 playInfo.lastPosition 定位，这里不用带进度参数
+  router.push({ name: 'play', params: { id: c.resourceId } })
+}
+
 onMounted(async () => {
   try {
     await userStore.loadTree()
@@ -196,7 +262,8 @@ onMounted(async () => {
     loading.value = false
   }
 
-  // 下面三个都是"有就显示、没有就不显示"，彼此独立，谁失败都不影响别人
+  // 下面几个都是"有就显示、没有就不显示"，彼此独立，谁失败都不影响别人
+  loadResumeCard()
   loadPlanTask()
   loadDigestCard()
 })
@@ -220,6 +287,56 @@ onMounted(async () => {
   margin-top: 3px;
   font-size: 13.5px;
   color: var(--c-text-sub);
+}
+
+/* ===== 接着上次听 ===== */
+
+.resume-strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 15px;
+  margin-bottom: 10px;
+  border-radius: var(--r-lg);
+  background: linear-gradient(135deg, #fff3e0, #ffe9d1);
+  box-shadow: 0 6px 18px rgba(240, 160, 60, 0.18);
+}
+.rs-ico {
+  font-size: 26px;
+  line-height: 1;
+}
+.rs-body {
+  flex: 1;
+  min-width: 0;
+}
+.rs-title {
+  font-size: 15.5px;
+  font-weight: 700;
+  color: #6b4423;
+}
+.rs-sub {
+  margin-top: 2px;
+  font-size: 12.5px;
+  color: #9c7248;
+}
+.rs-bar {
+  margin-top: 7px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(240, 160, 60, 0.22);
+  overflow: hidden;
+}
+.rs-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #f6a623, #ffc46b);
+}
+.rs-go {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #d98218;
+  white-space: nowrap;
 }
 
 /* ===== 今日任务 ===== */
