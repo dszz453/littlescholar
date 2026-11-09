@@ -101,6 +101,17 @@ if [ "$(count nativeAudio)" -ge 1 ]; then
 else
 	bad "dex 里没有 nativeAudio —— 页面永远走不到原生模式，wma 只能等服务端转码"
 fi
+
+# ⚠️ 这类"只被 JS 调"的桥方法最容易被 R8 静默删掉：它们没有任何 Java
+# 调用者，proguard 里少了 @JavascriptInterface 那条规则就会被判成死代码。
+# libVLC 的 JNI 回调就真的这样被删过（见 4b）。
+# 标准版桥上真正承担"播/不播"的是 setPlaying，删了它前台服务根本不会起 ——
+# 而页面里那声调用被 try/catch 包着，表现是"息屏就断"，接口层全绿。
+if [ "$(count setPlaying)" -ge 1 ]; then
+	ok "桥上有 setPlaying（前台服务靠它起停，R8 没删）"
+else
+	bad "dex 里没有 setPlaying —— proguard 的 @JavascriptInterface 规则失效了，息屏会断"
+fi
 if [ "$(count '原生模式不需要接管')" -ge 1 ]; then
 	ok "原生模式下拒绝后台接管（不会与 VLC 抢出声）"
 else
@@ -115,6 +126,20 @@ if [ "$(count '引擎起不来')" -ge 1 ]; then
 	ok "引擎崩了也有兜底（runCatching + 诊断），页面会退回转码地址"
 else
 	bad "找不到「引擎起不来」兜底 —— native 抛 Error 时会把前台服务一起带走"
+fi
+
+# 2026-10-26：标准版点开 wma "完全没反应"。libVLC 3.6.5 失败只给一个
+# EncounteredError，没有日志回调，所以壳里必须自己再问一次那个地址
+# （Java 的 TLS 栈），并把结论写进诊断。缺了它，下次再出同类问题仍然只能猜。
+if [ "$(count '探测')" -ge 1 ]; then
+	ok "原生播放带旁路探测（失败原因会进诊断，不再只有「没反应」）"
+else
+	bad "dex 里没有旁路探测 —— VLC 拉不到流时拿不到任何原因"
+fi
+if [ "$(count '没开始播放')" -ge 1 ]; then
+	ok "原生播放有看门狗（长时间不出声会主动降级，不会死在死按钮上）"
+else
+	bad "找不到看门狗文案「没开始播放」—— VLC 卡在打开阶段时页面永远等不到状态"
 fi
 
 # ---- 4b. libVLC 的 JNI 回调不能被 R8 动 ----

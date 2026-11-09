@@ -74,7 +74,14 @@ services:
       redis:
         condition: service_healthy
     networks:
-      - ls-net
+      ls-net:
+        # 显式声明别名：前端 nginx 靠 Docker 内嵌 DNS 找后端。
+        # 只靠 compose 自动加的 service 名，在主机重启后 docker 恢复容器时
+        # aliases 可能被清空（2026-10-26 线上实测）→ /api/ 全 502。
+        # nginx 里已改用容器名 ls-core，这里再兜一层。
+        aliases:
+          - core-server
+          - ls-core
 
   # ============ 后台管理前端（nginx 托管）============
   frontend:
