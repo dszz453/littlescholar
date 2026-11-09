@@ -17,8 +17,8 @@ def siteUrl = project.hasProperty('siteUrl') ? project.siteUrl : 'https://study.
 // 抽成变量是为了让产物名与包里的 versionName **只有一个来源** ——
 // 两处各写一遍，迟早在某次升版本时漏改一处，于是分发给家长的那个包
 // 名字写着 1.2.0、装上去是 1.3.0，排查问题时全乱。
-def appVersionName = '1.7.7'
-def appVersionCode = 10707 // = 10000×1 + 100×7 + 7
+def appVersionName = '1.7.8'
+def appVersionCode = 10708 // = 10000×1 + 100×7 + 8
 // 产物的显示名（不含 .apk）。标配客户端就叫「小书童」，不带后缀。
 def appArtifactBase = '小书童'
 
@@ -47,6 +47,13 @@ android {
         // ⚠️ versionCode 不递增时覆盖安装会直接失败，系统只回一句"应用未安装"。
         versionCode appVersionCode
         // 版本历史（倒序）：
+        //   1.7.8  **移除 libVLC，改用系统 MediaPlayer**。音频已经统一由
+        //          服务端转成 m4a（AAC），平台自带解码器就够；而 libVLC 在这批
+        //          平板上 12 秒建不起一条 TCP（Java 探针对同一地址 206），
+        //          每次播放都要先白等看门狗。换掉后 APK 从约 43MB 降到几 MB，
+        //          也不再受 VLC 自带 CA 库与 IPv6 优先的拖累。
+        //          新增 preparing 状态：转码期间告诉页面"已接手、在准备"，
+        //          别让页面 12 秒看门狗误判成壳没反应。
         //   1.7.4  诊断回传能真正定位"VLC 一条请求都不发"：vlc.log 只挑
         //          错误线索行（原来是尾部 1500 字原始噪声，全是 demux 心跳），
         //          并且回传地址在 8616(https) 失败时自动退一份 8093(明文) ——
@@ -110,9 +117,9 @@ android {
         //   1.1.0  升级自愈 + 诊断面板
         versionName appVersionName
 
-        // libVLC 的 .aar 里带 四个 ABI 的 .so（每个约 10MB）。
-        // 只打手机用得上的两个：x86/x86_64 是模拟器与极老的平板，
-        // 留着等于白送用户 40MB 流量。
+        // 只打手机用得上的两个 ABI（x86/x86_64 是模拟器与极老平板）。
+        // 1.7.8 移除 libVLC 后包里已经没有自带的 .so，但保留这条限制：
+        // 以后再加任何带 native 库的依赖，也不会把 APK 撑成四份。
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a'
         }
@@ -167,12 +174,9 @@ android {
             excludes += ['META-INF/*.kotlin_module', 'META-INF/DEPENDENCIES']
         }
         jniLibs {
-            // ⚠️ 必须用 legacy 打包（压缩 .so）。
-            //
-            // libVLC 的 arm64 libvlc.so 有 43MB、armv7 有 39MB，而 AGP 默认
-            // **不压缩** native 库（extractNativeLibs=false）—— 实测就是
-            // 一个 89MB 的 APK。改成压缩后安装时会解压，启动慢一点点，
-            // 但包体积砍掉一半以上（家长用微信/网盘传这个包）。
+            // 1.7.8 起包里已无大体积 .so（libVLC 移除），这条保留是为了
+            // 兼容老设备：legacy 打包会把 .so 压缩存放、安装时解压，
+            // 对少数 extractNativeLibs=false 支持不好的国产 ROM 更稳。
             useLegacyPackaging = true
         }
     }
@@ -208,18 +212,13 @@ dependencies {
     // 前者自带扫码界面、不依赖 Google Play 服务，包体也小得多 ——
     // 这种"家里用一次"的场景没必要引 ML Kit。
     implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
-    // libVLC：唯一能在客户端**原生**解 wma/ape 这些格式的引擎。
+    // ⚠️ 1.7.8 起不再引 libVLC。
     //
-    // 为什么必须引：WebView 的 <audio> 由 Chromium 解码，而 Chromium
-    // 对 wma 的 canPlayType 直接返回空串、加载报 DEMUXER_ERROR_COULD_NOT_OPEN
-    // （2026-10-21 实测）。所以只要还在网页里播，wma 就必须服务端转码 ——
-    // J1900 上转一本 3 分钟的绘本要 21.6 秒，孩子点开就是干等一分钟。
+    // 原来引它是为了在客户端原生解 wma —— 那套方案在 1.6.0 成立，但前提
+    // 已经不成立：服务端把 wma/ape/amr 统一转成 m4a（AAC in MP4），而 AAC
+    // 是 Android 平台**内置**解码器，每台设备都有，客户端不需要自带解码库。
     //
-    // 代价：APK 从 0.85MB 涨到约 20MB（两个 ABI 的 libvlc.so）。
-    // 这是"原生支持"唯一付得起的价 —— 另一条路（Media3 + 自编译 ffmpeg
-    // 解码扩展）能压到 7MB，但需要 NDK 交叉编译，且只覆盖我们开了的那几个编码器。
-    // 版本钉在 3.6.5，不用 3.7.x：后者要求 compileSdk >= 36，而本项目是 34
-    // （AGP 8.5.2 的推荐上限也是 34）。3.6.5 的 aar metadata 是 minCompileSdk=1，
-    // 解码能力与 3.7 对 wma/ape 这一档没有区别。
-    implementation 'org.videolan.android:libvlc-all:3.6.5'
+    // 而 libVLC 在这批平板上一次都没连通过（详见 NativeAudioEngine 顶部），
+    // 代价却是 +43MB 的 libvlc.so、自带 CA 库不认新根、IPv6 不回退。
+    // 用 android.media.MediaPlayer 就够了，见 NativeAudioEngine.kt。
 }

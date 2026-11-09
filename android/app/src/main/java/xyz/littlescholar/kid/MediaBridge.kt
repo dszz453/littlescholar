@@ -71,8 +71,8 @@ object MediaBridge {
     /**
      * 原生引擎的状态回推（时间轴靠它）。
      *
-     * wma 这类格式由 VLC 在服务里播，页面连 `<audio>` 都没有 ——
-     * 进度条、时间、字幕全靠这一路。**次数很密**（VLC 每 250ms 一次 TimeChanged），
+     * 服务端转码音频由原生引擎在服务里播，页面没有 `<audio>` ——
+     * 进度条、时间、字幕全靠这一路。**次数很密**（引擎每 500ms 一次），
      * 所以参数用基本类型、拼一次 JSON，别在原生侧再做节流：
      * 页面自己按 `Math.floor(sec * 2)` 去重比这里猜频率可靠。
      */
@@ -85,6 +85,9 @@ object MediaBridge {
         // 当前在播的资源 ID：兜底切集之后页面靠它把路由对齐。
         // 给默认值，老的调用点（只报状态）不用改。
         resourceId: Long = 0,
+        // 已接手、但还没 prepare 完（可能在等服务端转码）。
+        // 页面收到它会撤掉"壳没反应"的看门狗，但不当作已出声。
+        preparing: Boolean = false,
     ) {
         // 用 JSONObject 拼而不是手写字符串：error 里可能带引号/换行，
         // 手拼一次就是一个"页面整段脚本不执行"的悬案。
@@ -95,6 +98,7 @@ object MediaBridge {
             .put("ended", ended)
             .put("error", error)
             .put("resourceId", if (resourceId > 0) resourceId else 0L)
+            .put("preparing", preparing)
             .toString()
         call("window.__lsNative && window.__lsNative.onState && window.__lsNative.onState($o)")
     }

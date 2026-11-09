@@ -147,7 +147,7 @@ class MediaPlaybackService : Service() {
          *
          * 与 [takeOver] 的区别：接管是"网页已经在播、切后台时交给原生接着放"；
          * 这条是"网页根本播不了（wma），从头就由原生播"。两者互斥，
-         * 且原生模式不需要交还 —— 切前后台用的都是同一个 VLC 播放器。
+         * 且原生模式不需要交还 —— 切前后台用的都是同一个原生播放器。
          *
          * ⚠️ 服务**已经在跑**时一律直调，绝不走 `startForegroundService` ——
          * 这是"息屏自动连播"的命门（2026-11-02）：
@@ -301,13 +301,17 @@ class MediaPlaybackService : Service() {
     private var leaveStop: Runnable? = null
 
     /**
-     * 原生解码引擎（libVLC）。**只有 nativeMode 为 true 时它才是"当前真正在播的那个"**。
+     * 原生解码引擎（系统 MediaPlayer）。**只有 nativeMode 为 true 时它才是"当前真正在播的那个"**。
      *
-     * 与 [player]（MediaPlayer，用于后台接管 mp4/mp3）是两条互斥的路：
+     * 与 [player]（后台接管用的另一个 MediaPlayer）是两条互斥的路：
      * 网页**能**解的格式走 WebView（音画同步、字幕、倍速都在页面里）；
-     * 网页**解不了**的（wma/ape/amr…）才由它播，页面退化成遥控器 + 字幕层。
+     * 网页**解不了**的（服务端统一转成 m4a 产物）才由它播，
+     * 页面退化成遥控器 + 字幕层。
+     *
+     * 1.7.8 起底层从 libVLC 换成系统 MediaPlayer：音频已经统一转成 AAC，
+     * 平台自带解码器就够，不必再扛 43MB 的 libvlc.so（见 NativeAudioEngine）。
      */
-    private var vlc: VlcAudioEngine? = null
+    private var audioEngine: NativeAudioEngine? = null
     private var nativeMode = false
 
     /** 给 `isHandingOff()` 用（准备中也算，避免准备期被误停服务）。 */
@@ -341,7 +345,7 @@ class MediaPlaybackService : Service() {
             }
             ACTION_NATIVE -> {
                 // startForegroundService 要求 5 秒内 startForeground，
-                // 所以先把面板立起来，再让 VLC 去加载（加载可能要一两秒）。
+                // 所以先把面板立起来，再让引擎去加载（可能要一两秒）。
                 running = true
                 session?.isActive = true
                 acquireLocks()
@@ -389,7 +393,7 @@ class MediaPlaybackService : Service() {
             return
         }
         if (nativeMode) {
-            vlc?.resume()
+            audioEngine?.resume()
             markPlaying(true)
             return
         }
@@ -411,7 +415,7 @@ class MediaPlaybackService : Service() {
             return
         }
         if (nativeMode) {
-            vlc?.pause()
+            audioEngine?.pause()
             markPlaying(false)
             return
         }
@@ -428,7 +432,7 @@ class MediaPlaybackService : Service() {
     }
 
     private fun nativePositionSec(): Long {
-        if (nativeMode) return (vlc?.positionMs ?: 0L) / 1000L
+        if (nativeMode) return (audioEngine?.positionMs ?: 0L) / 1000L
         val p = player ?: return state.position
         return try {
             (p.currentPosition / 1000L).coerceAtLeast(0)
@@ -501,18 +505,19 @@ class MediaPlaybackService : Service() {
                 session?.isActive = true
                 runCatching { startForeground(NOTI_ID, buildNotification()) }
                 acquireLocks()
-                Diagnostics.add("原生播放", "VLC 加载：${url.take(80)}")
-                // ⚠️ 必须接住 Throwable：libvlcjni 的 JNI 注册失败抛的是
-                // UnsatisfiedLinkError（Error 不是 Exception），裸调用会把
-                // 前台服务一起带走 —— 用户看到的就是"点开 wma 客户端直接退出"。
+                Diagnostics.add("原生播放", "原生加载：${url.take(80)}")
+                // 必须接住 Throwable：引擎初始化失败抛的可能是 Error 而非
+                // Exception，裸调用会把前台服务一起带走 —— 用户看到的就是
+                // "点开音频客户端直接退出"。
                 runCatching { engine().play(url, state.position * 1000L) }
                     .onFailure { onEngineBroken(it) }
-                // 与 VLC 并行地问一次同一个地址（只取 1KB）。
-                // 3.6.5 的 libVLC 不给日志回调，失败只有一个 EncounteredError，
-                // 分不清"证书不被信任""DNS 卡住""服务端 4xx"——这一问就是答案。
+                // 与播放并行地问一次同一个地址（只取 1KB）。
+                // 系统的 MediaPlayer 报错只有 what/extra 两个数字，
+                // "服务端 404/401" 和 "解码器不认这种格式" 在它眼里一模一样；
+                // 这一问能把网络层的问题先排除掉，写进诊断。
                 probeAsync(url)
-                // 12 秒后把诊断 + VLC 日志尾部回传一次：够 VLC 走完 demux
-                // 与首帧，又不会拖太久。只在真机排障期需要，见 reportDiag。
+                // 12 秒后把诊断回传一次：够走完 prepare 与首帧，
+                // 又不会拖太久。只在真机排障期需要，见 reportDiag。
                 Thread {
                     runCatching { Thread.sleep(12_000) }
                     reportDiag("native+12s")
@@ -546,15 +551,15 @@ class MediaPlaybackService : Service() {
         }
     }
 
-    private fun engine(): VlcAudioEngine =
-        vlc ?: VlcAudioEngine(applicationContext) { st -> onNativeState(st) }.also { vlc = it }
+    private fun engine(): NativeAudioEngine =
+        audioEngine ?: NativeAudioEngine(applicationContext) { st -> onNativeState(st) }
+            .also { audioEngine = it }
 
     /**
-     * 原生引擎起不来（JNI 注册失败 / so 加载失败 / 解码器缺失）。
+     * 原生引擎起不来（引擎初始化失败 / 解码器缺失）。
      *
-     * 真正该挡住它的是 proguard 里的 `-keep class org.videolan.**`；这里是
-     * 兜底，只为保证**最坏情况也不闪退**：留一条诊断、把引擎丢掉，并推一个
-     * error 给页面 —— 页面收到就退回 `info.url`（服务端转码地址）。
+     * 这里只是兜底，只为保证**最坏情况也不闪退**：留一条诊断、把引擎丢掉，
+     * 并推一个 error 给页面 —— 页面收到就退回 `info.url`（服务端转码地址）。
      * 慢一点，但一定出得来声。
      */
     private fun onEngineBroken(e: Throwable) {
@@ -563,8 +568,8 @@ class MediaPlaybackService : Service() {
             "引擎起不来：${e.javaClass.simpleName}: ${e.message}",
         )
         nativeMode = false
-        runCatching { vlc?.release() }
-        vlc = null
+        runCatching { audioEngine?.release() }
+        audioEngine = null
         MediaBridge.nativeState(false, 0.0, 0.0, false, "NATIVE_UNAVAILABLE")
     }
 
@@ -573,22 +578,16 @@ class MediaPlaybackService : Service() {
     // ============================================================
 
     /**
-     * 为什么要它：2026-10-26 标准版点开 wma **完全没有反应** ——
-     * 页面上连通话记录都没有，只有"点了播放没动静"。
+     * 为什么要它：系统 MediaPlayer 报错只有 `what`/`extra` 两个整数，
+     * 「服务端返回 401/404」和「解码器不认这个容器」在它眼里都是
+     * `MEDIA_ERROR_UNKNOWN`，光看诊断分不出来。
      *
-     * 探针已经证明前端把 `https://…/api/stream/9?t=…` 交给了壳，
-     * 所以问题只可能在壳拉这个地址这一步。而 libVLC 3.6.5 失败时只抛
-     * 一个 `EncounteredError`，不带原因 —— 常见的三种完全不同的病
-     * （系统 CA 里缺根证书、DNS 卡住、票据过期 401）在用户眼里长得一模一样。
+     * 这里用同一套系统网络栈（HttpURLConnection）再问一次同一个地址：
+     *   · 探测失败（4xx/5xx/握手失败）→ 问题在网络或票据层，与解码无关；
+     *   · 探测成功（206 + Content-Type）而播放失败 → 问题在解码/容器。
+     * 两种结论都写进诊断，下一次就不用猜了。
      *
-     * 这里用 **Java 自己的网络栈**（HttpsURLConnection，走 Android 系统
-     * TrustManager）再问一次同一个地址：
-     *   · 探测失败 → 网络/证书层就过不去，与 VLC 解码无关；
-     *   · 探测成功而 VLC 不播 → 问题在 VLC 内部（参数/解码器），
-     *     与 URL 无关。
-     * 两种结论都直接写进诊断，下一次就不用猜了。
-     *
-     * 探测只取 1KB 就断开（Range），对服务端与流量都可忽略。
+     * 只取 1KB 就断开（Range），对服务端与流量都可忽略。
      */
     private val probeExec = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "ls-native-probe").apply { isDaemon = true }
@@ -599,19 +598,12 @@ class MediaPlaybackService : Service() {
             val verdict = runCatching { probeOnce(url) }
                 .getOrElse { "FAIL ${it.javaClass.simpleName}: ${it.message}" }
             Diagnostics.add("原生播放", "探测 $verdict")
-            // 已经出声了就不打扰；还没出声就立刻让页面降级，
-            // 不用干等 15 秒的看门狗。
-            if (verdict.startsWith("FAIL") && nativeMode && !engine().isPlaying) {
-                onNativeState(
-                    VlcAudioEngine.State(
-                        playing = false,
-                        positionMs = 0,
-                        durationMs = state.duration * 1000L,
-                        ended = false,
-                        error = verdict.take(120),
-                    ),
-                )
-            }
+            // 只记录，**不主动打断播放**。
+            //
+            // 1.7.8 起引擎与探针用的是同一套系统网络栈，探针失败不再等于
+            // 播放失败 —— 探针带的是自己的 UA、只取 1KB，被限流或拒 UA
+            // 都可能失败，而正常播放压根没受影响。真播不出来时引擎自己
+            // 会走 onError（带 what/extra），不必由探针代劳。
         }
     }
 
@@ -632,25 +624,11 @@ class MediaPlaybackService : Service() {
                 val ctx = applicationContext
                 val base = ServerConfig.get(ctx)
                 if (base.isBlank()) return@runCatching
-                val diag = Diagnostics.dump(ctx).takeLast(1500)
-                // vlc.log 尾部 1500 字符基本是 demux 的心跳噪声，肉眼找不到结论。
-                // 只捞带错误线索的行；一行都没有时退回最后 12 行。
-                val vlc = runCatching {
-                    val f = java.io.File(ctx.filesDir, "vlc.log")
-                    if (!f.exists()) return@runCatching "(vlc.log 不存在)"
-                    val lines = f.readLines().takeLast(4000)
-                    val keys = listOf(
-                        "error", "warn", "cannot", "failed", "refused", "unreachable",
-                        "timed out", "timeout", "no route", "socket", "http", "tls", "ssl",
-                        "access_", "demux", "cannot open",
-                    )
-                    val hit = lines.filter { l ->
-                        val s = l.lowercase()
-                        keys.any { s.contains(it) }
-                    }.takeLast(40)
-                    if (hit.isEmpty()) lines.takeLast(12).joinToString("\n") else hit.joinToString("\n")
-                }.getOrDefault("(读取失败)")
-                val msg = "[$tag]\n$diag\n--- vlc.log ---\n$vlc"
+                val diag = Diagnostics.dump(ctx).takeLast(2400)
+                // 1.7.8 起不再带 vlc.log：换成系统 MediaPlayer 后它不存在了，
+                // 而 MediaPlayer 的错误码（what/extra）已经在 fail() 里
+                // 转成人话写进 Diagnostics，这里少一段反而更好读。
+                val msg = "[$tag]\n$diag"
                 // ⚠️ 2026-10-29：原来把 2600 字符一次性塞进 query，实测**被截断**了 ——
                 // access log 里那行只剩 2018 字节，而开头的关键记录（[原生播放]
                 // 加载地址、探针结果）恰好是被切掉的那一头，等于白跑一趟。
@@ -725,12 +703,12 @@ class MediaPlaybackService : Service() {
     }
 
     /**
-     * VLC 的状态回调（已切到主线程）。
+     * 原生引擎的状态回调（已切到主线程）。
      *
      * 三件事：刷新面板、把位置推给页面（进度条与字幕都靠它）、
      * 播完通知页面去切下一集。
      */
-    private fun onNativeState(st: VlcAudioEngine.State) {
+    private fun onNativeState(st: NativeAudioEngine.State) {
         if (st.error.isNotEmpty()) {
             Diagnostics.add("原生播放", "失败：${st.error}")
             // 失败也要告诉页面：它会退到"这一段放不了"的提示，
@@ -739,6 +717,18 @@ class MediaPlaybackService : Service() {
             return
         }
         if (!nativeMode) return
+        // 已经接手、但还没 prepare 完（可能在等服务端把 m4a 转出来）。
+        //
+        // 单独一条：页面收到它会撤掉"壳没反应"的 12 秒看门狗，
+        // 但**不会**当成"已经出声"去动状态。没有它的话，一本新书
+        // 第一次播放（转码 20 秒）会让页面以为原生链路坏了，
+        // 退回网页再发一次同样的请求，等于白等两遍。
+        if (st.preparing) {
+            MediaBridge.nativeState(
+                false, 0.0, 0.0, false, "", state.resourceId, preparing = true,
+            )
+            return
+        }
         state = state.copy(
             playing = st.playing,
             position = st.positionMs / 1000L,
@@ -782,14 +772,14 @@ class MediaPlaybackService : Service() {
      *   这种情况（见 scheduleLeaveStop）。
      */
     private fun stopNative(keepService: Boolean = false) {
-        if (!nativeMode && vlc == null) {
+        if (!nativeMode && audioEngine == null) {
             if (keepService) return
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
         }
         nativeMode = false
-        runCatching { vlc?.stop() }
+        runCatching { audioEngine?.stop() }
         MediaBridge.nativeState(false, 0.0, 0.0, false, "")
         cancelEndRetry()
         cancelEndFallback()
@@ -1021,8 +1011,8 @@ class MediaPlaybackService : Service() {
      * 收摊：停掉**所有**可能出声的东西，然后收掉前台服务。
      *
      * 三路都要停 —— 少停一路就是"退出后还在响"：
-     *   · [player]  后台接管用的 MediaPlayer（mp4/mp3）
-     *   · [vlc]     原生引擎（wma/ape）
+     *   · [player]      后台接管用的 MediaPlayer（mp4/mp3）
+     *   · [audioEngine] 原生引擎（服务端转好的 m4a）
      *   · 前台服务本身 + 唤醒锁 + 媒体面板
      */
     private fun shutdownPlayback(reason: String) {
@@ -1033,7 +1023,7 @@ class MediaPlaybackService : Service() {
         nativeMode = false
         handoffMode = false
         handoffPreparing = false
-        runCatching { vlc?.stop() }
+        runCatching { audioEngine?.stop() }
         releaseLocks()
         session?.isActive = false
         if (running) {
@@ -1187,7 +1177,7 @@ class MediaPlaybackService : Service() {
             override fun onSkipToPrevious() = MediaBridge.prev()
             override fun onSeekTo(pos: Long) {
                 if (nativeMode) {
-                    vlc?.seekTo(pos)
+                    audioEngine?.seekTo(pos)
                     state = state.copy(position = pos / 1000L)
                     updateSession()
                     return
@@ -1478,8 +1468,8 @@ class MediaPlaybackService : Service() {
         cancelLeaveStop()
         cancelEndRetry()
         releasePlayer()
-        runCatching { vlc?.release() }
-        vlc = null
+        runCatching { audioEngine?.release() }
+        audioEngine = null
         releaseLocks()
         session?.release()
         session = null

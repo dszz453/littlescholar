@@ -70,7 +70,7 @@
              这段同样不能一声不响 —— 用户 2026-10-29 报的"点了没反应"
              有一部分就是这段空窗。 -->
         <p v-else-if="nativeWaitSec > 0" class="audio-prep-tip">
-          正在打开音频，已等 {{ nativeWaitSec }} 秒…
+          正在准备音频，首次收听要转码，已等 {{ nativeWaitSec }} 秒…
         </p>
 
         <!-- 音频也有字幕：很多"听故事"其实是英语启蒙，字幕是刚需 -->
@@ -1078,6 +1078,19 @@ function onNativeAudioState(st) {
     clearNativeStartTimer()
     // 明确报错 = 这台设备真的解不了，写盘免得每次都空等
     fallbackToWebAudio(true)
+    return
+  }
+  // 壳已经接手、但还没出声（`preparing`）。
+  //
+  // 1.7.8 起客户端换成系统 MediaPlayer，libVLC 那套"12 秒建不起 TCP"
+  // 的静默失败没有了；这里的等待是**正常的**：服务端正在把 wma 转成 m4a
+  // （实测 3 分钟绘本 21.6 秒），转完引擎自己就开播。
+  //
+  // 所以只撤掉"壳没反应"的看门狗，不当成已出声、也不回退 ——
+  // 否则页面会退回 `<audio>` 把同一个请求重发一遍，白等两遍。
+  if (st.preparing) {
+    nativeGotState = true
+    clearNativeStartTimer()
     return
   }
   if (st.playing) {
