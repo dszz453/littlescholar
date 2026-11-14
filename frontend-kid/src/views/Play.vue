@@ -868,22 +868,32 @@ const NATIVE_AUDIO_ENABLED = (() => {
   }
 })()
 
+
+
 /**
- * 【已停用，留作历史参考】交给 libVLC 的地址一律用**明文 HTTP**。
- * 换成系统 MediaPlayer 后不再需要（见 nativeMediaURL 的注释）。
+ * 原生播放地址：**必须换成明文入口**（8616 → 8093）。
  *
- * 2026-10-26 实录：原生模式下 nginx 访问日志里连一条 `/api/stream` 都看不到，
- * 而同一次点击的 Java 探针（同一个 URL）拿到了 206 —— 说明 VLC 根本没把
- * 请求发出去，卡在 TCP 之后的 TLS 握手。
+ * ============ 2026-11-14 实测：换回明文的理由 ============
  *
- * 原因：libVLC 的 TLS 用**它自己打包的 CA 库**，不走 Android 系统信任库；
- * 而 8616 的证书链已经换成 Let's Encrypt 新一代根（`ISRG Root YR`，由
- * ISRG Root X1 交叉签名）。Chromium（页面）和 Java 网络栈（探针）都认，
- * 只有 VLC 的旧 CA 库认不出来。
+ * 1.7.9 用系统 MediaPlayer 后，我一度认为"系统 TLS 栈和浏览器一致"，
+ * 所以把这里的明文改写去掉了，直接给 https。结果真机上原生播放**当场失败**：
  *
- * 同一份孩子端在 8093 上有明文入口，内容与票据校验完全一致，所以原生链路
- * 改走它，直接绕开"VLC 认不认这张证书"。只在 https:8616 下替换，
- * 其它端口/局域网地址不动，避免猜错映射。
+ *     14:15:23.483 [原生播放] 原生加载：https://…:8616/api/audio/8412?t=…
+ *     14:15:23.636 [原生播放] 错误码 -38 (what=-38 extra=0)   ← 150ms 就报错
+ *
+ * 而同一时刻 nginx 访问日志里**一条 `/api/audio/8412` 都没有** ——
+ * 播放器没把请求发出去就失败了。现场复测找到真因：
+ *
+ *     https://study.19860819.xyz:8616/api/audio/8412   普通 GET → 25 秒超时，零字节
+ *     同上，带 Range: bytes=0-1023                     → 206，正常
+ *     http://study.19860819.xyz:8093/api/audio/8412    普通 GET → 200，2.75MB
+ *
+ * 8616 前面是 LuckyWeb（一层反代），它对**不带 Range 的大响应**会把请求挂住；
+ * MediaPlayer 恰好先发普通 GET（它不保证带 Range），于是 150ms 就放弃。
+ * 8093 是本机 nginx 直出，普通 GET 一次拿全。
+ *
+ * 结论：原生链路**只走 8093 明文口**。票据在 8093 上同样校验，内容一致。
+ * 只在 https:8616 下替换，其它端口/局域网地址不动，避免猜错映射。
  */
 const NATIVE_PLAIN_BASE = (() => {
   try {
@@ -897,21 +907,20 @@ const NATIVE_PLAIN_BASE = (() => {
   }
 })()
 
-/**
- * 原生播放地址：绝对化即可，**不再换成明文入口**。
- *
- * 明文口（8616 ↔ 8093）是 libVLC 时代的补丁：VLC 自带 CA 库、不认
- * Let's Encrypt 新一代根，握手就断且不报错，只能绕开 TLS。
- *
- * 2026-11-09 换成系统 MediaPlayer 后，它用的是 Android 系统 TLS 栈，
- * 与浏览器、Java 探针完全一致，那张证书它是认的。继续走明文只会多两个风险：
- *   · 依赖服务器额外开放 8093（端口没开/被封时，播放直接失败）；
- *   · 音频内容走公网明文（票据仍校验，但没必要）。
- * 所以这里直接返回 https 原地址。`NATIVE_PLAIN_BASE` 保留但停用，
- * 需要回退到老 APK 时有现成代码可查。
- */
+/** https:8616 的老地址改写成明文口；其余原样绝对化。 */
 function nativeMediaURL(u) {
-  return absoluteURL(u)
+  const abs = absoluteURL(u)
+  if (!abs || !NATIVE_PLAIN_BASE) return abs
+  try {
+    const t = new URL(abs)
+    // 只改 8616 这一条：换成明文口 + 原路径 + 原票据
+    if (t.protocol === 'https:' && t.port === '8616') {
+      return `http://${t.hostname}:8093${t.pathname}${t.search}`
+    }
+  } catch {
+    /* 解析失败就原样返回 */
+  }
+  return abs
 }
 
 /**
@@ -3077,8 +3086,12 @@ async function armNext() {
       // 只预置"壳自己能播"的：音视频、非 HLS。
       // HLS 交给系统 MediaPlayer 在很多机型上直接失败，宁可不预置。
       if (!d || d.playMode === 'hls') break
+      // 两条来源都过 nativeMediaURL：兜底队列是**原生**去播的，
+      // 给 https:8616 它会 150ms 就报 -38（见 nativeMediaURL 的注释）。
       const u =
-        (d.nativeAudio && d.nativeUrl ? nativeMediaURL(d.nativeUrl) : '') || d.url || ''
+        (d.nativeAudio && d.nativeUrl ? nativeMediaURL(d.nativeUrl) : '') ||
+        nativeMediaURL(d.url) ||
+        ''
       if (!u) break
       items.push({
         url: u,
