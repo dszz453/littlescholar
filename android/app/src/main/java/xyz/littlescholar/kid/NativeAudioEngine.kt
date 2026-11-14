@@ -116,14 +116,24 @@ class NativeAudioEngine(
 
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
         when (change) {
+            // ⚠️ 永久失焦也可能是**假的**：小米/OPPO 这类 ROM 在息屏时会给所有
+            // 正在出声的播放器发一条 LOSS 做省电，之后就再也不补 GAIN。
+            // 以前这里 pause 完就不管了 —— 表现正是"播着播着自己暂停，再也
+            // 不动"。所以这里只暂停、并安排一次重试抢回焦点；抢到就接着播。
+            // 不会误伤用户主动暂停：`pausedByFocus` 只在"正在播时被打断"才置位。
             AudioManager.AUDIOFOCUS_LOSS -> {
-                pausedByFocus = false
-                pause()
+                if (isPlaying) {
+                    pausedByFocus = true
+                    hasFocus = false
+                    pauseInternal()
+                    scheduleFocusRetry()
+                }
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
                 if (isPlaying) {
                     pausedByFocus = true
-                    pause()
+                    hasFocus = false
+                    pauseInternal()
                 }
             }
             AudioManager.AUDIOFOCUS_GAIN -> {
@@ -136,6 +146,35 @@ class NativeAudioEngine(
             // 让系统的默认行为（对方也降）更适合这里。
             else -> Unit
         }
+    }
+
+    /** LOSS 之后的重试：抢回焦点就继续播，抢不到就安静待着，5 秒一问。 */
+    private var focusRetry: Runnable? = null
+
+    private fun scheduleFocusRetry() {
+        cancelFocusRetry()
+        val r = object : Runnable {
+            override fun run() {
+                focusRetry = null
+                // 期间用户自己按了暂停 / 换了源 / 已经恢复 —— 都不该再抢
+                if (!pausedByFocus || player == null) return
+                if (requestFocus()) {
+                    pausedByFocus = false
+                    Diagnostics.add("原生播放", "重新拿到音频焦点，继续播放")
+                    resume()
+                } else {
+                    focusRetry = this
+                    main.postDelayed(this, 5_000L)
+                }
+            }
+        }
+        focusRetry = r
+        main.postDelayed(r, 3_000L)
+    }
+
+    private fun cancelFocusRetry() {
+        focusRetry?.let { main.removeCallbacks(it) }
+        focusRetry = null
     }
 
     val isPlaying: Boolean
@@ -249,6 +288,14 @@ class NativeAudioEngine(
     }
 
     fun pause() {
+        // 页面/用户主动暂停：**清掉"因焦点暂停"的标记**，否则挂断电话后
+        // 会自己响起来（用户明明按了暂停）。
+        pausedByFocus = false
+        cancelFocusRetry()
+        pauseInternal()
+    }
+
+    private fun pauseInternal() {
         stopTick()
         runCatching { if (isPlaying) player?.pause() }
         emit()
@@ -295,7 +342,12 @@ class NativeAudioEngine(
     private val ticker = object : Runnable {
         override fun run() {
             if (player == null) return
-            if (!isPlaying) return
+            // ⚠️ 这里**不能**因为 `!isPlaying` 就 return 掉。
+            //
+            // 暂停时 `pause()` 已经 `stopTick()` 了，所以能跑到这里的
+            // "没在播"只可能是**瞬时**的（缓冲、系统调度、刚 start 还没生效）。
+            // 一旦在这里 return 且不重新 postDelayed，轮询就永久停了 ——
+            // 表现是进度条卡住、字幕不动，而声音其实还在放。
             emit()
             main.postDelayed(this, TICK_MS)
         }
@@ -382,6 +434,8 @@ class NativeAudioEngine(
     private fun releasePlayer() {
         disarmPrepareGuard()
         stopTick()
+        cancelFocusRetry()
+        pausedByFocus = false
         preparing = false
         val p = player
         player = null
@@ -423,8 +477,18 @@ class NativeAudioEngine(
         emit(error = msg)
     }
 
-    /** 把回调线程切回主线程，页面拿到的状态才是有序的。 */
-    private fun emit(ended: Boolean = false, error: String = lastError) {
+    /**
+     * 把回调线程切回主线程，页面拿到的状态才是有序的。
+     *
+     * ⚠️ `error` 的默认值必须是**空串**，不能是 `lastError`。
+     *
+     * 曾经写成 `error: String = lastError`，于是"这条资源失败过一次"之后，
+     * 之后每 500ms 的进度上报都会把那条旧错误再带一遍 —— 服务层看到
+     * `st.error` 非空就把页面打回 `<audio>`，而页面此时可能压根没出事。
+     * 一次瞬时错误会永久毒化整条播放，症状是"播着播着突然没声/重来"。
+     * 失败只由 [fail] 显式上报一次。
+     */
+    private fun emit(ended: Boolean = false, error: String = "") {
         val st = State(
             playing = isPlaying,
             positionMs = if (ended) lengthMs else positionMs,

@@ -869,7 +869,8 @@ const NATIVE_AUDIO_ENABLED = (() => {
 })()
 
 /**
- * 交给 libVLC 的地址一律用**明文 HTTP**。
+ * 【已停用，留作历史参考】交给 libVLC 的地址一律用**明文 HTTP**。
+ * 换成系统 MediaPlayer 后不再需要（见 nativeMediaURL 的注释）。
  *
  * 2026-10-26 实录：原生模式下 nginx 访问日志里连一条 `/api/stream` 都看不到，
  * 而同一次点击的 Java 探针（同一个 URL）拿到了 206 —— 说明 VLC 根本没把
@@ -896,25 +897,23 @@ const NATIVE_PLAIN_BASE = (() => {
   }
 })()
 
-/** 原生播放地址：先绝对化，必要时换成明文入口。 */
+/**
+ * 原生播放地址：绝对化即可，**不再换成明文入口**。
+ *
+ * 明文口（8616 ↔ 8093）是 libVLC 时代的补丁：VLC 自带 CA 库、不认
+ * Let's Encrypt 新一代根，握手就断且不报错，只能绕开 TLS。
+ *
+ * 2026-11-09 换成系统 MediaPlayer 后，它用的是 Android 系统 TLS 栈，
+ * 与浏览器、Java 探针完全一致，那张证书它是认的。继续走明文只会多两个风险：
+ *   · 依赖服务器额外开放 8093（端口没开/被封时，播放直接失败）；
+ *   · 音频内容走公网明文（票据仍校验，但没必要）。
+ * 所以这里直接返回 https 原地址。`NATIVE_PLAIN_BASE` 保留但停用，
+ * 需要回退到老 APK 时有现成代码可查。
+ */
 function nativeMediaURL(u) {
-  const abs = absoluteURL(u)
-  if (!abs || !NATIVE_PLAIN_BASE) return abs
-  return abs.replace(/^https:\/\/[^/]+/i, NATIVE_PLAIN_BASE)
+  return absoluteURL(u)
 }
 
-// nativeAudioMode：这条音频交给壳里的 libVLC 直接播原文件。
-//
-// ⚠️ 2026-10-29 修正：**有产物时不要走这条路**。
-//
-// 起因（用户报「打开还要等 12 秒」）：libVLC 连不上时是**静默**的 ——
-// 不报错、不出声、服务端 access log 里连一条 TCP 都看不到，页面只能靠
-// 12 秒看门狗兜底，然后才退回 /api/audio。而库里 125 条 wma 的 m4a
-// 早就转好在盘上了，读它就是 **0.5 秒**、零 CPU。
-//
-// 所以顺序反过来：`audioCached=true` 时直接用 `url`（现成文件），
-// 只有**没有产物**的新书才去赌 libVLC 那条直连（省掉现场转码）。
-// 这不是"回到转码"—— 转码早在没人看的时候做完了，这里只是把文件发出去。
 /**
  * 原生此刻在播哪一条（壳推上来的影子状态）。
  *
@@ -944,12 +943,30 @@ function adoptingNative() {
   return adoptId.value > 0 && Number(adoptId.value) === Number(resourceId.value)
 }
 
+/**
+ * 音频走原生还是走网页 `<audio>`。
+ *
+ * ⚠️ 这里曾经有个 `!info.value.audioCached` 的条件（只在**没转好**时才交给原生），
+ * 那是 libVLC 时代的结论：VLC 在这批平板上连不上服务端，而服务端产物命中缓存
+ * 只要 0.18 秒，所以"有产物就用网页 `<audio>`"确实更快。
+ *
+ * 2026-11-09 换成系统 MediaPlayer 之后，这个前提**不再成立**：原生和页面用的是
+ * 同一个 m4a 地址、同一套系统网络栈，速度没有区别；而网页 `<audio>` 有个致命
+ * 短板 —— **息屏后 WebView 被系统冻结，`<audio>` 跟着停**，表现就是"播着播着
+ * 自己暂停"，播完了也没人切下一集（`ended` 事件在冻结的页面里根本跑不出来）。
+ *
+ * 11-09 顺手打开预热后，147 条音频全部 `audioCached=true`，于是**每一本**都被
+ * 这个条件推给了网页 `<audio>`，症状就从"个别书要等"升级成"每本都断"。
+ *
+ * 现在只要后端说这条音频能原生播（`nativeAudio` + `nativeUrl`），就交给原生：
+ * 播放器活在 Service 里，锁屏、息屏、切后台都不受影响，还自带兜底切集。
+ * 只有原生真的失败（`nativeBroken`）才退回网页。
+ */
 const nativeAudioMode = computed(
   () =>
     NATIVE_AUDIO_ENABLED &&
     isAudio.value &&
-    (adoptingNative() ||
-      (!info.value.audioCached && !!info.value.nativeAudio && !!info.value.nativeUrl)) &&
+    (adoptingNative() || (!!info.value.nativeAudio && !!info.value.nativeUrl)) &&
     !nativeBroken.value &&
     !!nativeAudioBridge(),
 )
@@ -1076,8 +1093,16 @@ function onNativeAudioState(st) {
   if (st.error) {
     nativeGotState = true
     clearNativeStartTimer()
-    // 明确报错 = 这台设备真的解不了，写盘免得每次都空等
-    fallbackToWebAudio(true)
+    // 明确报错要退网页，但**只有"这台设备真解不了"才写盘**。
+    //
+    // 壳的报错文案分两类（见 NativeAudioEngine.describeError）：
+    //   · 解码类 —— 格式不对 / 解码器不支持 / 解码服务挂了 / 打不开：
+    //     换一本也一样放不了，写盘 20 分钟，省得每本都白试一次；
+    //   · 环境类 —— 超时 / 读写网络错误 / 拿不到音频焦点：
+    //     网络抖动或系统一时忙，下一本大概率就正常，写盘等于把自己锁死。
+    //     这类只退本次，不写盘。
+    const fatal = /解码|格式不对|不支持|打不开/.test(st.error)
+    fallbackToWebAudio(fatal)
     return
   }
   // 壳已经接手、但还没出声（`preparing`）。
@@ -3038,8 +3063,8 @@ async function armNext() {
     }
     return
   }
-  // 标准版交给 libVLC 解原文件；PRO 没有这条，接管的是页面 <audio> 的地址。
-  const useNativeURL = nativeAudioMode.value
+  // 优先用后端给的原生地址；没有再退回网页地址 ——
+  // 「有产物」时两者本来就是同一个 m4a，别因为一个字段缺失就放弃兜底。
   const items = []
   let cur = Number(resourceId.value)
   for (let i = 0; i < 3; i++) {
@@ -3052,11 +3077,8 @@ async function armNext() {
       // 只预置"壳自己能播"的：音视频、非 HLS。
       // HLS 交给系统 MediaPlayer 在很多机型上直接失败，宁可不预置。
       if (!d || d.playMode === 'hls') break
-      const u = useNativeURL
-        ? d.nativeAudio && d.nativeUrl
-          ? nativeMediaURL(d.nativeUrl)
-          : ''
-        : d.url || ''
+      const u =
+        (d.nativeAudio && d.nativeUrl ? nativeMediaURL(d.nativeUrl) : '') || d.url || ''
       if (!u) break
       items.push({
         url: u,

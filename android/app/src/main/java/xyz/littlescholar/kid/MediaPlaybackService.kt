@@ -245,6 +245,20 @@ class MediaPlaybackService : Service() {
     @Volatile
     private var lastPlayingAt: Long = 0L
 
+    /**
+     * 页面最后一次心跳的时间（`applyState` 每 5 秒一次）。
+     *
+     * 用来区分两件长得很像、处理方式却相反的事：
+     *   · 页面活着，只是切集慢 → 兜底切集必须**让路**，否则两边同时出声；
+     *   · 页面被系统冻结（息屏后 WebView 常见）→ 兜底必须**接手**，
+     *     否则这一集播完就永远停住。
+     *
+     * 息屏时 JS 被冻，`evaluateJavascript` 只排队不执行，心跳会停 ——
+     * 所以"心跳停了"正是"页面收不到指令"的可靠信号，比猜更准。
+     */
+    @Volatile
+    private var lastPageBeatAt: Long = 0L
+
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
@@ -927,6 +941,14 @@ class MediaPlaybackService : Service() {
      */
     private val endFallbackMs = 14_000L
 
+    /**
+     * 页面心跳多久之内算"还活着"（见 [scheduleEndFallback]）。
+     *
+     * 页面每 5 秒推一次状态，所以 20 秒 = 连续漏掉 4 次，基本可以断定
+     * 已经被系统冻结（息屏后最常见），而不是"刚好在忙"。
+     */
+    private val PAGE_BEAT_ALIVE_MS = 20_000L
+
     private fun handleArm(o: JSONObject) {
         val arr = o.optJSONArray("items")
         val q = mutableListOf<ArmedItem>()
@@ -955,7 +977,24 @@ class MediaPlaybackService : Service() {
         cancelEndFallback()
         val r = Runnable {
             endFallback = null
-            if (!nativeMode) return@Runnable
+            // 页面还活着就先让它切。
+            //
+            // 这条判据以前是 `if (!nativeMode) return`，只对"原生在播"生效 ——
+            // 于是**接管路径**（页面 `<audio>` 被交过来播）播完永远没人接：
+            // 页面冻着收不到 ended，壳这边又直接 return，声音就停在那儿。
+            //
+            // 改成看心跳：页面每 5 秒推一次 applyState，真活着就一定会刷新；
+            // 息屏后 WebView 冻结、心跳停摆，才是该接手的信号。
+            // 20 秒的窗口足以覆盖"页面醒着但网络慢、切集要几秒"的情况，
+            // 又不至于让孩子对着静音干等太久。
+            val sinceBeat = System.currentTimeMillis() - lastPageBeatAt
+            if (lastPageBeatAt > 0 && sinceBeat < PAGE_BEAT_ALIVE_MS) {
+                Diagnostics.add(
+                    "原生播放",
+                    "播完了，页面还活着（${sinceBeat / 1000}s 前有心跳），等它切",
+                )
+                return@Runnable
+            }
             if (armedQueue.isEmpty()) {
                 Diagnostics.add("原生播放", "播完了，没有预置下一集，等页面")
                 return@Runnable
@@ -980,6 +1019,9 @@ class MediaPlaybackService : Service() {
      * 不依赖页面、不依赖接口请求，所以息屏也照播。
      */
     private fun playArmed(item: ArmedItem) {
+        // 兜底可能从"接管"路径过来（页面冻死时，接管用的播放器刚播完）。
+        // 先把它收掉，否则新旧两个播放器会同时出声 —— 听起来像重音。
+        runCatching { releasePlayer() }
         state = state.copy(
             active = true,
             playing = true,
@@ -1112,6 +1154,10 @@ class MediaPlaybackService : Service() {
                 releasePlayer()
                 MediaBridge.giveBack(pos, ended = true)
                 markPlaying(false)
+                // 但页面可能已经被系统冻结（息屏后 WebView 的 JS 不执行，
+                // evaluateJavascript 只排队），这时"交还"等于没人接这一棒。
+                // 补一次兜底：页面还活着会让路，冻住了才由原生自己播下一集。
+                scheduleEndFallback()
             }
             p.setOnErrorListener { _, what, extra ->
                 Diagnostics.add("接管", "原生播放失败 what=$what extra=$extra，交还网页")
@@ -1200,6 +1246,9 @@ class MediaPlaybackService : Service() {
 
     /** 把最新状态灌进 session（元数据 + 播放状态 + 通知）。 */
     fun applyState(st: MediaState) {
+        // 页面还活着（心跳）。息屏后 JS 被冻结，这里就不会再更新 ——
+        // 兜底切集靠它判断"该不该让路"，见 lastPageBeatAt。
+        lastPageBeatAt = System.currentTimeMillis()
         // 页面说"我不在播了"（离开播放页、退出 App、切集时的过渡）：
         // 给一个短宽限，到点还没回来就真的收摊。
         //

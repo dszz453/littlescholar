@@ -17,8 +17,8 @@ def siteUrl = project.hasProperty('siteUrl') ? project.siteUrl : 'https://study.
 // 抽成变量是为了让产物名与包里的 versionName **只有一个来源** ——
 // 两处各写一遍，迟早在某次升版本时漏改一处，于是分发给家长的那个包
 // 名字写着 1.2.0、装上去是 1.3.0，排查问题时全乱。
-def appVersionName = '1.7.8'
-def appVersionCode = 10708 // = 10000×1 + 100×7 + 8
+def appVersionName = '1.7.9'
+def appVersionCode = 10709 // = 10000×1 + 100×7 + 9
 // 产物的显示名（不含 .apk）。标配客户端就叫「小书童」，不带后缀。
 def appArtifactBase = '小书童'
 
@@ -47,6 +47,17 @@ android {
         // ⚠️ versionCode 不递增时覆盖安装会直接失败，系统只回一句"应用未安装"。
         versionCode appVersionCode
         // 版本历史（倒序）：
+        //   1.7.9  **息屏连播的真正修复：音频默认交给原生**。
+        //          1.7.8 换了 MediaPlayer 之后仍然断，根因不在引擎，在**选路**：
+        //          页面有个 `!audioCached` 条件（libVLC 时代"有产物就用网页
+        //          <audio> 更快"），而 11-09 打开预热后 147 条全都有产物 ——
+        //          于是**每一本**都交给了网页 <audio>，息屏后 WebView 一冻结
+        //          就"播着播着暂停"，播完也没人切下一集（ended 跑不出来）。
+        //          现在只要后端给了 nativeAudio/nativeUrl 就走原生：播放器活在
+        //          Service 里，锁屏息屏照播，还有预置队列兜底连播。
+        //          配套：接管路径播完也安排兜底（按页面心跳判断该不该让路）；
+        //          原生地址不再走 8093 明文口；AUDIOFOCUS_LOSS 之后会重抢焦点
+        //          （小米/OPPO 息屏时会给所有播放器发 LOSS 做省电）。
         //   1.7.8  **移除 libVLC，改用系统 MediaPlayer**。音频已经统一由
         //          服务端转成 m4a（AAC），平台自带解码器就够；而 libVLC 在这批
         //          平板上 12 秒建不起一条 TCP（Java 探针对同一地址 206），
