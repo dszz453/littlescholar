@@ -17,6 +17,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.provider.Settings
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
@@ -870,6 +871,7 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun nativeAudio(json: String?) {
             try {
+                maybeAskBatteryExemption()
                 MediaPlaybackService.nativeAudio(this@MainActivity, json ?: "")
             } catch (e: Exception) {
                 Diagnostics.add("原生播放", "指令失败：${e.message}")
@@ -884,6 +886,34 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 Diagnostics.add("接管", "交还失败：${e.message}")
             }
+        }
+    }
+
+    /**
+     * 息屏连播的最后一道保险（1.7.10）：请求"忽略电池优化"。
+     *
+     * 现象（2026-11 真机）：锁屏后音频播着播着自己停，点亮屏幕、
+     * App 回到前台才继续 —— 这是 ROM 的省电管控把进程"半冻结"了：
+     * 前台服务 + 唤醒锁都不足以豁免，必须用户手动把它加进白名单。
+     *
+     * 触发时机：第一次收到页面的原生播放指令（用户已经开始听了，
+     * 这时弹系统对话框最不打扰，且孩子端装一次只弹一次）。
+     * 用户拒绝了就不再骚扰（记在 SharedPreferences）。
+     */
+    private fun maybeAskBatteryExemption() {
+        val pm = getSystemService(PowerManager::class.java) ?: return
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        val sp = getSharedPreferences("kid_shell", Context.MODE_PRIVATE)
+        if (sp.getBoolean("batteryAsked", false)) return
+        sp.edit().putBoolean("batteryAsked", true).apply()
+        runCatching {
+            Diagnostics.add("播放", "请求忽略电池优化（省电管控会冻结息屏播放）")
+            startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName"),
+                ),
+            )
         }
     }
 

@@ -338,6 +338,8 @@ class MediaPlaybackService : Service() {
         instance = this
         createChannel()
         createSession()
+        // 失速自愈巡检（见 stallWatch 的注释）。
+        main.postDelayed(stallWatch, 5_000L)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -407,6 +409,7 @@ class MediaPlaybackService : Service() {
             return
         }
         if (nativeMode) {
+            userPaused = false
             audioEngine?.resume()
             markPlaying(true)
             return
@@ -429,6 +432,7 @@ class MediaPlaybackService : Service() {
             return
         }
         if (nativeMode) {
+            userPaused = true
             audioEngine?.pause()
             markPlaying(false)
             return
@@ -489,6 +493,24 @@ class MediaPlaybackService : Service() {
                     Diagnostics.add("原生播放", "地址为空，忽略")
                     return
                 }
+                val rid = o.optLong("resourceId", 0).coerceAtLeast(0)
+                // 1.7.10 追认闸门：壳已经在播这同一条（自动切集后页面醒来、
+                // 或新旧页面/壳的时序差）时，把 play 当"对齐"而不是"重播"，
+                // 否则正在播的这集会从头再放一遍。
+                if (nativeMode && rid > 0 && rid == state.resourceId &&
+                    audioEngine?.isPlaying == true
+                ) {
+                    val incoming = o.optDouble("position", 0.0).toLong()
+                    val diff = Math.abs(incoming - state.position)
+                    if (diff <= 15 || incoming <= 5) {
+                        Diagnostics.add("原生播放", "页面追认当前集（pos=$incoming），不重播")
+                        return
+                    }
+                }
+                loopMode = o.optString("loopMode", "order").take(16)
+                userPaused = false
+                nativeEnded = false
+                engineFailed = false
                 state = state.copy(
                     active = true,
                     playing = true,
@@ -499,13 +521,13 @@ class MediaPlaybackService : Service() {
                     position = o.optDouble("position", 0.0).toLong().coerceAtLeast(0),
                     url = url,
                     video = false,
-                    resourceId = o.optLong("resourceId", 0).coerceAtLeast(0),
+                    resourceId = rid,
                 )
                 nativeMode = true
-                // 页面自己接上了新一集：预置队列作废（那是给"页面没反应"准备的，
+                // 页面自己接上了新一集：预置队列作废（那是给"壳自己切"用的，
                 // 留着会让下一集播完后切到过期的条目上）。
                 armedQueue.clear()
-                cancelEndFallback()
+                cancelAutoAdvance()
                 // 原生模式不存在"接管"这回事：播放器本来就在服务里。
                 handoffMode = false
                 handoffPreparing = false
@@ -521,16 +543,15 @@ class MediaPlaybackService : Service() {
                 acquireLocks()
                 Diagnostics.add("原生播放", "原生加载：${url.take(80)}")
                 // 必须接住 Throwable：引擎初始化失败抛的可能是 Error 而非
-                // Exception，裸调用会把前台服务一起带走 —— 用户看到的就是
-                // "点开音频客户端直接退出"。
-                runCatching { engine().play(url, state.position * 1000L) }
+                // Exception，裸调用会把前台服务一起带走。
+                runCatching { engine().play(rid, url, state.position * 1000L) }
                     .onFailure { onEngineBroken(it) }
                 // 与播放并行地问一次同一个地址（只取 1KB）。
                 // 系统的 MediaPlayer 报错只有 what/extra 两个数字，
                 // "服务端 404/401" 和 "解码器不认这种格式" 在它眼里一模一样；
                 // 这一问能把网络层的问题先排除掉，写进诊断。
                 probeAsync(url)
-                // 12 秒后把诊断回传一次：够走完 prepare 与首帧，
+                // 12 秒后把诊断回传一次：够走完下载与首帧，
                 // 又不会拖太久。只在真机排障期需要，见 reportDiag。
                 Thread {
                     runCatching { Thread.sleep(12_000) }
@@ -538,10 +559,12 @@ class MediaPlaybackService : Service() {
                 }.start()
             }
             "pause" -> {
+                userPaused = true
                 engine().pause()
                 markPlaying(false)
             }
             "resume" -> {
+                userPaused = false
                 engine().resume()
                 markPlaying(true)
             }
@@ -552,8 +575,7 @@ class MediaPlaybackService : Service() {
                 updateSession()
             }
             // 预置"后面几集"。页面在起播时顺手把下一集的地址取好交过来，
-            // 息屏后网页被系统挂起、切集链路断掉时，由原生接着播。
-            // 见 scheduleEndFallback。
+            // 壳自动切集时直接用（含本地缓存键 = resourceId）。
             "arm" -> handleArm(o)
             // ⚠️ 默认**只停播放器、不拆服务**（见 stopNative 的注释）。
             // 页面切集时也是发 stop —— 那之后 1~3 秒就要播下一集，
@@ -725,6 +747,7 @@ class MediaPlaybackService : Service() {
     private fun onNativeState(st: NativeAudioEngine.State) {
         if (st.error.isNotEmpty()) {
             Diagnostics.add("原生播放", "失败：${st.error}")
+            engineFailed = true
             // 失败也要告诉页面：它会退到"这一段放不了"的提示，
             // 而不是永远转圈等一个不会来的声音。
             MediaBridge.nativeState(false, 0.0, 0.0, false, st.error)
@@ -763,9 +786,11 @@ class MediaPlaybackService : Service() {
         // 播完这一条只推一次太脆：页面那条 evaluateJavascript 落空就没有第二次，
         // 表现是"反复停在同一集"。补几次重推，收到新的 play 就撤销。
         if (st.ended) {
+            nativeEnded = true
             scheduleEndRetry()
-            // 页面被系统挂起时，重推再多也没人接。兜底：过一会儿原生自己播下一集。
-            scheduleEndFallback()
+            // 1.7.10：壳自己就是切集者 —— 短暂停顿后直接播下一条，
+            // 不再等页面（页面息屏即冻结，等它 = 必停）。
+            scheduleAutoAdvance()
         }
     }
 
@@ -793,6 +818,7 @@ class MediaPlaybackService : Service() {
             return
         }
         nativeMode = false
+        userPaused = false
         runCatching { audioEngine?.stop() }
         MediaBridge.nativeState(false, 0.0, 0.0, false, "")
         cancelEndRetry()
@@ -812,6 +838,46 @@ class MediaPlaybackService : Service() {
         session?.isActive = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    // ============================================================
+    //  失速自愈（1.7.10）：治"播着播着自己停"
+    // ============================================================
+
+    /**
+     * 每 5 秒巡检：预期在播（原生模式、非用户暂停、非准备中、非播完、
+     * 无错误）却没声 —— 先 resume，还不行就整个重建播放器。
+     *
+     * 为什么需要：焦点重试只覆盖 AUDIOFOCUS_LOSS 这一个明确的暂停来源；
+     * 某些 ROM 息屏"半冻结"进程的方式是引擎不报错、不回调、只是不出声。
+     * 没有事件可订阅，只能主动巡。
+     */
+    private var stallTicks = 0
+    private val stallWatch = object : Runnable {
+        override fun run() {
+            main.postDelayed(this, 5_000L)
+            val eng = audioEngine ?: return
+            if (!nativeMode || !running || userPaused || nativeEnded || engineFailed ||
+                autoAdvance != null
+            ) {
+                stallTicks = 0
+                return
+            }
+            if (eng.isPreparing || eng.isPlaying) {
+                stallTicks = 0
+                return
+            }
+            stallTicks++
+            if (stallTicks == 2) {
+                Diagnostics.add("自愈", "引擎停转 ${stallTicks * 5}s，尝试续播")
+                runCatching { eng.resume() }
+            } else if (stallTicks >= 4) {
+                stallTicks = 0
+                Diagnostics.add("自愈", "重建播放器 @${state.position}s")
+                runCatching { eng.play(state.resourceId, state.url, state.position * 1000L) }
+                    .onFailure { onEngineBroken(it) }
+            }
+        }
     }
 
     // ============================================================
@@ -906,7 +972,7 @@ class MediaPlaybackService : Service() {
     }
 
     // ============================================================
-    //  「页面失联时自己接上」—— 预置队列 + 兜底切集
+    //  壳自动切集（1.7.10）：壳是**唯一**的切集者
     // ============================================================
 
     private data class ArmedItem(
@@ -921,33 +987,40 @@ class MediaPlaybackService : Service() {
     /**
      * 页面预置的"后面几集"。
      *
-     * 为什么需要它：切集本来只该有一份实现（见 MediaBridge 顶部），但那份
-     * 跑在 WebView 里。**息屏之后系统会冻结网页的 JS**：页面收不到 ended、
-     * 也跑不完"拉接口 → 发 play"这条链路，表现就是"这一集播完就停住"。
-     * 小米 / OPPO 这类 ROM 上尤其明显，因为它们的后台管控更激进。
+     * 1.7.10 起切集**只有一份实现**：壳播完 → [scheduleAutoAdvance] →
+     * [advanceQueue] → 播下一条 → 推 resourceId 给页面"追认"。
+     * 页面不再参与切集（它息屏会被冻结，1.7.9 及以前"页面切、壳 14 秒
+     * 后兜底"的双实现正是反复翻车的根源）。
      *
-     * 所以让页面在**还醒着的时候**把下一集地址先取好交过来；真到那一刻
-     * 页面没接上，由原生自己播，播完再把 resourceId 推回去让页面把路由对齐。
+     * 页面仍负责：手动点选某集时发 play（会取消自动切集）。
      */
     private var armedQueue: MutableList<ArmedItem> = mutableListOf()
-    private var endFallback: Runnable? = null
+    private var autoAdvance: Runnable? = null
+
+    /** 播放模式（order/single），页面起播时告知。单曲循环 = 壳原地重播。 */
+    @Volatile
+    private var loopMode: String = "order"
+
+    /** 用户主动暂停过（自愈看门狗不许碰这种暂停）。 */
+    @Volatile
+    private var userPaused: Boolean = false
+
+    /** 当前这条已播完（队列空时的安静是正常的，自愈不许重启它）。 */
+    @Volatile
+    private var nativeEnded: Boolean = false
+
+    /** 引擎已报错（页面会退回 `<audio>`，自愈重启只会变成失败循环）。 */
+    @Volatile
+    private var engineFailed: Boolean = false
 
     /**
-     * 兜底延迟。
+     * 播完到自动切下一集的间隔。
      *
-     * 要够长：页面醒着但网络慢时，"收到 ended → 下一集出声"实测 3~10 秒，
-     * 抢在它前面就会两边同时播同一集（听起来是从头放两遍）。
-     * 又不能太长：锁屏的孩子会以为故事就这么结束了。
+     * 要有一点：页面前台时它要用 ended 事件记学习进度（几百毫秒的事），
+     * 而且自然的"一集结束 → 下一集开始"也该有一口气。
+     * 不能太长：锁屏的孩子会以为故事就这么结束了。
      */
-    private val endFallbackMs = 14_000L
-
-    /**
-     * 页面心跳多久之内算"还活着"（见 [scheduleEndFallback]）。
-     *
-     * 页面每 5 秒推一次状态，所以 20 秒 = 连续漏掉 4 次，基本可以断定
-     * 已经被系统冻结（息屏后最常见），而不是"刚好在忙"。
-     */
-    private val PAGE_BEAT_ALIVE_MS = 20_000L
+    private val AUTO_ADVANCE_MS = 1_500L
 
     private fun handleArm(o: JSONObject) {
         val arr = o.optJSONArray("items")
@@ -970,52 +1043,69 @@ class MediaPlaybackService : Service() {
             }
         }
         armedQueue = q
-        Diagnostics.add("原生播放", "预置下一集 ${q.size} 条")
+        Diagnostics.add("原生播放", "预置后续 ${q.size} 条")
+        // 正在播就顺手把下一条预加载了（本地缓存），
+        // 到切集那一刻是零网络等待。
+        preloadNext()
     }
 
-    private fun scheduleEndFallback() {
-        cancelEndFallback()
+    private fun preloadNext() {
+        if (!nativeMode) return
+        armedQueue.firstOrNull()?.let { engine().preload(it.resourceId, it.url) }
+    }
+
+    private fun scheduleAutoAdvance() {
+        cancelAutoAdvance()
         val r = Runnable {
-            endFallback = null
-            // 页面还活着就先让它切。
-            //
-            // 这条判据以前是 `if (!nativeMode) return`，只对"原生在播"生效 ——
-            // 于是**接管路径**（页面 `<audio>` 被交过来播）播完永远没人接：
-            // 页面冻着收不到 ended，壳这边又直接 return，声音就停在那儿。
-            //
-            // 改成看心跳：页面每 5 秒推一次 applyState，真活着就一定会刷新；
-            // 息屏后 WebView 冻结、心跳停摆，才是该接手的信号。
-            // 20 秒的窗口足以覆盖"页面醒着但网络慢、切集要几秒"的情况，
-            // 又不至于让孩子对着静音干等太久。
-            val sinceBeat = System.currentTimeMillis() - lastPageBeatAt
-            if (lastPageBeatAt > 0 && sinceBeat < PAGE_BEAT_ALIVE_MS) {
-                Diagnostics.add(
-                    "原生播放",
-                    "播完了，页面还活着（${sinceBeat / 1000}s 前有心跳），等它切",
-                )
-                return@Runnable
-            }
-            if (armedQueue.isEmpty()) {
-                Diagnostics.add("原生播放", "播完了，没有预置下一集，等页面")
-                return@Runnable
-            }
-            val next = armedQueue.removeAt(0)
-            Diagnostics.add("原生播放", "页面没接上，兜底播下一集：${next.title.take(30)}")
-            playArmed(next)
+            autoAdvance = null
+            advanceQueue()
         }
-        endFallback = r
-        main.postDelayed(r, endFallbackMs)
+        autoAdvance = r
+        main.postDelayed(r, AUTO_ADVANCE_MS)
     }
 
-    private fun cancelEndFallback() {
-        endFallback?.let { main.removeCallbacks(it) }
-        endFallback = null
+    private fun cancelAutoAdvance() {
+        autoAdvance?.let { main.removeCallbacks(it) }
+        autoAdvance = null
     }
 
     /**
-     * 原生自己接下一集。
+     * 播完这一条后壳自己接下一条。
      *
-     * 走的是和页面点播同一个引擎入口，只是地址来自预置队列 ——
+     * 页面冻不冻都无所谓：它醒来时靠 nativeState 里的 resourceId "追认"
+     * （换路由、记进度），那套闸门在 1.7.9 就有了。
+     * 页面醒着且健康时，8 秒内没见壳动静它也会自己切一次（老壳兜底）。
+     */
+    private fun advanceQueue() {
+        if (userPaused) return
+        if (loopMode == "single") {
+            Diagnostics.add("原生播放", "单曲循环，原地重播")
+            nativeEnded = false
+            state = state.copy(position = 0, playing = true)
+            MediaBridge.nativeState(true, 0.0, state.duration.toDouble(), false, "", state.resourceId)
+            runCatching { engine().play(state.resourceId, state.url, 0L) }
+                .onFailure { onEngineBroken(it) }
+            return
+        }
+        if (armedQueue.isEmpty()) {
+            // 没有预置（最后一集/页面没来得及 arm）：把 ended 再推给页面几次
+            // （scheduleEndRetry 已在跑），醒着的页面会自己收尾。
+            Diagnostics.add("原生播放", "播完了，预置队列空")
+            return
+        }
+        val next = armedQueue.removeAt(0)
+        Diagnostics.add("原生播放", "自动接下一集：${next.title.take(30)}")
+        playArmed(next)
+    }
+
+    private fun cancelEndFallback() {
+        cancelAutoAdvance()
+    }
+
+    /**
+     * 壳自己接下一集。
+     *
+     * 走的是和页面点播同一个引擎入口（先本地缓存、没有才下载），
      * 不依赖页面、不依赖接口请求，所以息屏也照播。
      */
     private fun playArmed(item: ArmedItem) {
@@ -1037,7 +1127,11 @@ class MediaPlaybackService : Service() {
         nativeMode = true
         handoffMode = false
         handoffPreparing = false
+        userPaused = false
+        nativeEnded = false
+        engineFailed = false
         cancelLeaveStop()
+        cancelEndRetry()
         running = true
         session?.isActive = true
         runCatching { startForeground(NOTI_ID, buildNotification()) }
@@ -1046,7 +1140,10 @@ class MediaPlaybackService : Service() {
         // 先告诉页面"现在播的是第几条"：回到前台时它据此改路由，
         // 否则页面还显示着上一集的标题，进度条也会从 0 开始跳。
         MediaBridge.nativeState(true, 0.0, item.duration.toDouble(), false, "", item.resourceId)
-        runCatching { engine().play(item.url, 0L) }.onFailure { onEngineBroken(it) }
+        runCatching { engine().play(item.resourceId, item.url, 0L) }
+            .onFailure { onEngineBroken(it) }
+        // 链式预加载：把"下下一条"也提前下好。
+        preloadNext()
     }
 
     /**
@@ -1061,10 +1158,12 @@ class MediaPlaybackService : Service() {
         Diagnostics.add("播放", "收工：$reason")
         cancelLeaveStop()
         cancelEndRetry()
+        cancelAutoAdvance()
         runCatching { releasePlayer() }
         nativeMode = false
         handoffMode = false
         handoffPreparing = false
+        userPaused = false
         runCatching { audioEngine?.stop() }
         releaseLocks()
         session?.isActive = false
@@ -1149,15 +1248,14 @@ class MediaPlaybackService : Service() {
                 markPlaying(true)
             }
             p.setOnCompletionListener {
-                // 播完：交还给网页，由网页去切下一集（换集逻辑只有一份）
+                // 播完：交还给网页，由网页去切下一集
                 val pos = (it.duration / 1000L).coerceAtLeast(0)
                 releasePlayer()
                 MediaBridge.giveBack(pos, ended = true)
                 markPlaying(false)
-                // 但页面可能已经被系统冻结（息屏后 WebView 的 JS 不执行，
-                // evaluateJavascript 只排队），这时"交还"等于没人接这一棒。
-                // 补一次兜底：页面还活着会让路，冻住了才由原生自己播下一集。
-                scheduleEndFallback()
+                // 页面可能已被冻结（息屏后 evaluateJavascript 只排队），
+                // "交还"没人接 —— 壳自己接下一集（同原生模式）。
+                scheduleAutoAdvance()
             }
             p.setOnErrorListener { _, what, extra ->
                 Diagnostics.add("接管", "原生播放失败 what=$what extra=$extra，交还网页")

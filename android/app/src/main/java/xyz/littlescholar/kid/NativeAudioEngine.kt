@@ -8,40 +8,31 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import java.io.File
 import kotlin.math.abs
 
 /**
  * 原生音频引擎（Android 系统 MediaPlayer）。
  *
- * ============ 为什么不再用 libVLC ============
+ * ============ 1.7.10：MediaPlayer 不再碰网络 ============
  *
- * 1.6.0 引入 libVLC 的理由是"客户端要能自己解 wma"。但那套前提已经变了：
- * 服务端会把 wma/ape/amr 统一转成 **m4a（AAC in MP4）**，而 AAC 是 Android
- * 平台**内置**解码器，从 Android 5.0 起每台设备都有 —— 原生完全不需要
- * 自带解码库。
+ * 真机实锤（2026-11-20，荣耀 PGT-AN10 / Android 16）：
+ * `setDataSource(url)` 的原生 HTTP 数据源 60ms 内报 `错误码 -38`
+ * （INVALID_OPERATION），请求**根本没发出去**（服务端 access log 无记录）；
+ * 而同一时刻 WebView、页面 `<audio>`、HttpURLConnection 探针对同一地址
+ * 全部正常。这台设备的 MediaPlayer 网络栈是坏的。
  *
- * 而 libVLC 在这批平板上一直没能连上服务端（2026-10-29 实录：Java 探针
- * 对同一地址拿到 206，VLC 12 秒里一条 TCP 都没建，服务端 access log 里
- * `/api/stream` 计数为 0；`--ipv4` 也没能救回来）。结果就是每次播放
- * **先白等 12 秒看门狗**才退回转码，比直接用系统播放器还慢。
+ * 所以播放链路改为：[MediaCache]（HttpURLConnection，真机上唯一可靠的栈）
+ * 先把音频**整份下载到本地**，再把本地文件交给 MediaPlayer。
+ * 附带收益：票据过期不再影响播放中/待播内容、切集零网络等待
+ * （下一集在播当前集时就预加载好了）。
  *
- * 换掉它还顺手解决三件事：
- *   · APK 从约 43MB 降到几 MB（libvlc.so 的 arm64 就有 43MB）；
- *   · 不用再担心 VLC 自带的 CA 库认不认 Let's Encrypt 新根；
- *   · 网络栈就是系统那一套，IPv4/IPv6 回退、代理、证书全跟着系统走。
+ * ============ 其余历史决策（保留） ============
  *
- * ============ 为什么由 Service 持有 ============
- *
- * 后台播放、锁屏控制、通知栏按钮都要在页面被挂起后继续工作。
- * 引擎由 [MediaPlaybackService] 持有，Activity 只转发指令与状态，
- * 这样"前台播放"和"切后台继续播"用的是**同一个**播放器，不需要再做交接。
- *
- * ============ 与 VlcAudioEngine 的关系 ============
- *
- * 对外接口完全一致（play/pause/resume/seekTo/stop/release/snapshot +
- * [State] 回调），所以服务层只是换了一个实现。唯一的扩展是 [State.preparing]：
- * MediaPlayer 的 `prepareAsync()` 在等服务端转码时可能几十秒不出声，
- * 页面需要知道"壳已经接手了，只是还在准备"，否则它会以为壳没反应而回退。
+ * 1.6.0 引入 libVLC 的理由是"客户端要能自己解 wma"。但服务端会把
+ * wma/ape/amr 统一转成 **m4a（AAC in MP4）**，AAC 是 Android 平台内置
+ * 解码器 —— 原生不需要自带解码库，APK 从 43MB 降到 1MB 以内。
+ * 引擎由 [MediaPlaybackService] 持有，前台与切后台用**同一个**播放器。
  */
 class NativeAudioEngine(
     context: Context,
@@ -55,7 +46,7 @@ class NativeAudioEngine(
         val durationMs: Long,
         val ended: Boolean = false,
         val error: String = "",
-        /** 已收到 play 指令、正在 prepareAsync（可能在等服务端转码）。 */
+        /** 已收到 play 指令、正在下载/prepareAsync（可能在等服务端转码）。 */
         val preparing: Boolean = false,
     )
 
@@ -66,21 +57,15 @@ class NativeAudioEngine(
 
     private companion object {
         /**
-         * prepareAsync 的超时。
-         *
-         * 比 VLC 时代（15 秒）宽得多，因为这条路上**可能真的在等转码**：
-         * `/api/audio/:id` 是同步接口，第一次请求要现场取源 + ffmpeg（实测
-         * 3 分钟绘本 21.6 秒）。定太短会把"正在转"当成"打不开"，
-         * 然后页面回退到 `<audio>` 又把同一个请求重来一遍 —— 白等两遍。
-         *
-         * 也不能无限等：真连不上时要让页面尽快改用网页播放。
+         * prepareAsync 的超时。现在"准备期"= 下载（几 MB，通常几秒）+ prepare，
+         * 仍可能碰上服务端现场转码（首次播放 20 秒级），保留宽超时。
          */
-        const val PREPARE_TIMEOUT_MS = 60_000L
+        const val PREPARE_TIMEOUT_MS = 120_000L
 
-        /** 进度轮询间隔。MediaPlayer 没有 VLC 的 TimeChanged 事件，只能自己问。 */
+        /** 进度轮询间隔。MediaPlayer 没有 TimeChanged 事件，只能自己问。 */
         const val TICK_MS = 500L
 
-        /** 同一个地址再次 play 时，位置差多少以内算"接着播"，不必 seek。 */
+        /** 同一条资源再次 play 时，位置差多少以内算"接着播"，不必 seek。 */
         const val SEEK_TOLERANCE_MS = 1500L
     }
 
@@ -93,15 +78,20 @@ class NativeAudioEngine(
     /** prepare 阶段超时看门狗。 */
     private var prepareGuard: Runnable? = null
 
-    /** 当前资源地址；同一条资源再次 play 时只 seek/继续，不重建播放器。 */
+    /** 当前资源的地址；用于"同一条资源再 play 只 seek/继续"与看门狗重启。 */
     var currentUrl: String = ""
+        private set
+
+    /** 当前资源 id（缓存键）。 */
+    var currentResourceId: Long = 0L
         private set
 
     /** 本条资源最近一次失败的原因；空串表示没失败。 */
     private var lastError = ""
 
-    /** 已发 play、还没 prepare 完。会透传给页面（见 State.preparing）。 */
-    private var preparing = false
+    /** 已发 play、还没 prepare 完（含下载阶段）。会透传给页面（State.preparing）。 */
+    var isPreparing: Boolean = false
+        private set
 
     /** 当前是否因为"丢了音频焦点"（来电、别的 App 唱歌）而自动暂停。 */
     private var pausedByFocus = false
@@ -118,8 +108,7 @@ class NativeAudioEngine(
         when (change) {
             // ⚠️ 永久失焦也可能是**假的**：小米/OPPO 这类 ROM 在息屏时会给所有
             // 正在出声的播放器发一条 LOSS 做省电，之后就再也不补 GAIN。
-            // 以前这里 pause 完就不管了 —— 表现正是"播着播着自己暂停，再也
-            // 不动"。所以这里只暂停、并安排一次重试抢回焦点；抢到就接着播。
+            // 只暂停、并安排重试抢回焦点；抢到就接着播。
             // 不会误伤用户主动暂停：`pausedByFocus` 只在"正在播时被打断"才置位。
             AudioManager.AUDIOFOCUS_LOSS -> {
                 if (isPlaying) {
@@ -142,8 +131,7 @@ class NativeAudioEngine(
                     resume()
                 }
             }
-            // CAN_DUCK 不处理：儿童绘本是朗读内容，压低音量反而听不清，
-            // 让系统的默认行为（对方也降）更适合这里。
+            // CAN_DUCK 不处理：儿童绘本是朗读内容，压低音量反而听不清。
             else -> Unit
         }
     }
@@ -190,16 +178,19 @@ class NativeAudioEngine(
     /**
      * 播放一条音频。
      *
-     * 同一条 url 正在播时只做 seek/继续，**不重建播放器** —— 重建会带来
+     * 同一条资源正在播时只做 seek/继续，**不重建播放器** —— 重建会带来
      * 1~2 秒静音和"从头开始"，切前后台时正好撞上。
+     *
+     * 1.7.10 起流程 = 先取 [MediaCache] 缓存（有则直接用，无则下载），
+     * 拿到本地文件后再 setDataSource(file)。下载期间 `preparing=true`。
      */
-    fun play(url: String, startMs: Long) {
+    fun play(resourceId: Long, url: String, startMs: Long) {
         if (url.isBlank()) {
             fail("地址为空")
             return
         }
         val p = player
-        if (p != null && currentUrl == url && !preparing) {
+        if (p != null && currentResourceId == resourceId && resourceId > 0 && !isPreparing) {
             if (startMs > 0 && abs(p.currentPosition - startMs) > SEEK_TOLERANCE_MS) {
                 runCatching { p.seekTo(startMs.toInt()) }
             }
@@ -215,14 +206,47 @@ class NativeAudioEngine(
         }
 
         releasePlayer()
+        currentResourceId = resourceId
         currentUrl = url
         lastError = ""
         durationMs = 0
         pendingSeekMs = startMs.coerceAtLeast(0)
-        preparing = true
+        isPreparing = true
+        // 先告诉页面"壳已经接手，还在准备"（现在是下载阶段）。
+        emit()
 
+        MediaCache.fetch(appCtx, resourceId, url, object : MediaCache.Listener {
+            override fun onDone(file: File) {
+                main.post { openLocal(file, resourceId, url, startMs, retried = false) }
+            }
+
+            override fun onFail(msg: String) {
+                main.post {
+                    if (currentResourceId == resourceId) {
+                        fail("下载失败：$msg")
+                    }
+                }
+            }
+        })
+    }
+
+    /** 预加载（不播放）：把下一条提前下载到本地。 */
+    fun preload(resourceId: Long, url: String) {
+        if (resourceId <= 0 || url.isBlank()) return
+        MediaCache.preload(appCtx, resourceId, url)
+    }
+
+    /**
+     * 用本地文件开播放器。
+     *
+     * 缓存文件损坏（下载中断点错位、磁盘问题）时 MediaPlayer 会抛
+     * IOException —— 作废缓存重下一次；再不行才报错给页面。
+     */
+    private fun openLocal(file: File, resourceId: Long, url: String, startMs: Long, retried: Boolean) {
+        // 等 download 期间用户已经切走/停了：这条作废
+        if (currentResourceId != resourceId || currentUrl != url) return
         if (!requestFocus()) {
-            preparing = false
+            isPreparing = false
             fail("拿不到音频焦点")
             return
         }
@@ -231,13 +255,28 @@ class NativeAudioEngine(
         player = mp
         try {
             mp.setAudioAttributes(audioAttrs)
-            // 锁屏继续播：让 MediaPlayer 自己持唤醒锁。前台服务也持有，
-            // 但那是另一个锁 —— 服务被系统降级时这个仍能撑住音频输出。
+            // 锁屏继续播：让 MediaPlayer 自己持唤醒锁。
             mp.setWakeMode(appCtx, PowerManager.PARTIAL_WAKE_LOCK)
-            mp.setDataSource(url)
+            mp.setDataSource(file.path)
         } catch (e: Exception) {
-            preparing = false
+            isPreparing = false
             releasePlayer()
+            if (!retried) {
+                Diagnostics.add("原生播放", "缓存文件打不开（${e.javaClass.simpleName}），作废重下")
+                MediaCache.invalidate(appCtx, resourceId, url)
+                MediaCache.fetch(appCtx, resourceId, url, object : MediaCache.Listener {
+                    override fun onDone(f: File) {
+                        main.post { openLocal(f, resourceId, url, startMs, retried = true) }
+                    }
+
+                    override fun onFail(msg: String) {
+                        main.post {
+                            if (currentResourceId == resourceId) fail("下载失败：$msg")
+                        }
+                    }
+                })
+                return
+            }
             fail("打不开这段音频：${e.javaClass.simpleName}")
             return
         }
@@ -250,7 +289,7 @@ class NativeAudioEngine(
                 return@setOnPreparedListener
             }
             disarmPrepareGuard()
-            preparing = false
+            isPreparing = false
             val d = runCatching { p2.duration.toLong() }.getOrDefault(0L)
             if (d > 0) durationMs = d
             pendingSeekMs.takeIf { it > 0 }?.let {
@@ -279,12 +318,9 @@ class NativeAudioEngine(
         armPrepareGuard(mp)
         runCatching { mp.prepareAsync() }
             .onFailure {
-                preparing = false
+                isPreparing = false
                 fail("准备失败：${it.javaClass.simpleName}")
             }
-        // 先告诉页面"壳已经接手，还在准备"。没有这一句，页面那 12 秒
-        // 首状态看门狗会在转码期间到点，回退去重发一次同样的请求。
-        emit()
     }
 
     fun pause() {
@@ -303,7 +339,7 @@ class NativeAudioEngine(
 
     fun resume() {
         val p = player ?: return
-        if (preparing) return
+        if (isPreparing) return
         if (!requestFocus()) return
         runCatching { p.start() }
         startTick()
@@ -313,7 +349,7 @@ class NativeAudioEngine(
     fun seekTo(ms: Long) {
         val p = player ?: return
         val target = ms.coerceAtLeast(0)
-        if (preparing) {
+        if (isPreparing) {
             // 还没 prepared，seek 会被吞掉 —— 记下来等 onPrepared 再跳
             pendingSeekMs = target
             return
@@ -324,6 +360,7 @@ class NativeAudioEngine(
 
     fun stop() {
         currentUrl = ""
+        currentResourceId = 0
         releasePlayer()
         emit()
     }
@@ -333,7 +370,7 @@ class NativeAudioEngine(
         abandonFocus()
     }
 
-    fun snapshot(): State = State(isPlaying, positionMs, lengthMs, false, lastError, preparing)
+    fun snapshot(): State = State(isPlaying, positionMs, lengthMs, false, lastError, isPreparing)
 
     // ------------------------------------------------------------------
     //  进度轮询
@@ -346,8 +383,7 @@ class NativeAudioEngine(
             //
             // 暂停时 `pause()` 已经 `stopTick()` 了，所以能跑到这里的
             // "没在播"只可能是**瞬时**的（缓冲、系统调度、刚 start 还没生效）。
-            // 一旦在这里 return 且不重新 postDelayed，轮询就永久停了 ——
-            // 表现是进度条卡住、字幕不动，而声音其实还在放。
+            // 一旦在这里 return 且不重新 postDelayed，轮询就永久停了。
             emit()
             main.postDelayed(this, TICK_MS)
         }
@@ -369,12 +405,10 @@ class NativeAudioEngine(
     private fun armPrepareGuard(mp: MediaPlayer) {
         disarmPrepareGuard()
         val r = Runnable {
-            if (player !== mp || !preparing) return@Runnable
-            preparing = false
-            // 不释放 player：让它继续试着准备。真要一直出不来，
-            // 页面会先退回 `<audio>`，而服务端那次转码已经把它跑完了 ——
-            // 网页拿到的就是缓存，反而更快。
-            fail("等了 ${PREPARE_TIMEOUT_MS / 1000} 秒还没开始（可能服务端还在转码）")
+            if (player !== mp || !isPreparing) return@Runnable
+            isPreparing = false
+            // 不释放 player：让它继续试着准备。
+            fail("等了 ${PREPARE_TIMEOUT_MS / 1000} 秒还没开始")
         }
         prepareGuard = r
         main.postDelayed(r, PREPARE_TIMEOUT_MS)
@@ -436,7 +470,7 @@ class NativeAudioEngine(
         stopTick()
         cancelFocusRetry()
         pausedByFocus = false
-        preparing = false
+        isPreparing = false
         val p = player
         player = null
         runCatching {
@@ -452,7 +486,7 @@ class NativeAudioEngine(
 
     /**
      * MediaPlayer 的错误码只有 what/extra 两个整数，直接扔掉等于没有线索。
-     * 这两个值在官方文档里有明确含义，转成话之后诊断日志能直接定位。
+     * 转成话之后诊断日志能直接定位。
      */
     private fun describeError(what: Int, extra: Int): String {
         val w = when (what) {
@@ -471,7 +505,7 @@ class NativeAudioEngine(
     private fun fail(msg: String) {
         disarmPrepareGuard()
         stopTick()
-        preparing = false
+        isPreparing = false
         lastError = msg
         Diagnostics.add("原生播放", msg)
         emit(error = msg)
@@ -481,11 +515,8 @@ class NativeAudioEngine(
      * 把回调线程切回主线程，页面拿到的状态才是有序的。
      *
      * ⚠️ `error` 的默认值必须是**空串**，不能是 `lastError`。
-     *
      * 曾经写成 `error: String = lastError`，于是"这条资源失败过一次"之后，
-     * 之后每 500ms 的进度上报都会把那条旧错误再带一遍 —— 服务层看到
-     * `st.error` 非空就把页面打回 `<audio>`，而页面此时可能压根没出事。
-     * 一次瞬时错误会永久毒化整条播放，症状是"播着播着突然没声/重来"。
+     * 之后每 500ms 的进度上报都会把那条旧错误再带一遍。
      * 失败只由 [fail] 显式上报一次。
      */
     private fun emit(ended: Boolean = false, error: String = "") {
@@ -495,7 +526,7 @@ class NativeAudioEngine(
             durationMs = lengthMs,
             ended = ended,
             error = error,
-            preparing = preparing,
+            preparing = isPreparing,
         )
         main.post { onState(st) }
     }

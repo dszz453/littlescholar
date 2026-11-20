@@ -1045,6 +1045,7 @@ function nativeCmd(obj) {
 function startNativeAudio(at) {
   if (!nativeAudioMode.value) return
   nativeStarted.value = false
+  clearEndedFallback()
   const pos = Number(at)
   const sent = nativeCmd({
     cmd: 'play',
@@ -1056,6 +1057,8 @@ function startNativeAudio(at) {
     duration: Math.round(Number(duration.value) || 0),
     // 壳要用它回推"现在播的是第几条"，页面据此对齐路由
     resourceId: Number(resourceId.value) || 0,
+    // 1.7.10：单曲循环由壳原地重播（页面息屏会被冻结，靠不住）
+    loopMode: playMode.value === MODE_SINGLE ? 'single' : 'order',
   })
   // 连桥都没接住：当场退回，不用等。这是"这台壳没有原生能力"，写盘有意义
   if (!sent) {
@@ -1125,6 +1128,8 @@ function onNativeAudioState(st) {
   if (st.preparing) {
     nativeGotState = true
     clearNativeStartTimer()
+    // 壳在动（正在下载/准备）：页面兜底计时器不用出手了
+    clearEndedFallback()
     return
   }
   if (st.playing) {
@@ -1132,6 +1137,7 @@ function onNativeAudioState(st) {
     nativeGotState = true
     nativeStarted.value = true
     clearNativeStartTimer()
+    clearEndedFallback()
     // 真出声了：把上次的失败记录抹掉。以后换了 APK/网络，这里会自己恢复原生，
     // 不需要家长去清缓存。
     forgetNativeBroken()
@@ -1165,6 +1171,7 @@ function fallbackToWebAudio(permanent = false) {
   // 那只是这次慢，不该让后面 20 分钟内的每一本书都放弃原生。
   if (permanent) rememberNativeBroken()
   clearNativeStartTimer()
+  clearEndedFallback()
   nativeCmd({ cmd: 'stop' })
   // 交给 <audio>：它挂上之后会在 loadedmetadata 里按 pendingSeek 定位并自动播
   pendingSeek = current.value > 0 ? current.value : 0
@@ -1203,23 +1210,65 @@ function onNativeAudioEnded(st) {
   if (rid > 0 && rid !== Number(resourceId.value)) return
   // ② 刚追认完（见 adoptAt）：同样是一批迟到的回调，一律不理
   if (adoptAt && Date.now() - adoptAt < 8000) return
+  // 有原生桥（1.7.10+ 的壳）：**切集/重播全交给壳**，页面只记进度。
+  // 壳播完 1.5 秒就接下一条并推 resourceId 过来追认；
+  // 万一它没接（老壳 / 队列空），8 秒兜底计时器让页面自己动一次。
+  const hasShell = !!nativeAudioBridge()
   // 单曲循环不走闸门：它要能对同一集反复触发
   if (playMode.value === MODE_SINGLE) {
     isPlaying.value = false
+    nativeStarted.value = false
     flushProgress(true)
-    startNativeAudio(0)
+    if (hasShell) {
+      // 壳拿到 loopMode:single 会原地重播
+      armEndedFallback()
+    } else {
+      startNativeAudio(0)
+    }
     return
   }
   if (!claimEnded()) return
   isPlaying.value = false
+  nativeStarted.value = false
   flushProgress(true)
   const next = nextTrackId()
+  if (hasShell) {
+    armEndedFallback(next)
+    return
+  }
   if (next) {
     goTo(next)
   } else if (nativeCmd({ cmd: 'stop', final: true })) {
     // 顺序播到最后一集：把前台服务一起收掉，
     // 否则通知栏会一直挂着"正在播放"，而它其实早就安静了
   }
+}
+
+/* ---------- 页面侧兜底：壳没接住时自己切（1.7.10） ---------- */
+//
+// 壳是首选切集者，但它可能没接住：老壳没有自动切集、预置队列空
+// （最后一集）、或壳引擎出错。等 8 秒没见壳动静（既没在准备也没在播），
+// 页面自己切一次 —— goTo/startNativeAudio 会被壳的追认闸门接住，
+// 不会造成双播。
+let endedFallbackTimer = null
+function clearEndedFallback() {
+  if (endedFallbackTimer) {
+    clearTimeout(endedFallbackTimer)
+    endedFallbackTimer = null
+  }
+}
+function armEndedFallback(next) {
+  clearEndedFallback()
+  endedFallbackTimer = setTimeout(() => {
+    endedFallbackTimer = null
+    if (nativeShadow.playing || nativeStarted.value) return
+    if (playMode.value === MODE_SINGLE) {
+      startNativeAudio(0)
+      return
+    }
+    if (next) goTo(next)
+    else nativeCmd({ cmd: 'stop', final: true })
+  }, 8000)
 }
 
 /* ---------- 时间格式化 ---------- */
@@ -3050,7 +3099,8 @@ function armBridge() {
  * 所以在页面**还醒着**的时候，把后几集的播放地址先取好送进壳里；
  * 真到那一刻页面没接上，壳自己接（标准版 playArmed / PRO 的同名实现）。
  *
- * 只取 3 集：够覆盖一集最长的时长，又不会为了息屏这件事一次性打十几次接口。
+ * 只取 6 条：壳会把下一条提前下载到本地（1.7.10），6 条够覆盖
+ * 一次息屏收听（票据 4 小时有效）；页面醒着时会重新预置刷新。
  */
 let armSeq = 0
 // 已经为哪一条预置过：onMediaPlay 会因为回前台续播等原因重复触发，
@@ -3059,7 +3109,6 @@ let armedFor = 0
 async function armNext() {
   const send = armBridge()
   if (!send) return
-  if (adoptingNative()) return
   const rid = Number(resourceId.value)
   if (armedFor === rid) return
   const seq = ++armSeq
@@ -3076,7 +3125,7 @@ async function armNext() {
   // 「有产物」时两者本来就是同一个 m4a，别因为一个字段缺失就放弃兜底。
   const items = []
   let cur = Number(resourceId.value)
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 6; i++) {
     const nextId = nextIdAfter(cur)
     if (!nextId) break
     try {

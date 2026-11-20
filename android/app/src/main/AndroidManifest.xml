@@ -11,6 +11,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 1.7.10：ROM 的省电管控会把息屏播放的进程"半冻结"（前台服务也拦不住），
+         首次播放时引导用户把本应用加入电池优化白名单。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- 扫二维码填服务器地址。声明为「非必需」，没有摄像头的设备也能装。 -->
     <uses-permission android:name="android.permission.CAMERA" />
