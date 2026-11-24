@@ -151,9 +151,11 @@ object MediaCache {
                 val ex = tryOnce(url, part)
                 if (ex == null) break
                 attempt++
-                if (attempt >= 2) throw IllegalStateException(ex)
+                // 公网入口是家宽高位端口，会**间歇性**连不上（11-23 实录），
+                // 2 次不够 —— 给到 4 次，间隔递增 2s/4s/6s，覆盖几十秒级抖动。
+                if (attempt >= 4) throw IllegalStateException(ex)
                 Diagnostics.add("下载", "第 $attempt 次失败（$ex），重试")
-                Thread.sleep(1500L)
+                Thread.sleep(attempt * 2000L)
             }
             if (!part.renameTo(done)) {
                 // Windows 式改名失败（Linux 罕见）：复制兜底
@@ -174,14 +176,28 @@ object MediaCache {
                 readTimeout = 30_000
                 instanceFollowRedirects = true
                 setRequestProperty("User-Agent", "LittleScholar-Cache/1.0")
-                if (have > 0) setRequestProperty("Range", "bytes=$have-")
+                // ⚠️ 必须始终带 Range（包括从头下的 have=0，用 bytes=0-）：
+                // 公网入口的反代对**不带 Range 的大响应**会把请求挂住
+                // （2026-11-14 实测 25s 超时零字节），带 Range 则 206 正常。
+                // 以前只在续传时带，导致"首下"撞上反代挂死 —— 表现是
+                // 下载一直零进度、12 秒诊断窗口里连失败日志都没有。
+                setRequestProperty("Range", "bytes=$have-")
             }
             val code = conn.responseCode
             if (code !in 200..299) {
                 runCatching { conn.disconnect() }
                 return "HTTP $code"
             }
-            val total = conn.getHeaderField("Content-Length")?.toLongOrNull() ?: 0L
+            // 206 的 Content-Length 只是"本次续传的剩余量"，总长在
+            // Content-Range 末段（bytes=N-M/TOTAL）；200 才是全量长度。
+            val total =
+                if (code == 206) {
+                    conn.getHeaderField("Content-Range")
+                        ?.substringAfterLast('/')?.toLongOrNull()
+                        ?: conn.getHeaderField("Content-Length")?.toLongOrNull() ?: 0L
+                } else {
+                    conn.getHeaderField("Content-Length")?.toLongOrNull() ?: 0L
+                }
             val fromZero = have == 0L || code == 200
             val append = !fromZero
             if (fromZero) part.delete()

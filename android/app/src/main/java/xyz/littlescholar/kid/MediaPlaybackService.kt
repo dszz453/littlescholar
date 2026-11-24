@@ -748,6 +748,10 @@ class MediaPlaybackService : Service() {
         if (st.error.isNotEmpty()) {
             Diagnostics.add("原生播放", "失败：${st.error}")
             engineFailed = true
+            // 失败要立即上传诊断：+12s 的定时上报常常赶不上
+            // "下载挂到超时才报错"的时间线，失败当下发一包，
+            // 服务端就能看到完整的失败链路。
+            reportDiag("native-error")
             // 失败也要告诉页面：它会退到"这一段放不了"的提示，
             // 而不是永远转圈等一个不会来的声音。
             MediaBridge.nativeState(false, 0.0, 0.0, false, st.error)

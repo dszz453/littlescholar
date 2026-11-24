@@ -871,56 +871,26 @@ const NATIVE_AUDIO_ENABLED = (() => {
 
 
 /**
- * 原生播放地址：**必须换成明文入口**（8616 → 8093）。
+ * 原生播放地址：直接用 https 原地址（8616），**不再改写成 8093**。
  *
- * ============ 2026-11-14 实测：换回明文的理由 ============
+ * ============ 1.7.11：为什么把 11-14 的改写去掉 ============
  *
- * 1.7.9 用系统 MediaPlayer 后，我一度认为"系统 TLS 栈和浏览器一致"，
- * 所以把这里的明文改写去掉了，直接给 https。结果真机上原生播放**当场失败**：
+ * 那次改写的背景：MediaPlayer 自己发网络请求时，8616 前面的 Lucky 反代
+ * 对**不带 Range 的大响应**会挂住（25s 超时零字节），于是撞出 -38。
  *
- *     14:15:23.483 [原生播放] 原生加载：https://…:8616/api/audio/8412?t=…
- *     14:15:23.636 [原生播放] 错误码 -38 (what=-38 extra=0)   ← 150ms 就报错
+ * 1.7.10 之后这条理由消失了：播放器只吃 MediaCache 下载好的**本地文件**，
+ * 网络请求全部由 HttpURLConnection 发出 —— 而 MediaCache 每次都带
+ * `Range: bytes=N-`（见 MediaCache.kt），实测 8616 对带 Range 的请求
+ * 返回 206、一次拿全。
  *
- * 而同一时刻 nginx 访问日志里**一条 `/api/audio/8412` 都没有** ——
- * 播放器没把请求发出去就失败了。现场复测找到真因：
- *
- *     https://study.19860819.xyz:8616/api/audio/8412   普通 GET → 25 秒超时，零字节
- *     同上，带 Range: bytes=0-1023                     → 206，正常
- *     http://study.19860819.xyz:8093/api/audio/8412    普通 GET → 200，2.75MB
- *
- * 8616 前面是 LuckyWeb（一层反代），它对**不带 Range 的大响应**会把请求挂住；
- * MediaPlayer 恰好先发普通 GET（它不保证带 Range），于是 150ms 就放弃。
- * 8093 是本机 nginx 直出，普通 GET 一次拿全。
- *
- * 结论：原生链路**只走 8093 明文口**。票据在 8093 上同样校验，内容一致。
- * 只在 https:8616 下替换，其它端口/局域网地址不动，避免猜错映射。
+ * 而 8093 有个致命的运维特性：它是家宽入站的高位端口，**时通时断**
+ * （11-20 全晚正常，11-23 21:02 设备探针 ConnectException）。页面能加载
+ * 说明 8616 通 —— 用户看到的"播完不切下一集"，正是第一集缓存命中出声、
+ * 切下一集要重新下载时撞上 8093 不通。去掉这个单点，下载只依赖
+ * 和页面同一个入口。
  */
-const NATIVE_PLAIN_BASE = (() => {
-  try {
-    const loc = window.location
-    if (loc.protocol !== 'https:') return ''
-    const map = { '8616': '8093' }
-    const p = map[loc.port]
-    return p ? `http://${loc.hostname}:${p}` : ''
-  } catch {
-    return ''
-  }
-})()
-
-/** https:8616 的老地址改写成明文口；其余原样绝对化。 */
 function nativeMediaURL(u) {
-  const abs = absoluteURL(u)
-  if (!abs || !NATIVE_PLAIN_BASE) return abs
-  try {
-    const t = new URL(abs)
-    // 只改 8616 这一条：换成明文口 + 原路径 + 原票据
-    if (t.protocol === 'https:' && t.port === '8616') {
-      return `http://${t.hostname}:8093${t.pathname}${t.search}`
-    }
-  } catch {
-    /* 解析失败就原样返回 */
-  }
-  return abs
+  return absoluteURL(u)
 }
 
 /**
